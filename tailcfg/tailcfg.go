@@ -751,13 +751,14 @@ const (
 	PeerAPI4   = ServiceProto("peerapi4")
 	PeerAPI6   = ServiceProto("peerapi6")
 	PeerAPIDNS = ServiceProto("peerapi-dns-proxy")
+	SCION      = ServiceProto("scion")
 )
 
 // IsKnownServiceProto checks whether sp represents a known-valid value of
 // ServiceProto.
 func IsKnownServiceProto(sp ServiceProto) bool {
 	switch sp {
-	case TCP, UDP, PeerAPI4, PeerAPI6, PeerAPIDNS, ServiceProto("egg"):
+	case TCP, UDP, PeerAPI4, PeerAPI6, PeerAPIDNS, SCION, ServiceProto("egg"):
 		return true
 	}
 	return false
@@ -2755,6 +2756,12 @@ const (
 	// See https://github.com/tailscale/tailscale/issues/15404.
 	// TODO(bradfitz): remove this a few releases after 2026-02-16.
 	NodeAttrForceRegisterMagicDNSIPv4Only NodeCapability = "force-register-magicdns-ipv4-only"
+
+	// NodeAttrSCIONPrefer indicates that the node should prefer SCION paths
+	// when communicating with other SCION-capable peers that also have this
+	// attribute. Both self and peer must have this attribute for SCION to be
+	// preferred over direct UDP.
+	NodeAttrSCIONPrefer NodeCapability = "scion-prefer"
 )
 
 // SetDNSRequest is a request to add a DNS record.
