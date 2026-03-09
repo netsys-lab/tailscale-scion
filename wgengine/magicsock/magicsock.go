@@ -2515,6 +2515,12 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 	if nk, ok := c.unambiguousNodeKeyOfPingLocked(dm, di.discoKey, derpNodeSrc); ok {
 		if !isDerp {
 			c.peerMap.setNodeKeyForEpAddr(src, nk)
+			// For SCION sources, also register the plain host addr
+			// so WireGuard data packets (which don't carry a scionKey)
+			// can be looked up in the peerMap.
+			if src.scionKey.IsSet() {
+				c.peerMap.setNodeKeyForEpAddr(epAddr{ap: src.ap}, nk)
+			}
 		}
 	}
 

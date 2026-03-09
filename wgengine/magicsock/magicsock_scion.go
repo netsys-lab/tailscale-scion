@@ -37,8 +37,27 @@ type scionPathInfo struct {
 	hostAddr netip.AddrPort // peer's SCION host IP:port
 	path     snet.Path      // current best SCION path to this peer
 	expiry   time.Time      // path expiration from path metadata
+	mtu      uint16         // SCION payload MTU from path metadata
 	mu       sync.Mutex
 }
+
+// scionHeaderOverhead is the fixed overhead added by SCION encapsulation,
+// excluding the variable-length path header:
+//   - Underlay IPv4+UDP: 20 + 8 = 28 bytes
+//   - SCION common header: 12 bytes
+//   - Address header (IPv4, 2x ISD-AS + 2x IPv4): 2*8 + 2*4 = 24 bytes
+//   - SCION/UDP L4 header: 8 bytes
+//
+// Total fixed: 72 bytes. The path header is variable (depends on hop count).
+// Rather than parsing the path to determine the exact overhead, we use the
+// path MTU from metadata directly: the SCION daemon reports the maximum
+// *payload* size that can traverse the path (i.e., MTU already accounts for
+// all SCION headers). So the effective wire MTU for WireGuard is simply the
+// SCION path MTU.
+//
+// However, when no path MTU is available, we use a conservative estimate:
+// 1280 bytes (minimum IPv6-compatible MTU).
+const scionFallbackPayloadMTU = 1280
 
 // scionEndpointState tracks SCION-specific per-peer state on an endpoint.
 type scionEndpointState struct {
@@ -303,32 +322,45 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 
 		b := buffs[0][:n]
 
-		// Build an epAddr for this SCION source. Look up the scionKey
-		// so that pong replies are routed back over SCION.
 		srcHostAddr := srcAddr.Host.AddrPort()
-		srcEpAddr := epAddr{ap: srcHostAddr}
-		if sk := c.scionKeyForAddr(srcAddr.IA, srcHostAddr); sk.IsSet() {
-			srcEpAddr.scionKey = sk
-		}
 
 		// Check for disco packets (same as receiveIP does).
 		pt, _ := packetLooksLike(b)
 		if pt == packetLooksLikeDisco {
+			// For disco messages, include the scionKey so pong replies
+			// are routed back over SCION.
+			srcEpAddr := epAddr{ap: srcHostAddr}
+			if sk := c.scionKeyForAddr(srcAddr.IA, srcHostAddr); sk.IsSet() {
+				srcEpAddr.scionKey = sk
+			}
 			c.handleDiscoMessage(b, srcEpAddr, false, key.NodePublic{}, discoRXPathSCION)
 			continue
 		}
 
-		// WireGuard packet — look up the endpoint by source address.
+		if !c.havePrivateKey.Load() {
+			// No private key means we're logged out. Don't pass WireGuard
+			// packets up; wireguard-go will just complain.
+			continue
+		}
+
+		// WireGuard packet — look up the endpoint by host addr only
+		// (peerMap is keyed by netip.AddrPort, not scionKey).
+		srcEpAddr := epAddr{ap: srcHostAddr}
 		c.mu.Lock()
 		ep, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
 		c.mu.Unlock()
 		if !ok {
-			// Try looking up without SCION key since the receive side
-			// may not have the scionKey set in peerMap.
-			continue
+			// No peerMap entry yet. Return a lazyEndpoint so WireGuard
+			// can identify the peer from the encrypted packet and
+			// register it, matching the behavior of receiveIP.
+			sizes[0] = n
+			eps[0] = &lazyEndpoint{c: c, src: srcEpAddr}
+			return 1, nil
 		}
 
-		ep.noteRecvActivity(srcEpAddr, mono.Now())
+		now := mono.Now()
+		ep.lastRecvUDPAny.StoreAtomic(now)
+		ep.noteRecvActivity(srcEpAddr, now)
 		sizes[0] = n
 		eps[0] = ep
 		return 1, nil
@@ -364,8 +396,10 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 	}
 
 	var expiry time.Time
+	var mtu uint16
 	if md := best.Metadata(); md != nil {
 		expiry = md.Expiry
+		mtu = md.MTU
 	}
 
 	pi := &scionPathInfo{
@@ -373,6 +407,7 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		hostAddr: hostAddr,
 		path:     best,
 		expiry:   expiry,
+		mtu:      mtu,
 	}
 	return c.registerSCIONPathLocking(pi), nil
 }
@@ -460,6 +495,7 @@ func (c *Conn) refreshSCIONPathsOnce() {
 		pi.path = best
 		if md := best.Metadata(); md != nil {
 			pi.expiry = md.Expiry
+			pi.mtu = md.MTU
 		}
 		pi.mu.Unlock()
 	}
@@ -552,7 +588,15 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 		pathKey:  pathKey,
 	}
 	de.mu.Unlock()
-	de.c.logf("magicsock: discovered SCION path to %s (key=%d)", peerIA, pathKey)
+
+	pi := de.c.lookupSCIONPathLocking(pathKey)
+	var mtu uint16
+	if pi != nil {
+		pi.mu.Lock()
+		mtu = pi.mtu
+		pi.mu.Unlock()
+	}
+	de.c.logf("magicsock: discovered SCION path to %s (key=%d, mtu=%d)", peerIA, pathKey, mtu)
 }
 
 // scionKeyForAddr returns the scionPathKey for the given peer IA and host

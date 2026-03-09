@@ -262,17 +262,18 @@ func TestBetterAddrSCION(t *testing.T) {
 		a, b addrQuality
 		want bool
 	}{
-		// Direct UDP wins over SCION at equal latency.
+		// SCION wins over direct UDP at equal latency.
+		// TODO(scion): revert when SCION preference is behind NodeAttrSCIONPrefer.
 		{
-			name: "direct beats SCION same latency",
-			a:    al(publicV4, 100*ms),
-			b:    alSCION(publicV4_2, 1, 100*ms),
+			name: "SCION beats direct same latency",
+			a:    alSCION(publicV4_2, 1, 100*ms),
+			b:    al(publicV4, 100*ms),
 			want: true,
 		},
 		{
-			name: "SCION loses to direct same latency",
-			a:    alSCION(publicV4_2, 1, 100*ms),
-			b:    al(publicV4, 100*ms),
+			name: "direct loses to SCION same latency",
+			a:    al(publicV4, 100*ms),
+			b:    alSCION(publicV4_2, 1, 100*ms),
 			want: false,
 		},
 		// SCION wins over relay (VNI).
@@ -288,19 +289,18 @@ func TestBetterAddrSCION(t *testing.T) {
 			b:    alSCION(publicV4, 1, 100*ms),
 			want: false,
 		},
-		// With scionPreferred, SCION gets 40-point bonus and can beat
-		// direct UDP at similar latency.
+		// scionPreferred bonus is additive with SCION preference.
 		{
 			name: "scionPreferred SCION beats direct at similar latency",
 			a:    alSCIONPref(publicV4_2, 1, 100*ms),
 			b:    al(publicV4, 100*ms),
 			want: true,
 		},
-		// But direct UDP still wins if it's dramatically faster.
+		// SCION always wins over direct (current preference order).
 		{
-			name: "direct beats scionPreferred SCION when much faster",
-			a:    al(publicV4, 10*ms),
-			b:    alSCIONPref(publicV4_2, 1, 100*ms),
+			name: "SCION still wins over much faster direct",
+			a:    alSCION(publicV4_2, 1, 100*ms),
+			b:    al(publicV4, 10*ms),
 			want: true,
 		},
 		// Two SCION paths: lower latency wins.

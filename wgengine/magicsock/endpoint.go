@@ -936,7 +936,7 @@ func (de *endpoint) wantFullPingLocked(now mono.Time) bool {
 	if runtime.GOOS == "js" {
 		return false
 	}
-	if !de.bestAddr.isDirect() || de.lastFullPing.IsZero() {
+	if (!de.bestAddr.isDirect() && !de.bestAddr.isSCION()) || de.lastFullPing.IsZero() {
 		return true
 	}
 	if now.After(de.trustBestAddrUntil) {
@@ -1052,7 +1052,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		if startWGPing {
 			de.sendWireGuardOnlyPingsLocked(now)
 		}
-	} else if !udpAddr.isDirect() || now.After(de.trustBestAddrUntil) {
+	} else if (!udpAddr.isDirect() && !udpAddr.isSCION()) || now.After(de.trustBestAddrUntil) {
 		de.sendDiscoPingsLocked(now, true)
 		if de.wantUDPRelayPathDiscoveryLocked(now) {
 			de.discoverUDPRelayPathsLocked(now)
@@ -1322,7 +1322,9 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	sizes := []int{size}
 	if de.c.PeerMTUEnabled() {
 		isDerp := ep.ap.Addr() == tailcfg.DerpMagicIPAddr
-		if !isDerp && ((purpose == pingDiscovery) || (purpose == pingCLI && size == 0)) {
+		// Skip MTU probing for SCION paths — the SCION path MTU is known
+		// from metadata and oversized probes won't fit through the path.
+		if !isDerp && !ep.scionKey.IsSet() && ((purpose == pingDiscovery) || (purpose == pingCLI && size == 0)) {
 			de.c.dlogf("[v1] magicsock: starting MTU probe")
 			sizes = mtuProbePingSizesV4
 			if ep.ap.Addr().Is6() {
@@ -1699,6 +1701,13 @@ func (de *endpoint) noteConnectivityChange() {
 // disco headers. If size is zero, assume it is the safe wire MTU.
 func pingSizeToPktLen(size int, udpAddr epAddr) tstun.WireMTU {
 	if size == 0 {
+		return tstun.SafeWireMTU()
+	}
+	if udpAddr.scionKey.IsSet() {
+		// For SCION paths, the snet library handles all SCION header
+		// serialization internally. The payload we pass to WriteTo is the
+		// WireGuard packet. Since we skip MTU probing for SCION (the path
+		// MTU is known from metadata), just return the safe wire MTU.
 		return tstun.SafeWireMTU()
 	}
 	headerLen := ipv4.HeaderLen
