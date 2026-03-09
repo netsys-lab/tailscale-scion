@@ -187,6 +187,9 @@ type Conn struct {
 	pconn4 RebindingUDPConn
 	pconn6 RebindingUDPConn
 
+	// pconnSCION is the SCION connection, nil if SCION is not available.
+	pconnSCION *scionConn
+
 	receiveBatchPool sync.Pool
 
 	// closeDisco4 and closeDisco6 are io.Closers to shut down the raw
@@ -408,6 +411,12 @@ type Conn struct {
 	// homeDERPGauge is the usermetric gauge for the home DERP region ID.
 	// This can be nil when [Options.Metrics] are not enabled.
 	homeDERPGauge *usermetric.Gauge
+
+	// scionPaths is the registry of SCION path information, keyed by
+	// scionPathKey. Each entry holds the full SCION address and path
+	// data for a peer.
+	scionPaths   map[scionPathKey]*scionPathInfo
+	scionPathSeq atomic.Uint32 // monotonic key generator for scionPaths
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
