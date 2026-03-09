@@ -99,6 +99,9 @@ type endpoint struct {
 	expired         bool // whether the node has expired
 	isWireguardOnly bool // whether the endpoint is WireGuard only
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
+
+	scionState     *scionEndpointState // nil if peer has no SCION address
+	scionPreferred bool                // true if both self and peer have NodeAttrSCIONPrefer
 }
 
 // udpRelayEndpointReady determines whether the given relay [addrQuality] should
@@ -1794,19 +1797,28 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 }
 
 // epAddr is a [netip.AddrPort] with an optional Geneve header (RFC8926)
-// [packet.VirtualNetworkID].
+// [packet.VirtualNetworkID] or SCION path key.
 type epAddr struct {
-	ap  netip.AddrPort          // if ap == tailcfg.DerpMagicIPAddr then vni is never set
-	vni packet.VirtualNetworkID // vni.IsSet() indicates if this [epAddr] involves a Geneve header
+	ap       netip.AddrPort          // if ap == tailcfg.DerpMagicIPAddr then vni is never set
+	vni      packet.VirtualNetworkID // vni.IsSet() indicates if this [epAddr] involves a Geneve header
+	scionKey scionPathKey            // non-zero if this is a SCION endpoint
 }
 
 // isDirect returns true if e.ap is valid and not tailcfg.DerpMagicIPAddr,
-// and a VNI is not set.
+// and neither a VNI nor a SCION key is set.
 func (e epAddr) isDirect() bool {
-	return e.ap.IsValid() && e.ap.Addr() != tailcfg.DerpMagicIPAddr && !e.vni.IsSet()
+	return e.ap.IsValid() && e.ap.Addr() != tailcfg.DerpMagicIPAddr && !e.vni.IsSet() && !e.scionKey.IsSet()
+}
+
+// isSCION reports whether this address represents a SCION path.
+func (e epAddr) isSCION() bool {
+	return e.scionKey.IsSet()
 }
 
 func (e epAddr) String() string {
+	if e.scionKey.IsSet() {
+		return fmt.Sprintf("%v:scion:%d", e.ap.String(), e.scionKey)
+	}
 	if !e.vni.IsSet() {
 		return e.ap.String()
 	}
