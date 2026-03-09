@@ -1074,7 +1074,12 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		}
 	}
 	var err error
-	if udpAddr.ap.IsValid() {
+	if udpAddr.isSCION() {
+		_, err = de.c.sendSCIONBatch(udpAddr, buffs, offset)
+		if err != nil {
+			de.noteBadEndpoint(udpAddr)
+		}
+	} else if udpAddr.ap.IsValid() {
 		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
 
 		// If the error is known to indicate that the endpoint is no longer
@@ -1832,6 +1837,7 @@ type addrQuality struct {
 	relayServerDisco key.DiscoPublic // only relevant if epAddr.vni.isSet(), otherwise zero value
 	latency          time.Duration
 	wireMTU          tstun.WireMTU
+	scionPreferred   bool // true if both self and peer have NodeAttrSCIONPrefer
 }
 
 func (a addrQuality) String() string {
@@ -1866,6 +1872,23 @@ func betterAddr(a, b addrQuality) bool {
 	}
 	if a.vni.IsSet() && !b.vni.IsSet() {
 		return false
+	}
+
+	// SCION paths are preferred over relay but not over direct UDP.
+	// Direct UDP > SCION > UDP Relay > DERP
+	if a.scionKey.IsSet() != b.scionKey.IsSet() {
+		if a.scionKey.IsSet() {
+			// a is SCION
+			if b.isDirect() {
+				return false // direct wins over SCION
+			}
+			return true // SCION wins over relay/DERP
+		}
+		// b is SCION
+		if a.isDirect() {
+			return true // direct wins over SCION
+		}
+		return false // SCION wins over relay/DERP
 	}
 
 	// Each address starts with a set of points (from 0 to 100) that
@@ -1910,6 +1933,16 @@ func betterAddr(a, b addrQuality) bool {
 	}
 	if b.ap.Addr().Is6() {
 		bPoints += 10
+	}
+
+	// When both self and peer have NodeAttrSCIONPrefer, give SCION paths
+	// a large bonus so they're preferred over direct UDP unless direct UDP
+	// is dramatically faster.
+	if a.scionPreferred && a.scionKey.IsSet() {
+		aPoints += 40
+	}
+	if b.scionPreferred && b.scionKey.IsSet() {
+		bPoints += 40
 	}
 
 	// Don't change anything if the latency improvement is less than 1%; we

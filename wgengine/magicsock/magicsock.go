@@ -3271,6 +3271,9 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 	if runtime.GOOS == "js" {
 		fns = []conn.ReceiveFunc{c.receiveDERP}
 	}
+	if c.pconnSCION != nil {
+		fns = append(fns, c.receiveSCION)
+	}
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
 	return fns, c.LocalPort(), nil
@@ -3353,6 +3356,9 @@ func (c *Conn) Close() error {
 	// They will frequently have been closed already by a call to connBind.Close.
 	c.pconn6.Close()
 	c.pconn4.Close()
+	if c.pconnSCION != nil {
+		c.pconnSCION.close()
+	}
 	if c.closeDisco4 != nil {
 		c.closeDisco4.Close()
 	}
@@ -3600,6 +3606,19 @@ func (c *Conn) rebind(curPortFate currentPortFate) error {
 		c.portMapper.SetLocalPort(c.LocalPort())
 	}
 	c.UpdatePMTUD()
+
+	// Try to set up SCION if not already connected.
+	if c.pconnSCION == nil {
+		sc, err := trySCIONConnect(c.connCtx, c.LocalPort())
+		if err != nil {
+			c.logf("magicsock: SCION not available: %v", err)
+		} else {
+			c.logf("magicsock: SCION available, local IA: %s", sc.localIA)
+			c.pconnSCION = sc
+			go c.refreshSCIONPaths()
+		}
+	}
+
 	return nil
 }
 
