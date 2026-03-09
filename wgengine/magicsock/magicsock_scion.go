@@ -441,6 +441,26 @@ func scionServiceFromPeer(n tailcfg.NodeView) (ia addr.IA, hostAddr netip.AddrPo
 	return 0, netip.AddrPort{}, false
 }
 
+// SCIONService returns the SCION service entry to advertise in Hostinfo,
+// or ok=false if SCION is not available.
+func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) {
+	sc := c.pconnSCION
+	if sc == nil {
+		return tailcfg.Service{}, false
+	}
+	// The local host IP comes from the SCION connection's local address.
+	localAddr := sc.conn.LocalAddr()
+	hostIP := "0.0.0.0"
+	if ua, uaOk := localAddr.(*net.UDPAddr); uaOk && ua.IP != nil {
+		hostIP = ua.IP.String()
+	}
+	return tailcfg.Service{
+		Proto:       tailcfg.SCION,
+		Port:        c.LocalPort(),
+		Description: fmt.Sprintf("%s,%s", sc.localIA, hostIP),
+	}, true
+}
+
 var errNoSCION = fmt.Errorf("SCION not available")
 
 const discoRXPathSCION discoRXPath = "SCION"

@@ -4924,6 +4924,12 @@ func (b *LocalBackend) hostInfoWithServicesLocked() *tailcfg.Hostinfo {
 	// the slice with no free capacity.
 	c := len(hi.Services)
 	hi.Services = append(hi.Services[:c:c], peerAPIServices...)
+
+	// Advertise SCION service if available.
+	if scionSvc, ok := b.MagicConn().SCIONService(); ok {
+		hi.Services = append(hi.Services, scionSvc)
+	}
+
 	hi.PushDeviceToken = b.pushDeviceToken.Load()
 
 	// Compare the expected ports from peerAPIServices to the actual ports in hi.Services.

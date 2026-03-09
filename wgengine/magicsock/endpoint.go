@@ -1295,7 +1295,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if runtime.GOOS == "js" {
 		return
 	}
-	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
+	if debugNeverDirectUDP() && !ep.vni.IsSet() && !ep.scionKey.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
 		return
 	}
 	epDisco := de.disco.Load()
@@ -1303,7 +1303,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 		return
 	}
 	if purpose != pingCLI &&
-		!ep.vni.IsSet() { // de.endpointState is only relevant for direct/non-vni epAddr's
+		!ep.vni.IsSet() && !ep.scionKey.IsSet() { // de.endpointState is only relevant for direct/non-vni/non-SCION epAddr's
 		st, ok := de.endpointState[ep.ap]
 		if !ok {
 			// Shouldn't happen. But don't ping an endpoint that's
@@ -1382,6 +1382,16 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 
 		de.startDiscoPingLocked(epAddr{ap: ep}, now, pingDiscovery, 0, nil)
 	}
+	// Also ping over SCION if available for this peer.
+	if de.scionState != nil && de.c.pconnSCION != nil {
+		scionEp := epAddr{
+			ap:       de.scionState.hostAddr,
+			scionKey: de.scionState.pathKey,
+		}
+		de.startDiscoPingLocked(scionEp, now, pingDiscovery, 0, nil)
+		sentAny = true
+	}
+
 	derpAddr := de.derpAddr
 	if sentAny && sendCallMeMaybe && derpAddr.IsValid() {
 		// Have our magicsock.Conn figure out its STUN endpoint (if
@@ -1533,6 +1543,35 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 	de.setEndpointsLocked(n.Endpoints())
 
 	de.relayCapable = capVerIsRelayCapable(n.Cap())
+
+	// Check for SCION service advertisement from this peer.
+	if peerIA, hostAddr, ok := scionServiceFromPeer(n); ok {
+		if de.scionState == nil || de.scionState.peerIA != peerIA || de.scionState.hostAddr != hostAddr {
+			// New or changed SCION address — discover paths.
+			if de.c.pconnSCION != nil {
+				pathKey, err := de.c.discoverSCIONPaths(de.c.connCtx, peerIA, hostAddr)
+				if err != nil {
+					de.c.logf("magicsock: SCION path discovery for %s failed: %v", peerIA, err)
+				} else {
+					de.scionState = &scionEndpointState{
+						peerIA:   peerIA,
+						hostAddr: hostAddr,
+						pathKey:  pathKey,
+					}
+					de.c.logf("[v1] magicsock: discovered SCION path to %s (key=%d)", peerIA, pathKey)
+				}
+			}
+		}
+	} else if de.scionState != nil {
+		// Peer no longer advertises SCION.
+		de.c.unregisterSCIONPath(de.scionState.pathKey)
+		de.scionState = nil
+	}
+
+	// Check if SCION should be preferred for this peer.
+	peerSCIONPrefer := n.CapMap().Contains(tailcfg.NodeAttrSCIONPrefer)
+	selfSCIONPrefer := de.c.self.Valid() && de.c.self.CapMap().Contains(tailcfg.NodeAttrSCIONPrefer)
+	de.scionPreferred = peerSCIONPrefer && selfSCIONPrefer && de.scionState != nil
 }
 
 func (de *endpoint) setEndpointsLocked(eps interface {
@@ -1767,9 +1806,10 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	// TODO(bradfitz): decide how latency vs. preference order affects decision
 	if !isDerp {
 		thisPong := addrQuality{
-			epAddr:  sp.to,
-			latency: latency,
-			wireMTU: pingSizeToPktLen(sp.size, sp.to),
+			epAddr:         sp.to,
+			latency:        latency,
+			wireMTU:        pingSizeToPktLen(sp.size, sp.to),
+			scionPreferred: de.scionPreferred,
 		}
 		// TODO(jwhited): consider checking de.trustBestAddrUntil as well. If
 		//  de.bestAddr is untrusted we may want to clear it, otherwise we could
