@@ -1914,9 +1914,10 @@ func betterAddr(a, b addrQuality) bool {
 		return false
 	}
 
-	// SCION paths are preferred over relay but not over direct UDP.
-	// Direct UDP > SCION > UDP Relay > DERP
-	if a.scionKey.IsSet() != b.scionKey.IsSet() {
+	// SCION paths are preferred over relay but not over direct UDP,
+	// unless scionPreferred is set (both peers have NodeAttrSCIONPrefer),
+	// in which case the points system with the +40 bonus handles it.
+	if a.scionKey.IsSet() != b.scionKey.IsSet() && !a.scionPreferred && !b.scionPreferred {
 		if a.scionKey.IsSet() {
 			// a is SCION
 			if b.isDirect() {
