@@ -19,7 +19,6 @@ import (
 	"github.com/scionproto/scion/pkg/snet/mock_snet"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tstun"
-	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -182,22 +181,20 @@ func TestParseSCIONServiceAddr(t *testing.T) {
 
 func TestSCIONPathRegistry(t *testing.T) {
 	c := &Conn{}
-	c.mu = syncs.Mutex{}
 
-	// Register a path.
+	// Test locking versions (used by callers outside c.mu).
 	pi := &scionPathInfo{
 		peerIA:   addr.MustParseIA("1-ff00:0:111"),
 		hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
 	}
-	k := c.registerSCIONPath(pi)
+	k := c.registerSCIONPathLocking(pi)
 	if !k.IsSet() {
 		t.Fatal("registered key should be set")
 	}
 
-	// Look it up.
-	got := c.lookupSCIONPath(k)
+	got := c.lookupSCIONPathLocking(k)
 	if got != pi {
-		t.Fatalf("lookupSCIONPath(%d) returned wrong path info", k)
+		t.Fatalf("lookupSCIONPathLocking(%d) returned wrong path info", k)
 	}
 
 	// Register another.
@@ -205,26 +202,27 @@ func TestSCIONPathRegistry(t *testing.T) {
 		peerIA:   addr.MustParseIA("1-ff00:0:112"),
 		hostAddr: netip.MustParseAddrPort("10.0.0.2:41641"),
 	}
-	k2 := c.registerSCIONPath(pi2)
+	k2 := c.registerSCIONPathLocking(pi2)
 	if k2 == k {
 		t.Fatal("second key should differ from first")
 	}
-	if c.lookupSCIONPath(k2) != pi2 {
+	if c.lookupSCIONPathLocking(k2) != pi2 {
 		t.Fatal("second path not found")
 	}
 
-	// Unregister the first.
+	// Unregister the first (non-locking, must hold c.mu).
+	c.mu.Lock()
 	c.unregisterSCIONPath(k)
-	if c.lookupSCIONPath(k) != nil {
+	c.mu.Unlock()
+
+	if c.lookupSCIONPathLocking(k) != nil {
 		t.Fatal("unregistered path should return nil")
 	}
-	// Second should still be there.
-	if c.lookupSCIONPath(k2) != pi2 {
+	if c.lookupSCIONPathLocking(k2) != pi2 {
 		t.Fatal("second path should still be present after unregistering first")
 	}
 
-	// Lookup of non-existent key.
-	if c.lookupSCIONPath(scionPathKey(9999)) != nil {
+	if c.lookupSCIONPathLocking(scionPathKey(9999)) != nil {
 		t.Fatal("non-existent key should return nil")
 	}
 }
@@ -452,6 +450,34 @@ func TestScionServiceFromPeer(t *testing.T) {
 			},
 			wantOk: false,
 		},
+		{
+			name: "peer with SCION in peerapi4 description (piggyback)",
+			node: &tailcfg.Node{
+				ID:  5,
+				Key: testNodeKey(),
+				Hostinfo: (&tailcfg.Hostinfo{
+					Services: []tailcfg.Service{
+						{Proto: tailcfg.PeerAPI4, Port: 12345, Description: "scion=1-ff00:0:110,192.0.2.1:32766"},
+					},
+				}).View(),
+			},
+			wantIA:   addr.MustParseIA("1-ff00:0:110"),
+			wantAddr: netip.MustParseAddrPort("192.0.2.1:32766"),
+			wantOk:   true,
+		},
+		{
+			name: "peer with bad SCION piggyback",
+			node: &tailcfg.Node{
+				ID:  6,
+				Key: testNodeKey(),
+				Hostinfo: (&tailcfg.Hostinfo{
+					Services: []tailcfg.Service{
+						{Proto: tailcfg.PeerAPI4, Port: 12345, Description: "scion=bad-data"},
+					},
+				}).View(),
+			},
+			wantOk: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -616,18 +642,18 @@ func TestSCIONPathInfoMutexSafety(t *testing.T) {
 
 func TestScionListenPort(t *testing.T) {
 	tests := []struct {
-		name    string
-		envVal  string
-		want    uint16
+		name   string
+		envVal string
+		want   uint16
 	}{
-		{"default", "", scionDefaultPort},
+		{"default auto-select", "", 0},
 		{"valid port", "31337", 31337},
 		{"min port", "30000", 30000},
 		{"max port", "32767", 32767},
-		{"below range", "29999", scionDefaultPort},
-		{"above range", "32768", scionDefaultPort},
-		{"non-numeric", "abc", scionDefaultPort},
-		{"wireguard port", "41641", scionDefaultPort},
+		{"below range", "29999", 0},
+		{"above range", "32768", 0},
+		{"non-numeric", "abc", 0},
+		{"wireguard port", "41641", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -639,14 +665,6 @@ func TestScionListenPort(t *testing.T) {
 				t.Errorf("scionListenPort() = %d, want %d", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestSCIONDispatchedPortRange(t *testing.T) {
-	// Verify the default port is within the dispatched range.
-	if scionDefaultPort < scionDispatchedPortMin || scionDefaultPort > scionDispatchedPortMax {
-		t.Errorf("scionDefaultPort %d is outside dispatched range [%d, %d]",
-			scionDefaultPort, scionDispatchedPortMin, scionDispatchedPortMax)
 	}
 }
 
@@ -696,7 +714,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 			t.Fatal("returned key should be set")
 		}
 
-		pi := c.lookupSCIONPath(k)
+		pi := c.lookupSCIONPathLocking(k)
 		if pi == nil {
 			t.Fatal("path info not found in registry")
 		}
@@ -758,7 +776,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		pi := c.lookupSCIONPath(k)
+		pi := c.lookupSCIONPathLocking(k)
 		if pi == nil {
 			t.Fatal("path info not found")
 		}
@@ -800,12 +818,12 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
 			expiry:   time.Now().Add(30 * time.Second),
 		}
-		k := c.registerSCIONPath(pi)
+		k := c.registerSCIONPathLocking(pi)
 
 		c.refreshSCIONPathsOnce()
 
 		// Verify the path was updated.
-		got := c.lookupSCIONPath(k)
+		got := c.lookupSCIONPathLocking(k)
 		got.mu.Lock()
 		gotPath := got.path
 		gotExpiry := got.expiry
@@ -836,7 +854,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
 			expiry:   time.Now().Add(2 * time.Hour),
 		}
-		c.registerSCIONPath(pi)
+		c.registerSCIONPathLocking(pi)
 
 		// Should not call daemon.Paths since path doesn't need refresh.
 		c.refreshSCIONPathsOnce()
@@ -866,12 +884,12 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			path:     oldPath,
 			expiry:   time.Now().Add(30 * time.Second),
 		}
-		k := c.registerSCIONPath(pi)
+		k := c.registerSCIONPathLocking(pi)
 
 		c.refreshSCIONPathsOnce()
 
 		// Path should remain unchanged after daemon failure.
-		got := c.lookupSCIONPath(k)
+		got := c.lookupSCIONPathLocking(k)
 		got.mu.Lock()
 		gotPath := got.path
 		got.mu.Unlock()
@@ -908,11 +926,11 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
 			expiry:   time.Now().Add(30 * time.Second), // about to expire
 		}
-		k := c.registerSCIONPath(pi)
+		k := c.registerSCIONPathLocking(pi)
 
 		c.refreshSCIONPathsOnce()
 
-		got := c.lookupSCIONPath(k)
+		got := c.lookupSCIONPathLocking(k)
 		got.mu.Lock()
 		gotPath := got.path
 		got.mu.Unlock()

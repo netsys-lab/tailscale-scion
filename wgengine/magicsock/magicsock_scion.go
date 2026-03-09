@@ -47,12 +47,11 @@ type scionEndpointState struct {
 	pathKey  scionPathKey   // key into Conn.scionPaths
 }
 
-// SCION dispatcher port range. The SCION dispatcher only forwards packets
-// addressed to ports within this range.
+// SCION dispatched port range. The SCION endhost stack only directly dispatches
+// packets addressed to ports within this range. Port 0 means auto-select.
 const (
 	scionDispatchedPortMin = 30000
 	scionDispatchedPortMax = 32767
-	scionDefaultPort       = 31000
 )
 
 // scionConn wraps a SCION connection for use by magicsock.
@@ -121,8 +120,9 @@ func scionDaemonAddr() string {
 }
 
 // scionListenPort returns the SCION port to use, checking the TS_SCION_PORT
-// environment variable first, then falling back to the default. The port must
-// be within the SCION dispatched port range (30000-32767).
+// environment variable first, then falling back to 0 (auto-select from the
+// topology's dispatched port range). If set, the port must be within the SCION
+// dispatched port range.
 func scionListenPort() uint16 {
 	if p := os.Getenv("TS_SCION_PORT"); p != "" {
 		var v int
@@ -132,11 +132,12 @@ func scionListenPort() uint16 {
 			}
 		}
 	}
-	return scionDefaultPort
+	return 0 // let snet auto-select from topology port range
 }
 
 // trySCIONConnect attempts to connect to the local SCION daemon and set up a
-// SCION listener on a port within the SCION dispatched port range (30000-32767).
+// SCION listener. The listener binds to 127.0.0.1 (required by snet, which
+// rejects unspecified addresses) on a port within the dispatched range.
 // Returns nil if SCION is not available.
 func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 	daemonAddr := scionDaemonAddr()
@@ -146,32 +147,33 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		return nil, fmt.Errorf("connecting to SCION daemon at %s: %w", daemonAddr, err)
 	}
 
-	topo, err := daemon.LoadTopology(ctx, conn)
+	localIA, err := conn.LocalIA(ctx)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("loading SCION topology: %w", err)
+		return nil, fmt.Errorf("querying local IA: %w", err)
 	}
 
+	// In scion v0.12.0, daemon.Connector satisfies snet.Topology.
 	network := &snet.SCIONNetwork{
-		Topology: topo,
+		Topology: conn,
 	}
 
 	listenPort := scionListenPort()
 	listenAddr := &net.UDPAddr{
-		IP:   net.IPv4zero,
+		IP:   net.IPv4(127, 0, 0, 1),
 		Port: int(listenPort),
 	}
 	sconn, err := network.Listen(ctx, "udp", listenAddr)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("listening on SCION port %d: %w", listenPort, err)
+		return nil, fmt.Errorf("listening on SCION %s: %w", listenAddr, err)
 	}
 
 	return &scionConn{
 		conn:    sconn,
-		localIA: topo.LocalIA,
+		localIA: localIA,
 		daemon:  conn,
-		topo:    topo,
+		topo:    conn,
 	}, nil
 }
 
@@ -206,7 +208,7 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 		return false, errNoSCION
 	}
 
-	pi := c.lookupSCIONPath(addr.scionKey)
+	pi := c.lookupSCIONPathLocking(addr.scionKey)
 	if pi == nil {
 		return false, fmt.Errorf("no SCION path info for key %d", addr.scionKey)
 	}
@@ -226,7 +228,7 @@ func (c *Conn) sendSCION(sk scionPathKey, b []byte) (bool, error) {
 	if sc == nil {
 		return false, errNoSCION
 	}
-	pi := c.lookupSCIONPath(sk)
+	pi := c.lookupSCIONPathLocking(sk)
 	if pi == nil {
 		return false, fmt.Errorf("no SCION path info for key %d", sk)
 	}
@@ -238,14 +240,32 @@ func (c *Conn) sendSCION(sk scionPathKey, b []byte) (bool, error) {
 }
 
 // lookupSCIONPath returns the scionPathInfo for the given key, or nil if not found.
+// c.mu must be held.
 func (c *Conn) lookupSCIONPath(k scionPathKey) *scionPathInfo {
+	return c.scionPaths[k]
+}
+
+// lookupSCIONPathLocking returns the scionPathInfo for the given key, acquiring c.mu.
+func (c *Conn) lookupSCIONPathLocking(k scionPathKey) *scionPathInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.scionPaths[k]
 }
 
 // registerSCIONPath stores a scionPathInfo and returns a key for it.
+// c.mu must be held.
 func (c *Conn) registerSCIONPath(pi *scionPathInfo) scionPathKey {
+	k := scionPathKey(c.scionPathSeq.Add(1))
+	if c.scionPaths == nil {
+		c.scionPaths = make(map[scionPathKey]*scionPathInfo)
+	}
+	c.scionPaths[k] = pi
+	return k
+}
+
+// registerSCIONPathLocking stores a scionPathInfo, acquiring c.mu, and returns
+// a key for it.
+func (c *Conn) registerSCIONPathLocking(pi *scionPathInfo) scionPathKey {
 	k := scionPathKey(c.scionPathSeq.Add(1))
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -257,9 +277,8 @@ func (c *Conn) registerSCIONPath(pi *scionPathInfo) scionPathKey {
 }
 
 // unregisterSCIONPath removes a SCION path entry.
+// c.mu must be held.
 func (c *Conn) unregisterSCIONPath(k scionPathKey) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	delete(c.scionPaths, k)
 }
 
@@ -284,12 +303,13 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 
 		b := buffs[0][:n]
 
-		// Build an epAddr for this SCION source. We use the host IP:port
-		// from the SCION address. The scionKey on the epAddr is not set
-		// here since we're on the receive path — the peerMap lookup uses
-		// the host addr portion.
+		// Build an epAddr for this SCION source. Look up the scionKey
+		// so that pong replies are routed back over SCION.
 		srcHostAddr := srcAddr.Host.AddrPort()
 		srcEpAddr := epAddr{ap: srcHostAddr}
+		if sk := c.scionKeyForAddr(srcAddr.IA, srcHostAddr); sk.IsSet() {
+			srcEpAddr.scionKey = sk
+		}
 
 		// Check for disco packets (same as receiveIP does).
 		pt, _ := packetLooksLike(b)
@@ -354,7 +374,7 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		path:     best,
 		expiry:   expiry,
 	}
-	return c.registerSCIONPath(pi), nil
+	return c.registerSCIONPathLocking(pi), nil
 }
 
 // totalPathLatency returns the sum of all hop latencies for a SCION path.
@@ -446,6 +466,9 @@ func (c *Conn) refreshSCIONPathsOnce() {
 }
 
 // scionServiceFromPeer extracts SCION service info from a peer node's Services.
+// It checks for a dedicated SCION service entry first, then falls back to
+// checking the peerapi4 Description field (which is used to piggyback SCION
+// info through coord servers that only relay peerapi services).
 func scionServiceFromPeer(n tailcfg.NodeView) (ia addr.IA, hostAddr netip.AddrPort, ok bool) {
 	hi := n.Hostinfo()
 	if !hi.Valid() {
@@ -454,14 +477,34 @@ func scionServiceFromPeer(n tailcfg.NodeView) (ia addr.IA, hostAddr netip.AddrPo
 	services := hi.Services()
 	for i := range services.Len() {
 		svc := services.At(i)
-		if svc.Proto != tailcfg.SCION {
-			continue
+		// Direct SCION service entry.
+		if svc.Proto == tailcfg.SCION {
+			parsedIA, parsedAddr, err := parseSCIONServiceAddr(svc.Description, svc.Port)
+			if err != nil {
+				continue
+			}
+			return parsedIA, parsedAddr, true
 		}
-		parsedIA, parsedAddr, err := parseSCIONServiceAddr(svc.Description, svc.Port)
-		if err != nil {
-			continue
+		// Piggyback: SCION info in peerapi4's Description field.
+		// Format: "scion=ISD-AS,host-IP:port"
+		if svc.Proto == tailcfg.PeerAPI4 && strings.HasPrefix(svc.Description, "scion=") {
+			scionDesc := svc.Description[len("scion="):]
+			// Parse "ISD-AS,host-IP:port"
+			lastColon := strings.LastIndex(scionDesc, ":")
+			if lastColon < 0 {
+				continue
+			}
+			addrPart := scionDesc[:lastColon]
+			var port uint16
+			if _, err := fmt.Sscanf(scionDesc[lastColon+1:], "%d", &port); err != nil {
+				continue
+			}
+			parsedIA, parsedAddr, err := parseSCIONServiceAddr(addrPart, port)
+			if err != nil {
+				continue
+			}
+			return parsedIA, parsedAddr, true
 		}
-		return parsedIA, parsedAddr, true
 	}
 	return 0, netip.AddrPort{}, false
 }
@@ -473,23 +516,59 @@ func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) {
 	if sc == nil {
 		return tailcfg.Service{}, false
 	}
-	// The local host IP comes from the SCION connection's local address.
+	// snet.Conn.LocalAddr() returns an *snet.UDPAddr; extract host IP and port.
 	localAddr := sc.conn.LocalAddr()
-	hostIP := "0.0.0.0"
-	if ua, uaOk := localAddr.(*net.UDPAddr); uaOk && ua.IP != nil {
-		hostIP = ua.IP.String()
-	}
-	// Advertise the actual SCION listen port (within dispatched range),
-	// not the magicsock/WireGuard port.
+	hostIP := "127.0.0.1"
 	var scionPort uint16
-	if ua, uaOk := localAddr.(*net.UDPAddr); uaOk {
-		scionPort = uint16(ua.Port)
+	if sa, saOk := localAddr.(*snet.UDPAddr); saOk && sa.Host != nil {
+		if sa.Host.IP != nil {
+			hostIP = sa.Host.IP.String()
+		}
+		scionPort = uint16(sa.Host.Port)
 	}
 	return tailcfg.Service{
 		Proto:       tailcfg.SCION,
 		Port:        scionPort,
 		Description: fmt.Sprintf("%s,%s", sc.localIA, hostIP),
 	}, true
+}
+
+// discoverSCIONPathAsync runs SCION path discovery in a goroutine,
+// avoiding blocking updateFromNode which holds the endpoint lock.
+func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPort) {
+	ctx, cancel := context.WithTimeout(de.c.connCtx, 10*time.Second)
+	defer cancel()
+
+	pathKey, err := de.c.discoverSCIONPaths(ctx, peerIA, hostAddr)
+	if err != nil {
+		de.c.logf("magicsock: SCION path discovery for %s failed: %v", peerIA, err)
+		return
+	}
+
+	de.mu.Lock()
+	de.scionState = &scionEndpointState{
+		peerIA:   peerIA,
+		hostAddr: hostAddr,
+		pathKey:  pathKey,
+	}
+	de.mu.Unlock()
+	de.c.logf("magicsock: discovered SCION path to %s (key=%d)", peerIA, pathKey)
+}
+
+// scionKeyForAddr returns the scionPathKey for the given peer IA and host
+// address, or a zero key if not found.
+func (c *Conn) scionKeyForAddr(peerIA addr.IA, hostAddr netip.AddrPort) scionPathKey {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, pi := range c.scionPaths {
+		pi.mu.Lock()
+		match := pi.peerIA == peerIA && pi.hostAddr == hostAddr
+		pi.mu.Unlock()
+		if match {
+			return k
+		}
+	}
+	return 0
 }
 
 var errNoSCION = fmt.Errorf("SCION not available")

@@ -1547,19 +1547,13 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 	// Check for SCION service advertisement from this peer.
 	if peerIA, hostAddr, ok := scionServiceFromPeer(n); ok {
 		if de.scionState == nil || de.scionState.peerIA != peerIA || de.scionState.hostAddr != hostAddr {
-			// New or changed SCION address — discover paths.
+			// New or changed SCION address — discover paths asynchronously
+			// to avoid blocking updateFromNode (which holds the endpoint lock).
 			if de.c.pconnSCION != nil {
-				pathKey, err := de.c.discoverSCIONPaths(de.c.connCtx, peerIA, hostAddr)
-				if err != nil {
-					de.c.logf("magicsock: SCION path discovery for %s failed: %v", peerIA, err)
-				} else {
-					de.scionState = &scionEndpointState{
-						peerIA:   peerIA,
-						hostAddr: hostAddr,
-						pathKey:  pathKey,
-					}
-					de.c.logf("[v1] magicsock: discovered SCION path to %s (key=%d)", peerIA, pathKey)
-				}
+				de.c.logf("magicsock: SCION peer %s at %s, discovering paths...", peerIA, hostAddr)
+				go de.discoverSCIONPathAsync(peerIA, hostAddr)
+			} else {
+				de.c.logf("magicsock: peer has SCION (%s) but local SCION not available", peerIA)
 			}
 		}
 	} else if de.scionState != nil {
@@ -1767,9 +1761,10 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	now := mono.Now()
 	latency := now.Sub(sp.at)
 
-	if !isDerp && !src.vni.IsSet() {
-		// Note: we check vni.isSet() as relay [epAddr]'s are not stored in
-		// endpointState, they are either de.bestAddr or not.
+	if !isDerp && !src.vni.IsSet() && !src.scionKey.IsSet() {
+		// Note: we check vni.IsSet() and scionKey.IsSet() as relay and
+		// SCION epAddr's are not stored in endpointState; they are either
+		// de.bestAddr or not.
 		st, ok := de.endpointState[sp.to.ap]
 		if !ok {
 			// This is no longer an endpoint we care about.
@@ -1914,22 +1909,14 @@ func betterAddr(a, b addrQuality) bool {
 		return false
 	}
 
-	// SCION paths are preferred over relay but not over direct UDP,
-	// unless scionPreferred is set (both peers have NodeAttrSCIONPrefer),
-	// in which case the points system with the +40 bonus handles it.
-	if a.scionKey.IsSet() != b.scionKey.IsSet() && !a.scionPreferred && !b.scionPreferred {
+	// SCION paths are preferred over direct UDP and relay.
+	// TODO(scion): revert to "SCION < direct" once data plane is validated;
+	// this is temporarily inverted for testing.
+	if a.scionKey.IsSet() != b.scionKey.IsSet() {
 		if a.scionKey.IsSet() {
-			// a is SCION
-			if b.isDirect() {
-				return false // direct wins over SCION
-			}
-			return true // SCION wins over relay/DERP
+			return true // SCION wins over direct/relay/DERP
 		}
-		// b is SCION
-		if a.isDirect() {
-			return true // direct wins over SCION
-		}
-		return false // SCION wins over relay/DERP
+		return false // SCION wins over direct/relay/DERP
 	}
 
 	// Each address starts with a set of points (from 0 to 100) that
