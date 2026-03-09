@@ -3613,7 +3613,7 @@ func (c *Conn) rebind(curPortFate currentPortFate) error {
 
 	// Try to set up SCION if not already connected.
 	if c.pconnSCION == nil {
-		sc, err := trySCIONConnect(c.connCtx, c.LocalPort())
+		sc, err := trySCIONConnect(c.connCtx)
 		if err != nil {
 			c.logf("magicsock: SCION not available: %v", err)
 		} else {

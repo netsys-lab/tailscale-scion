@@ -614,6 +614,42 @@ func TestSCIONPathInfoMutexSafety(t *testing.T) {
 	<-done
 }
 
+func TestScionListenPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		envVal  string
+		want    uint16
+	}{
+		{"default", "", scionDefaultPort},
+		{"valid port", "31337", 31337},
+		{"min port", "30000", 30000},
+		{"max port", "32767", 32767},
+		{"below range", "29999", scionDefaultPort},
+		{"above range", "32768", scionDefaultPort},
+		{"non-numeric", "abc", scionDefaultPort},
+		{"wireguard port", "41641", scionDefaultPort},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envVal != "" {
+				t.Setenv("TS_SCION_PORT", tt.envVal)
+			}
+			got := scionListenPort()
+			if got != tt.want {
+				t.Errorf("scionListenPort() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSCIONDispatchedPortRange(t *testing.T) {
+	// Verify the default port is within the dispatched range.
+	if scionDefaultPort < scionDispatchedPortMin || scionDefaultPort > scionDispatchedPortMax {
+		t.Errorf("scionDefaultPort %d is outside dispatched range [%d, %d]",
+			scionDefaultPort, scionDispatchedPortMin, scionDispatchedPortMax)
+	}
+}
+
 func TestSCIONDiscoRXPath(t *testing.T) {
 	if discoRXPathSCION != "SCION" {
 		t.Errorf("discoRXPathSCION = %q, want %q", discoRXPathSCION, "SCION")

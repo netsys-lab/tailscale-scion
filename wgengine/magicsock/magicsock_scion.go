@@ -47,6 +47,14 @@ type scionEndpointState struct {
 	pathKey  scionPathKey   // key into Conn.scionPaths
 }
 
+// SCION dispatcher port range. The SCION dispatcher only forwards packets
+// addressed to ports within this range.
+const (
+	scionDispatchedPortMin = 30000
+	scionDispatchedPortMax = 32767
+	scionDefaultPort       = 31000
+)
+
 // scionConn wraps a SCION connection for use by magicsock.
 type scionConn struct {
 	conn    *snet.Conn       // from SCIONNetwork.Listen()
@@ -112,9 +120,25 @@ func scionDaemonAddr() string {
 	return daemon.DefaultAPIAddress
 }
 
+// scionListenPort returns the SCION port to use, checking the TS_SCION_PORT
+// environment variable first, then falling back to the default. The port must
+// be within the SCION dispatched port range (30000-32767).
+func scionListenPort() uint16 {
+	if p := os.Getenv("TS_SCION_PORT"); p != "" {
+		var v int
+		if _, err := fmt.Sscanf(p, "%d", &v); err == nil {
+			if v >= scionDispatchedPortMin && v <= scionDispatchedPortMax {
+				return uint16(v)
+			}
+		}
+	}
+	return scionDefaultPort
+}
+
 // trySCIONConnect attempts to connect to the local SCION daemon and set up a
-// SCION listener. Returns nil if SCION is not available.
-func trySCIONConnect(ctx context.Context, localPort uint16) (*scionConn, error) {
+// SCION listener on a port within the SCION dispatched port range (30000-32767).
+// Returns nil if SCION is not available.
+func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 	daemonAddr := scionDaemonAddr()
 	svc := daemon.Service{Address: daemonAddr}
 	conn, err := svc.Connect(ctx)
@@ -132,14 +156,15 @@ func trySCIONConnect(ctx context.Context, localPort uint16) (*scionConn, error) 
 		Topology: topo,
 	}
 
+	listenPort := scionListenPort()
 	listenAddr := &net.UDPAddr{
 		IP:   net.IPv4zero,
-		Port: int(localPort),
+		Port: int(listenPort),
 	}
 	sconn, err := network.Listen(ctx, "udp", listenAddr)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("listening on SCION: %w", err)
+		return nil, fmt.Errorf("listening on SCION port %d: %w", listenPort, err)
 	}
 
 	return &scionConn{
@@ -454,9 +479,15 @@ func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) {
 	if ua, uaOk := localAddr.(*net.UDPAddr); uaOk && ua.IP != nil {
 		hostIP = ua.IP.String()
 	}
+	// Advertise the actual SCION listen port (within dispatched range),
+	// not the magicsock/WireGuard port.
+	var scionPort uint16
+	if ua, uaOk := localAddr.(*net.UDPAddr); uaOk {
+		scionPort = uint16(ua.Port)
+	}
 	return tailcfg.Service{
 		Proto:       tailcfg.SCION,
-		Port:        c.LocalPort(),
+		Port:        scionPort,
 		Description: fmt.Sprintf("%s,%s", sc.localIA, hostIP),
 	}, true
 }
