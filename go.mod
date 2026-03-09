@@ -189,6 +189,7 @@ require (
 	github.com/gokrazy/gokapi v0.0.0-20250222071133-506fdb322775 // indirect
 	github.com/gokrazy/internal v0.0.0-20251208203110-3c1aa9087c82 // indirect
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
+	github.com/golang/mock v1.7.0-rc.1 // indirect
 	github.com/golangci/plugin-module-register v0.1.1 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-github/v66 v66.0.0 // indirect
