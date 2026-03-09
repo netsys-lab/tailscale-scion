@@ -519,7 +519,8 @@ func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) bool {
 		// kick off discovery disco pings every trustUDPAddrDuration and mirror
 		// to DERP.
 		de.mu.Lock()
-		if de.heartbeatDisabled && de.bestAddr.epAddr == src {
+		if de.heartbeatDisabled && (de.bestAddr.epAddr == src ||
+			(de.bestAddr.isSCION() && de.bestAddr.ap == src.ap)) {
 			de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
 		}
 		de.mu.Unlock()
@@ -1078,6 +1079,13 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		_, err = de.c.sendSCIONBatch(udpAddr, buffs, offset)
 		if err != nil {
 			de.noteBadEndpoint(udpAddr)
+		} else if de.c.metrics != nil {
+			var txBytes int
+			for _, b := range buffs {
+				txBytes += len(b[offset:])
+			}
+			de.c.metrics.outboundPacketsSCIONTotal.Add(int64(len(buffs)))
+			de.c.metrics.outboundBytesSCIONTotal.Add(int64(txBytes))
 		}
 	} else if udpAddr.ap.IsValid() {
 		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
@@ -1918,14 +1926,12 @@ func betterAddr(a, b addrQuality) bool {
 		return false
 	}
 
-	// SCION paths are preferred over direct UDP and relay.
-	// TODO(scion): revert to "SCION < direct" once data plane is validated;
-	// this is temporarily inverted for testing.
-	if a.scionKey.IsSet() != b.scionKey.IsSet() {
-		if a.scionKey.IsSet() {
-			return true // SCION wins over direct/relay/DERP
-		}
-		return false // SCION wins over direct/relay/DERP
+	// SCION beats relay (Geneve) unconditionally.
+	if a.scionKey.IsSet() && !b.scionKey.IsSet() && b.vni.IsSet() {
+		return true
+	}
+	if b.scionKey.IsSet() && !a.scionKey.IsSet() && a.vni.IsSet() {
+		return false
 	}
 
 	// Each address starts with a set of points (from 0 to 100) that
@@ -1972,14 +1978,20 @@ func betterAddr(a, b addrQuality) bool {
 		bPoints += 10
 	}
 
-	// When both self and peer have NodeAttrSCIONPrefer, give SCION paths
-	// a large bonus so they're preferred over direct UDP unless direct UDP
-	// is dramatically faster.
+	// SCION paths get a configurable bonus (default +15) so they win at
+	// similar latency. NodeAttrSCIONPrefer adds +25 more for a strong
+	// admin preference (total +40 at default).
+	if a.scionKey.IsSet() {
+		aPoints += scionPreferenceBonus()
+	}
+	if b.scionKey.IsSet() {
+		bPoints += scionPreferenceBonus()
+	}
 	if a.scionPreferred && a.scionKey.IsSet() {
-		aPoints += 40
+		aPoints += 25
 	}
 	if b.scionPreferred && b.scionKey.IsSet() {
-		bPoints += 40
+		bPoints += 25
 	}
 
 	// Don't change anything if the latency improvement is less than 1%; we
@@ -2113,7 +2125,14 @@ func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
 func (de *endpoint) stopAndReset() {
 	atomic.AddInt64(&de.numStopAndResetAtomic, 1)
 	de.mu.Lock()
-	defer de.mu.Unlock()
+
+	// Extract scionPathKey before releasing de.mu so we can clean it up
+	// under c.mu afterward (lock order: c.mu before de.mu).
+	var scionKey scionPathKey
+	if de.scionState != nil {
+		scionKey = de.scionState.pathKey
+		de.scionState = nil
+	}
 
 	if closing := de.c.closing.Load(); !closing {
 		if de.isWireguardOnly {
@@ -2131,6 +2150,14 @@ func (de *endpoint) stopAndReset() {
 	if de.heartBeatTimer != nil {
 		de.heartBeatTimer.Stop()
 		de.heartBeatTimer = nil
+	}
+	de.mu.Unlock()
+
+	// Clean up SCION path outside de.mu (lock order: c.mu before de.mu).
+	if scionKey.IsSet() {
+		de.c.mu.Lock()
+		de.c.unregisterSCIONPath(scionKey)
+		de.c.mu.Unlock()
 	}
 }
 

@@ -16,10 +16,27 @@ import (
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/snet"
 	wgconn "github.com/tailscale/wireguard-go/conn"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
 )
+
+// debugSCIONPreference is the TS_SCION_PREFERENCE envknob controlling the
+// betterAddr points bonus for SCION paths. Default 15; set to 0 to disable.
+var debugSCIONPreference = envknob.RegisterInt("TS_SCION_PREFERENCE")
+
+// scionPreferenceBonus returns the betterAddr points bonus for SCION paths.
+// Returns the value of TS_SCION_PREFERENCE if set, otherwise defaults to 15.
+func scionPreferenceBonus() int {
+	if v := debugSCIONPreference(); v != 0 {
+		return v
+	}
+	if v, ok := envknob.LookupInt("TS_SCION_PREFERENCE"); ok {
+		return v // allow explicit 0
+	}
+	return 15
+}
 
 // scionPathKey is a compact index into the Conn-level scionPaths registry.
 // This keeps epAddr small and comparable (snet.UDPAddr contains slices).
@@ -28,6 +45,13 @@ type scionPathKey uint32
 
 // IsSet reports whether k refers to a valid SCION path entry.
 func (k scionPathKey) IsSet() bool { return k != 0 }
+
+// scionAddrKey is a comparable key for the reverse index from (IA, host:port)
+// to scionPathKey, enabling O(1) lookup in receiveSCION.
+type scionAddrKey struct {
+	ia   addr.IA
+	addr netip.AddrPort
+}
 
 // scionPathInfo holds the full SCION path information for a peer, indexed by
 // scionPathKey. The actual SCION address and path data live here rather than
@@ -232,8 +256,29 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 		return false, fmt.Errorf("no SCION path info for key %d", addr.scionKey)
 	}
 
+	// Read path info once for the entire batch to avoid repeated locking.
+	pi.mu.Lock()
+	path, hostAddr, peerIA := pi.path, pi.hostAddr, pi.peerIA
+	expired := !pi.expiry.IsZero() && time.Now().After(pi.expiry)
+	pi.mu.Unlock()
+	if expired {
+		return false, fmt.Errorf("SCION path expired for key %d", addr.scionKey)
+	}
+
+	dst := &snet.UDPAddr{
+		IA: peerIA,
+		Host: &net.UDPAddr{
+			IP:   hostAddr.Addr().AsSlice(),
+			Port: int(hostAddr.Port()),
+		},
+	}
+	if path != nil {
+		dst.Path = path.Dataplane()
+		dst.NextHop = path.UnderlayNextHop()
+	}
+
 	for _, buf := range buffs {
-		_, err = sc.writeTo(buf[offset:], pi)
+		_, err = sc.conn.WriteTo(buf[offset:], dst)
 		if err != nil {
 			return false, err
 		}
@@ -250,6 +295,12 @@ func (c *Conn) sendSCION(sk scionPathKey, b []byte) (bool, error) {
 	pi := c.lookupSCIONPathLocking(sk)
 	if pi == nil {
 		return false, fmt.Errorf("no SCION path info for key %d", sk)
+	}
+	pi.mu.Lock()
+	expired := !pi.expiry.IsZero() && time.Now().After(pi.expiry)
+	pi.mu.Unlock()
+	if expired {
+		return false, fmt.Errorf("SCION path expired for key %d", sk)
 	}
 	_, err := sc.writeTo(b, pi)
 	if err != nil {
@@ -278,7 +329,11 @@ func (c *Conn) registerSCIONPath(pi *scionPathInfo) scionPathKey {
 	if c.scionPaths == nil {
 		c.scionPaths = make(map[scionPathKey]*scionPathInfo)
 	}
+	if c.scionPathsByAddr == nil {
+		c.scionPathsByAddr = make(map[scionAddrKey]scionPathKey)
+	}
 	c.scionPaths[k] = pi
+	c.scionPathsByAddr[scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr}] = k
 	return k
 }
 
@@ -291,13 +346,20 @@ func (c *Conn) registerSCIONPathLocking(pi *scionPathInfo) scionPathKey {
 	if c.scionPaths == nil {
 		c.scionPaths = make(map[scionPathKey]*scionPathInfo)
 	}
+	if c.scionPathsByAddr == nil {
+		c.scionPathsByAddr = make(map[scionAddrKey]scionPathKey)
+	}
 	c.scionPaths[k] = pi
+	c.scionPathsByAddr[scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr}] = k
 	return k
 }
 
 // unregisterSCIONPath removes a SCION path entry.
 // c.mu must be held.
 func (c *Conn) unregisterSCIONPath(k scionPathKey) {
+	if pi, ok := c.scionPaths[k]; ok {
+		delete(c.scionPathsByAddr, scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr})
+	}
 	delete(c.scionPaths, k)
 }
 
@@ -361,6 +423,10 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		now := mono.Now()
 		ep.lastRecvUDPAny.StoreAtomic(now)
 		ep.noteRecvActivity(srcEpAddr, now)
+		if c.metrics != nil {
+			c.metrics.inboundPacketsSCIONTotal.Add(1)
+			c.metrics.inboundBytesSCIONTotal.Add(int64(n))
+		}
 		sizes[0] = n
 		eps[0] = ep
 		return 1, nil
@@ -432,25 +498,48 @@ func totalPathLatency(p snet.Path) time.Duration {
 }
 
 // refreshSCIONPaths runs in a background goroutine, periodically refreshing
-// SCION paths before they expire.
+// SCION paths before they expire. It uses exponential backoff when the SCION
+// daemon is unreachable.
 func (c *Conn) refreshSCIONPaths() {
-	ticker := time.NewTicker(30 * time.Second)
+	const (
+		baseInterval = 30 * time.Second
+		maxBackoff   = 10 * time.Minute
+	)
+	ticker := time.NewTicker(baseInterval)
 	defer ticker.Stop()
 
+	var consecutiveFailures int
 	for {
 		select {
 		case <-c.donec:
 			return
 		case <-ticker.C:
-			c.refreshSCIONPathsOnce()
+			if consecutiveFailures > 0 {
+				backoff := baseInterval * time.Duration(1<<min(consecutiveFailures, 5))
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				ticker.Reset(backoff)
+			}
+			if err := c.refreshSCIONPathsOnce(); err != nil {
+				consecutiveFailures++
+				if consecutiveFailures == 5 {
+					c.logf("magicsock: SCION path refresh failing repeatedly (%d consecutive failures)", consecutiveFailures)
+				}
+			} else {
+				if consecutiveFailures > 0 {
+					ticker.Reset(baseInterval)
+				}
+				consecutiveFailures = 0
+			}
 		}
 	}
 }
 
-func (c *Conn) refreshSCIONPathsOnce() {
+func (c *Conn) refreshSCIONPathsOnce() error {
 	sc := c.pconnSCION
 	if sc == nil {
-		return
+		return nil
 	}
 
 	c.mu.Lock()
@@ -465,6 +554,7 @@ func (c *Conn) refreshSCIONPathsOnce() {
 	defer cancel()
 
 	now := time.Now()
+	var lastErr error
 	for _, pi := range pathsCopy {
 		pi.mu.Lock()
 		needsRefresh := !pi.expiry.IsZero() && now.After(pi.expiry.Add(-1*time.Minute))
@@ -478,6 +568,11 @@ func (c *Conn) refreshSCIONPathsOnce() {
 		paths, err := sc.daemon.Paths(ctx, peerIA, sc.localIA, daemon.PathReqFlags{Refresh: true})
 		if err != nil || len(paths) == 0 {
 			c.logf("magicsock: SCION path refresh for %s failed: %v", peerIA, err)
+			if err != nil {
+				lastErr = err
+			} else {
+				lastErr = fmt.Errorf("no paths to %s", peerIA)
+			}
 			continue
 		}
 
@@ -499,6 +594,7 @@ func (c *Conn) refreshSCIONPathsOnce() {
 		}
 		pi.mu.Unlock()
 	}
+	return lastErr
 }
 
 // scionServiceFromPeer extracts SCION service info from a peer node's Services.
@@ -600,19 +696,11 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 }
 
 // scionKeyForAddr returns the scionPathKey for the given peer IA and host
-// address, or a zero key if not found.
+// address, or a zero key if not found. O(1) via reverse index.
 func (c *Conn) scionKeyForAddr(peerIA addr.IA, hostAddr netip.AddrPort) scionPathKey {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for k, pi := range c.scionPaths {
-		pi.mu.Lock()
-		match := pi.peerIA == peerIA && pi.hostAddr == hostAddr
-		pi.mu.Unlock()
-		if match {
-			return k
-		}
-	}
-	return 0
+	return c.scionPathsByAddr[scionAddrKey{ia: peerIA, addr: hostAddr}]
 }
 
 var errNoSCION = fmt.Errorf("SCION not available")

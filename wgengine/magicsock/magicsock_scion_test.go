@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
 )
 
@@ -262,8 +264,7 @@ func TestBetterAddrSCION(t *testing.T) {
 		a, b addrQuality
 		want bool
 	}{
-		// SCION wins over direct UDP at equal latency.
-		// TODO(scion): revert when SCION preference is behind NodeAttrSCIONPrefer.
+		// SCION beats direct at equal latency (default +15 bonus).
 		{
 			name: "SCION beats direct same latency",
 			a:    alSCION(publicV4_2, 1, 100*ms),
@@ -276,7 +277,7 @@ func TestBetterAddrSCION(t *testing.T) {
 			b:    alSCION(publicV4_2, 1, 100*ms),
 			want: false,
 		},
-		// SCION wins over relay (VNI).
+		// SCION wins over relay (VNI) unconditionally.
 		{
 			name: "SCION beats relay same latency",
 			a:    alSCION(publicV4, 1, 100*ms),
@@ -289,19 +290,19 @@ func TestBetterAddrSCION(t *testing.T) {
 			b:    alSCION(publicV4, 1, 100*ms),
 			want: false,
 		},
-		// scionPreferred bonus is additive with SCION preference.
+		// scionPreferred bonus (+25 on top of +15) beats direct.
 		{
 			name: "scionPreferred SCION beats direct at similar latency",
 			a:    alSCIONPref(publicV4_2, 1, 100*ms),
 			b:    al(publicV4, 100*ms),
 			want: true,
 		},
-		// SCION always wins over direct (current preference order).
+		// Direct wins when significantly faster (SCION only has +15 bonus).
 		{
-			name: "SCION still wins over much faster direct",
+			name: "much faster direct beats SCION",
 			a:    alSCION(publicV4_2, 1, 100*ms),
 			b:    al(publicV4, 10*ms),
-			want: true,
+			want: false,
 		},
 		// Two SCION paths: lower latency wins.
 		{
@@ -567,6 +568,38 @@ func TestBetterAddrSCIONWithExistingCases(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("[%d] betterAddr(%+v, %+v) = %v; want %v", i, tt.a, tt.b, got, tt.want)
 		}
+	}
+}
+
+func TestSCIONPathRegistryReverseIndex(t *testing.T) {
+	c := &Conn{}
+
+	pi := &scionPathInfo{
+		peerIA:   addr.MustParseIA("1-ff00:0:111"),
+		hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
+	}
+	k := c.registerSCIONPathLocking(pi)
+
+	// Reverse lookup should find the key.
+	got := c.scionKeyForAddr(pi.peerIA, pi.hostAddr)
+	if got != k {
+		t.Errorf("scionKeyForAddr returned %d, want %d", got, k)
+	}
+
+	// Different address should not match.
+	got2 := c.scionKeyForAddr(pi.peerIA, netip.MustParseAddrPort("10.0.0.2:41641"))
+	if got2.IsSet() {
+		t.Error("scionKeyForAddr should return zero for unknown address")
+	}
+
+	// Unregister should remove from reverse index.
+	c.mu.Lock()
+	c.unregisterSCIONPath(k)
+	c.mu.Unlock()
+
+	got3 := c.scionKeyForAddr(pi.peerIA, pi.hostAddr)
+	if got3.IsSet() {
+		t.Error("scionKeyForAddr should return zero after unregister")
 	}
 }
 
@@ -965,5 +998,97 @@ func TestEpAddrSCIONAndVNIMutualExclusion(t *testing.T) {
 	got := both.String()
 	if got != "1.2.3.4:555:scion:1" {
 		t.Errorf("String() = %q, want SCION format", got)
+	}
+}
+
+func TestStopAndResetCleansSCIONPath(t *testing.T) {
+	c := &Conn{}
+	c.logf = t.Logf
+
+	pi := &scionPathInfo{
+		peerIA:   addr.MustParseIA("1-ff00:0:111"),
+		hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
+	}
+	k := c.registerSCIONPathLocking(pi)
+
+	de := &endpoint{c: c}
+	de.scionState = &scionEndpointState{
+		peerIA:   pi.peerIA,
+		hostAddr: pi.hostAddr,
+		pathKey:  k,
+	}
+
+	de.stopAndReset()
+
+	if de.scionState != nil {
+		t.Error("scionState should be nil after stopAndReset")
+	}
+	if c.lookupSCIONPathLocking(k) != nil {
+		t.Error("SCION path should be removed from registry after stopAndReset")
+	}
+}
+
+func TestNoteRecvActivitySCIONTrustRefresh(t *testing.T) {
+	c := &Conn{}
+	de := &endpoint{c: c}
+	de.heartbeatDisabled = true
+
+	scionAddr := epAddr{ap: netip.MustParseAddrPort("127.0.0.1:32766"), scionKey: 2}
+	plainAddr := epAddr{ap: netip.MustParseAddrPort("127.0.0.1:32766")}
+
+	now := mono.Now()
+	de.bestAddr.epAddr = scionAddr
+	de.bestAddrAt = now
+
+	// WireGuard data arrives with plain addr (no scionKey).
+	de.noteRecvActivity(plainAddr, now)
+
+	de.mu.Lock()
+	trust := de.trustBestAddrUntil
+	de.mu.Unlock()
+
+	if trust == 0 {
+		t.Error("trustBestAddrUntil should be extended for SCION bestAddr when receiving plain addr data")
+	}
+}
+
+func TestSendSCIONBatchExpiredPath(t *testing.T) {
+	c := &Conn{}
+	c.pconnSCION = &scionConn{}
+
+	pi := &scionPathInfo{
+		peerIA:   addr.MustParseIA("1-ff00:0:111"),
+		hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
+		expiry:   time.Now().Add(-1 * time.Hour), // expired
+	}
+	k := c.registerSCIONPathLocking(pi)
+
+	ep := epAddr{ap: netip.MustParseAddrPort("10.0.0.1:41641"), scionKey: k}
+	_, err := c.sendSCIONBatch(ep, [][]byte{{0x01}}, 0)
+	if err == nil {
+		t.Fatal("expected error for expired path")
+	}
+	if !strings.Contains(err.Error(), "expired") {
+		t.Errorf("error should mention 'expired', got: %v", err)
+	}
+}
+
+func TestSendSCIONExpiredPath(t *testing.T) {
+	c := &Conn{}
+	c.pconnSCION = &scionConn{}
+
+	pi := &scionPathInfo{
+		peerIA:   addr.MustParseIA("1-ff00:0:111"),
+		hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
+		expiry:   time.Now().Add(-1 * time.Hour), // expired
+	}
+	k := c.registerSCIONPathLocking(pi)
+
+	_, err := c.sendSCION(k, []byte{0x01})
+	if err == nil {
+		t.Fatal("expected error for expired path")
+	}
+	if !strings.Contains(err.Error(), "expired") {
+		t.Errorf("error should mention 'expired', got: %v", err)
 	}
 }

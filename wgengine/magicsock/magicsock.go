@@ -96,6 +96,7 @@ const (
 	PathDERP          Path = "derp"
 	PathPeerRelayIPv4 Path = "peer_relay_ipv4"
 	PathPeerRelayIPv6 Path = "peer_relay_ipv6"
+	PathSCION         Path = "scion"
 )
 
 type pathLabel struct {
@@ -145,6 +146,12 @@ type metrics struct {
 	outboundBytesDERPTotal          expvar.Int
 	outboundBytesPeerRelayIPv4Total expvar.Int
 	outboundBytesPeerRelayIPv6Total expvar.Int
+
+	// SCION path counters.
+	inboundPacketsSCIONTotal  expvar.Int
+	inboundBytesSCIONTotal    expvar.Int
+	outboundPacketsSCIONTotal expvar.Int
+	outboundBytesSCIONTotal   expvar.Int
 
 	// outboundPacketsDroppedErrors is the total number of outbound packets
 	// dropped due to errors.
@@ -415,8 +422,9 @@ type Conn struct {
 	// scionPaths is the registry of SCION path information, keyed by
 	// scionPathKey. Each entry holds the full SCION address and path
 	// data for a peer.
-	scionPaths   map[scionPathKey]*scionPathInfo
-	scionPathSeq atomic.Uint32 // monotonic key generator for scionPaths
+	scionPaths      map[scionPathKey]*scionPathInfo
+	scionPathsByAddr map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
+	scionPathSeq    atomic.Uint32                  // monotonic key generator for scionPaths
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -722,6 +730,7 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 	pathDERP := pathLabel{Path: PathDERP}
 	pathPeerRelayV4 := pathLabel{Path: PathPeerRelayIPv4}
 	pathPeerRelayV6 := pathLabel{Path: PathPeerRelayIPv6}
+	pathSCION := pathLabel{Path: PathSCION}
 	inboundPacketsTotal := usermetric.NewMultiLabelMapWithRegistry[pathLabel](
 		reg,
 		"tailscaled_inbound_packets_total",
@@ -776,30 +785,38 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 	metricSendDERP.Register(&m.outboundPacketsDERPTotal)
 	metricSendPeerRelay.Register(&m.outboundPacketsPeerRelayIPv4Total)
 	metricSendPeerRelay.Register(&m.outboundPacketsPeerRelayIPv6Total)
+	metricRecvDataPacketsSCION.Register(&m.inboundPacketsSCIONTotal)
+	metricRecvDataBytesSCION.Register(&m.inboundBytesSCIONTotal)
+	metricSendDataPacketsSCION.Register(&m.outboundPacketsSCIONTotal)
+	metricSendDataBytesSCION.Register(&m.outboundBytesSCIONTotal)
 
 	inboundPacketsTotal.Set(pathDirectV4, &m.inboundPacketsIPv4Total)
 	inboundPacketsTotal.Set(pathDirectV6, &m.inboundPacketsIPv6Total)
 	inboundPacketsTotal.Set(pathDERP, &m.inboundPacketsDERPTotal)
 	inboundPacketsTotal.Set(pathPeerRelayV4, &m.inboundPacketsPeerRelayIPv4Total)
 	inboundPacketsTotal.Set(pathPeerRelayV6, &m.inboundPacketsPeerRelayIPv6Total)
+	inboundPacketsTotal.Set(pathSCION, &m.inboundPacketsSCIONTotal)
 
 	inboundBytesTotal.Set(pathDirectV4, &m.inboundBytesIPv4Total)
 	inboundBytesTotal.Set(pathDirectV6, &m.inboundBytesIPv6Total)
 	inboundBytesTotal.Set(pathDERP, &m.inboundBytesDERPTotal)
 	inboundBytesTotal.Set(pathPeerRelayV4, &m.inboundBytesPeerRelayIPv4Total)
 	inboundBytesTotal.Set(pathPeerRelayV6, &m.inboundBytesPeerRelayIPv6Total)
+	inboundBytesTotal.Set(pathSCION, &m.inboundBytesSCIONTotal)
 
 	outboundPacketsTotal.Set(pathDirectV4, &m.outboundPacketsIPv4Total)
 	outboundPacketsTotal.Set(pathDirectV6, &m.outboundPacketsIPv6Total)
 	outboundPacketsTotal.Set(pathDERP, &m.outboundPacketsDERPTotal)
 	outboundPacketsTotal.Set(pathPeerRelayV4, &m.outboundPacketsPeerRelayIPv4Total)
 	outboundPacketsTotal.Set(pathPeerRelayV6, &m.outboundPacketsPeerRelayIPv6Total)
+	outboundPacketsTotal.Set(pathSCION, &m.outboundPacketsSCIONTotal)
 
 	outboundBytesTotal.Set(pathDirectV4, &m.outboundBytesIPv4Total)
 	outboundBytesTotal.Set(pathDirectV6, &m.outboundBytesIPv6Total)
 	outboundBytesTotal.Set(pathDERP, &m.outboundBytesDERPTotal)
 	outboundBytesTotal.Set(pathPeerRelayV4, &m.outboundBytesPeerRelayIPv4Total)
 	outboundBytesTotal.Set(pathPeerRelayV6, &m.outboundBytesPeerRelayIPv6Total)
+	outboundBytesTotal.Set(pathSCION, &m.outboundBytesSCIONTotal)
 
 	outboundPacketsDroppedErrors.Set(usermetric.DropLabels{Reason: usermetric.ReasonError}, &m.outboundPacketsDroppedErrors)
 
@@ -832,6 +849,10 @@ func deregisterMetrics() {
 	metricSendUDP.UnregisterAll()
 	metricSendDERP.UnregisterAll()
 	metricSendPeerRelay.UnregisterAll()
+	metricRecvDataPacketsSCION.UnregisterAll()
+	metricRecvDataBytesSCION.UnregisterAll()
+	metricSendDataPacketsSCION.UnregisterAll()
+	metricSendDataBytesSCION.UnregisterAll()
 }
 
 // InstallCaptureHook installs a callback which is called to
@@ -4031,6 +4052,12 @@ var (
 	metricSendDataBytesIPv6          = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_ipv6")
 	metricSendDataBytesPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv4")
 	metricSendDataBytesPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv6")
+
+	// SCION data packets and bytes
+	metricRecvDataPacketsSCION = clientmetric.NewAggregateCounter("magicsock_recv_data_scion")
+	metricRecvDataBytesSCION  = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_scion")
+	metricSendDataPacketsSCION = clientmetric.NewAggregateCounter("magicsock_send_data_scion")
+	metricSendDataBytesSCION   = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_scion")
 
 	// Disco packets
 	metricSendDiscoUDP                           = clientmetric.NewCounter("magicsock_disco_send_udp")
