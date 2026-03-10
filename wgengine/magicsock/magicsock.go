@@ -425,6 +425,10 @@ type Conn struct {
 	scionPaths      map[scionPathKey]*scionPathInfo
 	scionPathsByAddr map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
 	scionPathSeq    atomic.Uint32                  // monotonic key generator for scionPaths
+
+	// lastSCIONRecv is the last time we received any SCION packet.
+	// Used by receiveSCION to detect a dead socket and trigger reconnection.
+	lastSCIONRecv atomic.Int64 // unix nanos
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -3340,6 +3344,11 @@ func (c *connBind) Close() error {
 	}
 	if c.closeDisco6 != nil {
 		c.closeDisco6.Close()
+	}
+	if c.pconnSCION != nil {
+		// Set an immediate read deadline to unblock receiveSCION.
+		// We don't close the SCION socket here; Conn.Close handles that.
+		c.pconnSCION.conn.SetReadDeadline(time.Now())
 	}
 	// Send an empty read result to unblock receiveDERP,
 	// which will then check connBind.Closed.

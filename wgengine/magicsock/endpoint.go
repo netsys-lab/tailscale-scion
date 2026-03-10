@@ -1859,20 +1859,22 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 			wireMTU:        pingSizeToPktLen(sp.size, sp.to),
 			scionPreferred: de.scionPreferred,
 		}
-		// TODO(jwhited): consider checking de.trustBestAddrUntil as well. If
-		//  de.bestAddr is untrusted we may want to clear it, otherwise we could
-		//  get stuck with a forever untrusted bestAddr that blackholes, since
-		//  we don't clear direct UDP paths on disco ping timeout (see
-		//  discoPingTimeout).
-		if betterAddr(thisPong, de.bestAddr) {
-			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
-			de.debugUpdates.Add(EndpointChange{
-				When: time.Now(),
-				What: "handlePongConnLocked-bestAddr-update",
-				From: de.bestAddr,
-				To:   thisPong,
-			})
-			de.setBestAddrLocked(thisPong)
+		// If the current bestAddr is untrusted (no recent pong confirming
+		// it works), allow any fresh pong to replace it. This prevents
+		// getting stuck with a dead bestAddr that betterAddr() refuses to
+		// demote due to preference rules (e.g., TS_PREFER_SCION=1).
+		curBestUntrusted := de.bestAddr.ap.IsValid() && now.After(de.trustBestAddrUntil)
+		if curBestUntrusted || betterAddr(thisPong, de.bestAddr) {
+			if thisPong.epAddr != de.bestAddr.epAddr {
+				de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
+				de.debugUpdates.Add(EndpointChange{
+					When: time.Now(),
+					What: "handlePongConnLocked-bestAddr-update",
+					From: de.bestAddr,
+					To:   thisPong,
+				})
+				de.setBestAddrLocked(thisPong)
+			}
 		}
 		if de.bestAddr.epAddr == thisPong.epAddr {
 			de.debugUpdates.Add(EndpointChange{

@@ -5,6 +5,7 @@ package magicsock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -93,6 +94,18 @@ const scionFallbackPayloadMTU = 1280
 // scionUnsetHopLatency is the assumed per-hop latency when the SCION daemon
 // reports LatencyUnset for a hop. Conservative estimate for path selection.
 const scionUnsetHopLatency = 10 * time.Millisecond
+
+// scionReadDeadline is the read deadline set on the SCION socket.
+// If no packet is received within this duration, we check whether the
+// socket is still alive. This must be long enough to avoid spurious
+// reconnections during idle periods, but short enough to detect a dead
+// socket promptly.
+const scionReadDeadline = 30 * time.Second
+
+// scionReconnectThreshold is the maximum time without receiving any SCION
+// packet before we consider the socket dead and attempt to reconnect.
+// This is only checked when there are active SCION peers.
+const scionReconnectThreshold = 30 * time.Second
 
 // scionEndpointState tracks SCION-specific per-peer state on an endpoint.
 type scionEndpointState struct {
@@ -421,22 +434,84 @@ func (c *Conn) unregisterSCIONPath(k scionPathKey) {
 
 // receiveSCION is the conn.ReceiveFunc for SCION packets. It reads from the
 // SCION connection and dispatches disco or WireGuard packets.
+//
+// Unlike receiveIP, this function handles read timeouts internally and never
+// propagates them to WireGuard. This is critical because WireGuard's
+// RoutineReceiveIncoming exits the goroutine permanently after 10 consecutive
+// temporary errors, and we need to survive SCION socket death + reconnection.
+//
+// The function uses SetReadDeadline to periodically wake up and check whether
+// the socket is still alive. If no packets are received for
+// scionReconnectThreshold while active SCION peers exist, we close the old
+// socket and reconnect.
 func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
 	sc := c.pconnSCION
 	if sc == nil {
-		// Block until the Conn is closed if SCION is not available.
 		<-c.donec
 		return 0, net.ErrClosed
 	}
 
+	// Initialize lastSCIONRecv so we don't trigger reconnection on startup.
+	c.lastSCIONRecv.CompareAndSwap(0, time.Now().UnixNano())
+
 	for {
+		// Check for graceful shutdown.
+		select {
+		case <-c.donec:
+			return 0, net.ErrClosed
+		default:
+		}
+
+		// Re-read pconnSCION — it may have been swapped by reconnectSCION.
+		sc = c.pconnSCION
+		if sc == nil {
+			// Socket was closed and reconnection failed. Retry.
+			select {
+			case <-c.donec:
+				return 0, net.ErrClosed
+			case <-time.After(5 * time.Second):
+			}
+			c.retrySCIONConnect()
+			continue
+		}
+
+		// Set a read deadline so we wake up periodically even if the socket
+		// is silently dead (SCION router lost our port registration).
+		sc.conn.SetReadDeadline(time.Now().Add(scionReadDeadline))
+
 		n, srcAddr, err := sc.readFrom(buffs[0])
 		if err != nil {
-			return 0, err
+			// Graceful shutdown: Conn is closing.
+			select {
+			case <-c.donec:
+				return 0, net.ErrClosed
+			default:
+			}
+
+			// Timeout: check if we need to reconnect.
+			if isTimeoutError(err) {
+				if c.shouldReconnectSCION() {
+					c.reconnectSCION()
+				}
+				continue
+			}
+
+			// Socket closed (by reconnectSCION or externally): re-read
+			// pconnSCION on next iteration.
+			if errors.Is(err, net.ErrClosed) {
+				continue
+			}
+
+			// Other errors: log and continue. Never propagate to WireGuard.
+			c.logf("magicsock: SCION read error: %v", err)
+			continue
 		}
 		if n == 0 {
 			continue
 		}
+
+		// Got a packet — record receive time.
+		c.lastSCIONRecv.Store(time.Now().UnixNano())
 
 		b := buffs[0][:n]
 
@@ -470,8 +545,6 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		}
 
 		if !c.havePrivateKey.Load() {
-			// No private key means we're logged out. Don't pass WireGuard
-			// packets up; wireguard-go will just complain.
 			continue
 		}
 
@@ -482,9 +555,6 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		ep, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
 		c.mu.Unlock()
 		if !ok {
-			// No peerMap entry yet. Return a lazyEndpoint so WireGuard
-			// can identify the peer from the encrypted packet and
-			// register it, matching the behavior of receiveIP.
 			sizes[0] = n
 			eps[0] = &lazyEndpoint{c: c, src: srcEpAddr}
 			return 1, nil
@@ -500,6 +570,112 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		sizes[0] = n
 		eps[0] = ep
 		return 1, nil
+	}
+}
+
+// isTimeoutError reports whether err is a network timeout (from SetReadDeadline).
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// shouldReconnectSCION reports whether the SCION socket appears dead and
+// should be reconnected. The socket is considered dead when:
+//  1. No SCION packet has been received for scionReconnectThreshold, AND
+//  2. There are active SCION peers (otherwise silence is expected).
+func (c *Conn) shouldReconnectSCION() bool {
+	lastRecv := time.Unix(0, c.lastSCIONRecv.Load())
+	if time.Since(lastRecv) < scionReconnectThreshold {
+		return false
+	}
+
+	// Check if any endpoint has SCION state (active SCION peers).
+	c.mu.Lock()
+	hasSCIONPeers := len(c.scionPaths) > 0
+	c.mu.Unlock()
+	return hasSCIONPeers
+}
+
+// reconnectSCION closes the current SCION socket and creates a new one.
+// The receiveSCION loop will pick up the new socket on the next iteration.
+func (c *Conn) reconnectSCION() {
+	c.logf("magicsock: SCION socket appears dead (no recv for %v), reconnecting...", scionReconnectThreshold)
+
+	oldSC := c.pconnSCION
+
+	// Close old connection first — we must release the port before binding
+	// the new socket. When TS_SCION_PORT is set, both sockets would try
+	// to bind the same port. This means there's a brief window where
+	// pconnSCION is nil and sends will fail, but that's acceptable —
+	// the endpoint was already dead anyway.
+	if oldSC != nil {
+		oldSC.close()
+	}
+	c.pconnSCION = nil
+
+	newSC, err := trySCIONConnect(c.connCtx)
+	if err != nil {
+		c.logf("magicsock: SCION reconnect failed: %v", err)
+		// Reset the receive timestamp so we retry after scionReconnectThreshold.
+		c.lastSCIONRecv.Store(time.Now().UnixNano())
+		return
+	}
+
+	// Swap in the new connection.
+	c.pconnSCION = newSC
+
+	// Reset the receive timestamp so we don't immediately re-trigger.
+	c.lastSCIONRecv.Store(time.Now().UnixNano())
+
+	c.logf("magicsock: SCION reconnected successfully, local IA: %s", newSC.localIA)
+
+	// Re-discover paths for all SCION peers. We need fresh paths that
+	// use the new socket's local address.
+	c.rediscoverAllSCIONPaths()
+}
+
+// retrySCIONConnect attempts to re-establish a SCION connection when
+// pconnSCION is nil (previous reconnect attempt failed).
+func (c *Conn) retrySCIONConnect() {
+	if c.pconnSCION != nil {
+		return // another goroutine beat us to it
+	}
+	newSC, err := trySCIONConnect(c.connCtx)
+	if err != nil {
+		c.logf("magicsock: SCION reconnect retry failed: %v", err)
+		return
+	}
+	c.pconnSCION = newSC
+	c.lastSCIONRecv.Store(time.Now().UnixNano())
+	c.logf("magicsock: SCION reconnect retry succeeded, local IA: %s", newSC.localIA)
+	c.rediscoverAllSCIONPaths()
+}
+
+// rediscoverAllSCIONPaths triggers path re-discovery for all endpoints that
+// have SCION state. This is called after reconnecting the SCION socket to
+// ensure paths reference the new connection.
+func (c *Conn) rediscoverAllSCIONPaths() {
+	c.mu.Lock()
+	var peers []struct {
+		ep       *endpoint
+		peerIA   addr.IA
+		hostAddr netip.AddrPort
+	}
+	c.peerMap.forEachEndpoint(func(ep *endpoint) {
+		ep.mu.Lock()
+		if ep.scionState != nil {
+			peers = append(peers, struct {
+				ep       *endpoint
+				peerIA   addr.IA
+				hostAddr netip.AddrPort
+			}{ep, ep.scionState.peerIA, ep.scionState.hostAddr})
+		}
+		ep.mu.Unlock()
+	})
+	c.mu.Unlock()
+
+	for _, p := range peers {
+		go p.ep.discoverSCIONPathAsync(p.peerIA, p.hostAddr)
 	}
 }
 
