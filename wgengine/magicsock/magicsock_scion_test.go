@@ -683,10 +683,10 @@ func TestScionListenPort(t *testing.T) {
 		{"valid port", "31337", 31337},
 		{"min port", "30000", 30000},
 		{"max port", "32767", 32767},
-		{"below range", "29999", 0},
-		{"above range", "32768", 0},
+		{"below range", "29999", 29999},   // scionListenPort only parses; range validation is in trySCIONConnect
+		{"above range", "32768", 32768},   // same: validated against daemon port range later
 		{"non-numeric", "abc", 0},
-		{"wireguard port", "41641", 0},
+		{"wireguard port", "41641", 41641}, // any valid port is accepted at parse time
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
