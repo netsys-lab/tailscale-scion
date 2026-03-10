@@ -866,6 +866,16 @@ func (de *endpoint) heartbeat() {
 
 	if de.wantFullPingLocked(now) {
 		de.sendDiscoPingsLocked(now, true)
+	} else if de.scionState != nil && de.c.pconnSCION != nil && !de.bestAddr.isSCION() {
+		// Even when the current best path is "good enough" to skip a full ping
+		// round, heartbeat the SCION path so it can compete via betterAddr.
+		// Without this, SCION never gets pinged once a low-latency direct path
+		// suppresses wantFullPingLocked.
+		scionEp := epAddr{
+			ap:       de.scionState.hostAddr,
+			scionKey: de.scionState.pathKey,
+		}
+		de.startDiscoPingLocked(scionEp, now, pingHeartbeat, 0, nil)
 	}
 
 	if de.wantUDPRelayPathDiscoveryLocked(now) {
@@ -1026,6 +1036,14 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
 		// [heartbeatInterval] tick or [discoPingInterval] rate-limiting.
 		for ep := range de.endpointState {
 			de.startDiscoPingLocked(epAddr{ap: ep}, now, pingCLI, size, resCB)
+		}
+		// Also ping over SCION if available for this peer.
+		if de.scionState != nil && de.c.pconnSCION != nil {
+			scionEp := epAddr{
+				ap:       de.scionState.hostAddr,
+				scionKey: de.scionState.pathKey,
+			}
+			de.startDiscoPingLocked(scionEp, now, pingCLI, size, resCB)
 		}
 		if de.wantUDPRelayPathDiscoveryLocked(now) {
 			de.discoverUDPRelayPathsLocked(now)
