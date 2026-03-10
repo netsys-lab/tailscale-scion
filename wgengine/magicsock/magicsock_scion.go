@@ -228,10 +228,32 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		IP:   net.IPv4(127, 0, 0, 1),
 		Port: int(listenPort),
 	}
-	sconn, err := network.Listen(ctx, "udp", listenAddr)
+
+	// Use OpenRaw + NewCookedConn instead of Listen so we can set socket
+	// buffer sizes on the underlying UDP connection before wrapping it.
+	pconn, err := network.OpenRaw(ctx, listenAddr)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("listening on SCION %s: %w", listenAddr, err)
+	}
+
+	// Increase underlay UDP socket buffers to match the regular magicsock
+	// UDP sockets (7 MB). The default kernel buffer (~212 KB) overflows
+	// easily at high throughput, causing packet drops and TCP retransmissions.
+	if pc, ok := pconn.(*snet.SCIONPacketConn); ok {
+		if err := pc.SetReadBuffer(socketBufferSize); err != nil {
+			fmt.Fprintf(os.Stderr, "magicsock: SCION: failed to set read buffer to %d: %v\n", socketBufferSize, err)
+		}
+		if err := pc.SetWriteBuffer(socketBufferSize); err != nil {
+			fmt.Fprintf(os.Stderr, "magicsock: SCION: failed to set write buffer to %d: %v\n", socketBufferSize, err)
+		}
+	}
+
+	sconn, err := snet.NewCookedConn(pconn, conn)
+	if err != nil {
+		pconn.Close()
+		conn.Close()
+		return nil, fmt.Errorf("creating SCION conn: %w", err)
 	}
 
 	return &scionConn{
