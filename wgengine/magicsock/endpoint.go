@@ -1079,6 +1079,15 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		_, err = de.c.sendSCIONBatch(udpAddr, buffs, offset)
 		if err != nil {
 			de.noteBadEndpoint(udpAddr)
+			// Trigger throttled re-discovery so we don't wait up to 30s
+			// for the periodic refreshSCIONPaths to fix an expired path.
+			de.mu.Lock()
+			st := de.scionState
+			shouldRediscover := st != nil && time.Since(st.lastDiscoveryAt) > 5*time.Second
+			de.mu.Unlock()
+			if shouldRediscover {
+				go de.discoverSCIONPathAsync(st.peerIA, st.hostAddr)
+			}
 		} else if de.c.metrics != nil {
 			var txBytes int
 			for _, b := range buffs {
@@ -1500,7 +1509,6 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 		panic("nil node when updating endpoint")
 	}
 	de.mu.Lock()
-	defer de.mu.Unlock()
 
 	de.heartbeatDisabled = heartbeatDisabled
 	if probeUDPLifetimeEnabled {
@@ -1555,6 +1563,8 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 	de.relayCapable = capVerIsRelayCapable(n.Cap())
 
 	// Check for SCION service advertisement from this peer.
+	// Extract old SCION key for cleanup outside de.mu (lock order: c.mu before de.mu).
+	var oldSCIONKey scionPathKey
 	if peerIA, hostAddr, ok := scionServiceFromPeer(n); ok {
 		if de.scionState == nil || de.scionState.peerIA != peerIA || de.scionState.hostAddr != hostAddr {
 			// New or changed SCION address — discover paths asynchronously
@@ -1568,7 +1578,7 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 		}
 	} else if de.scionState != nil {
 		// Peer no longer advertises SCION.
-		de.c.unregisterSCIONPath(de.scionState.pathKey)
+		oldSCIONKey = de.scionState.pathKey
 		de.scionState = nil
 	}
 
@@ -1576,6 +1586,15 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 	peerSCIONPrefer := n.CapMap().Contains(tailcfg.NodeAttrSCIONPrefer)
 	selfSCIONPrefer := de.c.self.Valid() && de.c.self.CapMap().Contains(tailcfg.NodeAttrSCIONPrefer)
 	de.scionPreferred = peerSCIONPrefer && selfSCIONPrefer && de.scionState != nil
+
+	de.mu.Unlock()
+
+	// Clean up SCION path outside de.mu (lock order: c.mu before de.mu).
+	if oldSCIONKey.IsSet() {
+		de.c.mu.Lock()
+		de.c.unregisterSCIONPath(oldSCIONKey)
+		de.c.mu.Unlock()
+	}
 }
 
 func (de *endpoint) setEndpointsLocked(eps interface {

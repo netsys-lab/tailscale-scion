@@ -1985,6 +1985,8 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 
 	if isDERP {
 		metricSendDiscoDERP.Add(1)
+	} else if dst.scionKey.IsSet() {
+		metricSendDiscoSCION.Add(1)
 	} else {
 		metricSendDiscoUDP.Add(1)
 	}
@@ -2007,6 +2009,8 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 		}
 		if isDERP {
 			metricSentDiscoDERP.Add(1)
+		} else if dst.scionKey.IsSet() {
+			metricSentDiscoSCION.Add(1)
 		} else {
 			metricSentDiscoUDP.Add(1)
 		}
@@ -4062,8 +4066,10 @@ var (
 	// Disco packets
 	metricSendDiscoUDP                           = clientmetric.NewCounter("magicsock_disco_send_udp")
 	metricSendDiscoDERP                          = clientmetric.NewCounter("magicsock_disco_send_derp")
+	metricSendDiscoSCION                         = clientmetric.NewCounter("magicsock_disco_send_scion")
 	metricSentDiscoUDP                           = clientmetric.NewCounter("magicsock_disco_sent_udp")
 	metricSentDiscoDERP                          = clientmetric.NewCounter("magicsock_disco_sent_derp")
+	metricSentDiscoSCION                         = clientmetric.NewCounter("magicsock_disco_sent_scion")
 	metricSentDiscoPing                          = clientmetric.NewCounter("magicsock_disco_sent_ping")
 	metricSentDiscoPong                          = clientmetric.NewCounter("magicsock_disco_sent_pong")
 	metricSentDiscoPeerMTUProbes                 = clientmetric.NewCounter("magicsock_disco_sent_peer_mtu_probes")

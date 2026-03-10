@@ -1,3 +1,4 @@
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -83,11 +84,16 @@ type scionPathInfo struct {
 // 1280 bytes (minimum IPv6-compatible MTU).
 const scionFallbackPayloadMTU = 1280
 
+// scionUnsetHopLatency is the assumed per-hop latency when the SCION daemon
+// reports LatencyUnset for a hop. Conservative estimate for path selection.
+const scionUnsetHopLatency = 10 * time.Millisecond
+
 // scionEndpointState tracks SCION-specific per-peer state on an endpoint.
 type scionEndpointState struct {
-	peerIA   addr.IA        // peer's ISD-AS from Services advertisement
-	hostAddr netip.AddrPort // peer's SCION host IP:port
-	pathKey  scionPathKey   // key into Conn.scionPaths
+	peerIA          addr.IA        // peer's ISD-AS from Services advertisement
+	hostAddr        netip.AddrPort // peer's SCION host IP:port
+	pathKey         scionPathKey   // key into Conn.scionPaths
+	lastDiscoveryAt time.Time      // when path discovery last started (throttle)
 }
 
 // SCION dispatched port range. The SCION endhost stack only directly dispatches
@@ -489,7 +495,7 @@ func totalPathLatency(p snet.Path) time.Duration {
 	for _, l := range md.Latency {
 		if l < 0 {
 			// LatencyUnset — treat as unknown
-			total += 10 * time.Millisecond
+			total += scionUnsetHopLatency
 		} else {
 			total += l
 		}
@@ -523,8 +529,9 @@ func (c *Conn) refreshSCIONPaths() {
 			}
 			if err := c.refreshSCIONPathsOnce(); err != nil {
 				consecutiveFailures++
-				if consecutiveFailures == 5 {
-					c.logf("magicsock: SCION path refresh failing repeatedly (%d consecutive failures)", consecutiveFailures)
+				if consecutiveFailures == 1 || consecutiveFailures&(consecutiveFailures-1) == 0 {
+					c.logf("magicsock: SCION path refresh failed (%d consecutive): %v",
+						consecutiveFailures, err)
 				}
 			} else {
 				if consecutiveFailures > 0 {
@@ -668,8 +675,23 @@ func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) {
 // discoverSCIONPathAsync runs SCION path discovery in a goroutine,
 // avoiding blocking updateFromNode which holds the endpoint lock.
 func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPort) {
+	// Record discovery start time for throttling.
+	de.mu.Lock()
+	if de.scionState != nil {
+		de.scionState.lastDiscoveryAt = time.Now()
+	}
+	de.mu.Unlock()
+
 	ctx, cancel := context.WithTimeout(de.c.connCtx, 10*time.Second)
 	defer cancel()
+
+	// Capture old key before discovering new path.
+	de.mu.Lock()
+	var oldKey scionPathKey
+	if de.scionState != nil {
+		oldKey = de.scionState.pathKey
+	}
+	de.mu.Unlock()
 
 	pathKey, err := de.c.discoverSCIONPaths(ctx, peerIA, hostAddr)
 	if err != nil {
@@ -677,11 +699,19 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 		return
 	}
 
+	// Clean up old path entry if the key changed.
+	if oldKey.IsSet() && oldKey != pathKey {
+		de.c.mu.Lock()
+		de.c.unregisterSCIONPath(oldKey)
+		de.c.mu.Unlock()
+	}
+
 	de.mu.Lock()
 	de.scionState = &scionEndpointState{
-		peerIA:   peerIA,
-		hostAddr: hostAddr,
-		pathKey:  pathKey,
+		peerIA:          peerIA,
+		hostAddr:        hostAddr,
+		pathKey:         pathKey,
+		lastDiscoveryAt: time.Now(),
 	}
 	de.mu.Unlock()
 

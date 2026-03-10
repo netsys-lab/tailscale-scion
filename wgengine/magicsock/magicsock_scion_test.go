@@ -379,7 +379,7 @@ func TestTotalPathLatency(t *testing.T) {
 					3 * time.Millisecond,
 				},
 			}),
-			want: 5*time.Millisecond + 10*time.Millisecond + 3*time.Millisecond,
+			want: 5*time.Millisecond + scionUnsetHopLatency + 3*time.Millisecond,
 		},
 	}
 	for _, tt := range tests {
