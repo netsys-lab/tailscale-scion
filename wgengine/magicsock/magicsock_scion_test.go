@@ -580,6 +580,11 @@ func TestSCIONPathRegistryReverseIndex(t *testing.T) {
 	}
 	k := c.registerSCIONPathLocking(pi)
 
+	// Set as active path so the reverse index is populated.
+	c.mu.Lock()
+	c.setActiveSCIONPath(pi.peerIA, pi.hostAddr, k)
+	c.mu.Unlock()
+
 	// Reverse lookup should find the key.
 	got := c.scionKeyForAddr(pi.peerIA, pi.hostAddr)
 	if got != k {
@@ -607,10 +612,12 @@ func TestSCIONEndpointState(t *testing.T) {
 	ia := addr.MustParseIA("1-ff00:0:110")
 	hostAddr := netip.MustParseAddrPort("192.0.2.1:41641")
 
+	pk := scionPathKey(5)
 	st := &scionEndpointState{
-		peerIA:   ia,
-		hostAddr: hostAddr,
-		pathKey:  scionPathKey(5),
+		peerIA:     ia,
+		hostAddr:   hostAddr,
+		paths:      map[scionPathKey]*scionPathProbeState{pk: {}},
+		activePath: pk,
 	}
 
 	if st.peerIA != ia {
@@ -619,8 +626,11 @@ func TestSCIONEndpointState(t *testing.T) {
 	if st.hostAddr != hostAddr {
 		t.Errorf("hostAddr = %v, want %v", st.hostAddr, hostAddr)
 	}
-	if !st.pathKey.IsSet() {
-		t.Error("pathKey should be set")
+	if !st.activePath.IsSet() {
+		t.Error("activePath should be set")
+	}
+	if len(st.paths) != 1 {
+		t.Errorf("paths count = %d, want 1", len(st.paths))
 	}
 }
 
@@ -739,15 +749,21 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 		c := &Conn{}
 		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
 
-		k, err := c.discoverSCIONPaths(context.Background(), peerIA, hostAddr)
+		keys, err := c.discoverSCIONPaths(context.Background(), peerIA, hostAddr)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !k.IsSet() {
-			t.Fatal("returned key should be set")
+		if len(keys) == 0 {
+			t.Fatal("returned keys should not be empty")
+		}
+		// All 3 paths should be registered (deduped by fingerprint, but mock
+		// paths have no metadata for fingerprinting so they're all unique).
+		if len(keys) != 3 {
+			t.Fatalf("expected 3 keys, got %d", len(keys))
 		}
 
-		pi := c.lookupSCIONPathLocking(k)
+		// First key should be the lowest-latency path (fast one, 5ms).
+		pi := c.lookupSCIONPathLocking(keys[0])
 		if pi == nil {
 			t.Fatal("path info not found in registry")
 		}
@@ -757,9 +773,9 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 		if pi.hostAddr != hostAddr {
 			t.Errorf("hostAddr = %v, want %v", pi.hostAddr, hostAddr)
 		}
-		// The selected path should be the fast one (5ms).
+		// The first (active) path should be the fast one (5ms).
 		if pi.path != fastPath {
-			t.Error("should have selected the lowest-latency path")
+			t.Error("first key should be the lowest-latency path")
 		}
 	})
 
@@ -805,11 +821,14 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 		c := &Conn{}
 		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
 
-		k, err := c.discoverSCIONPaths(context.Background(), peerIA, hostAddr)
+		keys, err := c.discoverSCIONPaths(context.Background(), peerIA, hostAddr)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		pi := c.lookupSCIONPathLocking(k)
+		if len(keys) == 0 {
+			t.Fatal("returned keys should not be empty")
+		}
+		pi := c.lookupSCIONPathLocking(keys[0])
 		if pi == nil {
 			t.Fatal("path info not found")
 		}
@@ -1013,9 +1032,10 @@ func TestStopAndResetCleansSCIONPath(t *testing.T) {
 
 	de := &endpoint{c: c}
 	de.scionState = &scionEndpointState{
-		peerIA:   pi.peerIA,
-		hostAddr: pi.hostAddr,
-		pathKey:  k,
+		peerIA:     pi.peerIA,
+		hostAddr:   pi.hostAddr,
+		paths:      map[scionPathKey]*scionPathProbeState{k: {}},
+		activePath: k,
 	}
 
 	// stopAndReset requires c.mu to be held (all production callers hold it).

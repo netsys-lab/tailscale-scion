@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -64,13 +65,14 @@ type scionAddrKey struct {
 // scionPathKey. The actual SCION address and path data live here rather than
 // in epAddr to keep epAddr comparable and small.
 type scionPathInfo struct {
-	peerIA    addr.IA
-	hostAddr  netip.AddrPort  // peer's SCION host IP:port
-	path      snet.Path       // current best SCION path to this peer
-	replyPath *snet.UDPAddr   // bootstrapped from incoming packet (pre-reversed)
-	expiry    time.Time       // path expiration from path metadata
-	mtu       uint16          // SCION payload MTU from path metadata
-	mu        sync.Mutex
+	peerIA      addr.IA
+	hostAddr    netip.AddrPort       // peer's SCION host IP:port
+	fingerprint snet.PathFingerprint // SHA256 of interface sequence; for matching across refreshes
+	path        snet.Path            // current best SCION path to this peer
+	replyPath   *snet.UDPAddr        // bootstrapped from incoming packet (pre-reversed)
+	expiry      time.Time            // path expiration from path metadata
+	mtu         uint16               // SCION payload MTU from path metadata
+	mu          sync.Mutex
 }
 
 // scionHeaderOverhead is the fixed overhead added by SCION encapsulation,
@@ -107,12 +109,60 @@ const scionReadDeadline = 30 * time.Second
 // This is only checked when there are active SCION peers.
 const scionReconnectThreshold = 30 * time.Second
 
+// defaultSCIONProbePaths is the default number of SCION paths to probe per peer.
+const defaultSCIONProbePaths = 5
+
+// scionPongHistoryCount is the ring buffer size for per-path pong latency tracking.
+const scionPongHistoryCount = 8
+
+// scionMaxProbePaths returns the max number of SCION paths to probe per peer.
+// Defaults to 5, overridable via TS_SCION_MAX_PROBE_PATHS.
+func scionMaxProbePaths() int {
+	if v, ok := envknob.LookupInt("TS_SCION_MAX_PROBE_PATHS"); ok && v > 0 {
+		return v
+	}
+	return defaultSCIONProbePaths
+}
+
 // scionEndpointState tracks SCION-specific per-peer state on an endpoint.
 type scionEndpointState struct {
-	peerIA          addr.IA        // peer's ISD-AS from Services advertisement
-	hostAddr        netip.AddrPort // peer's SCION host IP:port
-	pathKey         scionPathKey   // key into Conn.scionPaths
-	lastDiscoveryAt time.Time      // when path discovery last started (throttle)
+	peerIA          addr.IA                                // peer's ISD-AS from Services advertisement
+	hostAddr        netip.AddrPort                         // peer's SCION host IP:port
+	paths           map[scionPathKey]*scionPathProbeState  // probed paths (up to scionMaxProbePaths)
+	activePath      scionPathKey                           // currently selected best path for data
+	lastDiscoveryAt time.Time                              // when path discovery last started (throttle)
+}
+
+// scionPathProbeState tracks disco probing state for one SCION path.
+type scionPathProbeState struct {
+	fingerprint snet.PathFingerprint
+	lastPing    mono.Time
+	recentPongs [scionPongHistoryCount]scionPongReply // ring buffer
+	recentPong  uint16                                 // index of most recent entry
+	pongCount   uint16                                 // total pongs received (capped at ring size)
+}
+
+// scionPongReply records one pong measurement for a SCION path.
+type scionPongReply struct {
+	latency time.Duration
+	pongAt  mono.Time
+}
+
+// addPongReply records a pong measurement in the ring buffer.
+func (ps *scionPathProbeState) addPongReply(r scionPongReply) {
+	ps.recentPong = (ps.recentPong + 1) % scionPongHistoryCount
+	ps.recentPongs[ps.recentPong] = r
+	if ps.pongCount < scionPongHistoryCount {
+		ps.pongCount++
+	}
+}
+
+// latency returns the most recent pong latency, or time.Hour if no pongs received.
+func (ps *scionPathProbeState) latency() time.Duration {
+	if ps.pongCount == 0 {
+		return time.Hour
+	}
+	return ps.recentPongs[ps.recentPong].latency
 }
 
 // scionConn wraps a SCION connection for use by magicsock.
@@ -398,38 +448,54 @@ func (c *Conn) registerSCIONPath(pi *scionPathInfo) scionPathKey {
 	if c.scionPaths == nil {
 		c.scionPaths = make(map[scionPathKey]*scionPathInfo)
 	}
-	if c.scionPathsByAddr == nil {
-		c.scionPathsByAddr = make(map[scionAddrKey]scionPathKey)
-	}
 	c.scionPaths[k] = pi
-	c.scionPathsByAddr[scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr}] = k
+	// Don't unconditionally overwrite scionPathsByAddr here — with multi-path,
+	// multiple keys share the same (IA, hostAddr). The caller is responsible
+	// for setting the active path via setActiveSCIONPath.
 	return k
 }
 
 // registerSCIONPathLocking stores a scionPathInfo, acquiring c.mu, and returns
 // a key for it.
 func (c *Conn) registerSCIONPathLocking(pi *scionPathInfo) scionPathKey {
-	k := scionPathKey(c.scionPathSeq.Add(1))
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.scionPaths == nil {
-		c.scionPaths = make(map[scionPathKey]*scionPathInfo)
-	}
-	if c.scionPathsByAddr == nil {
-		c.scionPathsByAddr = make(map[scionAddrKey]scionPathKey)
-	}
-	c.scionPaths[k] = pi
-	c.scionPathsByAddr[scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr}] = k
-	return k
+	return c.registerSCIONPath(pi)
 }
 
-// unregisterSCIONPath removes a SCION path entry.
+// unregisterSCIONPath removes a SCION path entry and its peerMap entry.
 // c.mu must be held.
 func (c *Conn) unregisterSCIONPath(k scionPathKey) {
 	if pi, ok := c.scionPaths[k]; ok {
-		delete(c.scionPathsByAddr, scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr})
+		// Only remove reverse index if it points to this key.
+		ak := scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr}
+		if c.scionPathsByAddr[ak] == k {
+			delete(c.scionPathsByAddr, ak)
+		}
+		// Remove stale peerMap entry for this scionKey.
+		scionEp := epAddr{ap: pi.hostAddr, scionKey: k}
+		if peerInf := c.peerMap.byEpAddr[scionEp]; peerInf != nil {
+			delete(peerInf.epAddrs, scionEp)
+			delete(c.peerMap.byEpAddr, scionEp)
+		}
 	}
 	delete(c.scionPaths, k)
+}
+
+// setActiveSCIONPath updates the reverse index to point to the given key.
+// c.mu must be held.
+func (c *Conn) setActiveSCIONPath(peerIA addr.IA, hostAddr netip.AddrPort, k scionPathKey) {
+	if c.scionPathsByAddr == nil {
+		c.scionPathsByAddr = make(map[scionAddrKey]scionPathKey)
+	}
+	c.scionPathsByAddr[scionAddrKey{ia: peerIA, addr: hostAddr}] = k
+}
+
+// updateActiveSCIONPathLocking updates the reverse index, acquiring c.mu.
+func (c *Conn) updateActiveSCIONPathLocking(peerIA addr.IA, hostAddr netip.AddrPort, k scionPathKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.setActiveSCIONPath(peerIA, hostAddr, k)
 }
 
 // receiveSCION is the conn.ReceiveFunc for SCION packets. It reads from the
@@ -537,6 +603,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 					hostAddr:  srcHostAddr,
 					replyPath: srcAddr,
 				})
+				c.setActiveSCIONPath(srcAddr.IA, srcHostAddr, sk)
 			}
 			c.mu.Unlock()
 			srcEpAddr.scionKey = sk
@@ -680,48 +747,83 @@ func (c *Conn) rediscoverAllSCIONPaths() {
 }
 
 // discoverSCIONPaths queries the SCION daemon for paths to the given peer IA,
-// selects the best one, and stores it in the path registry. Returns the
-// scionPathKey for the path.
-func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr netip.AddrPort) (scionPathKey, error) {
+// deduplicates by fingerprint, selects the top N by latency, and stores them
+// in the path registry. Returns the scionPathKeys for the registered paths
+// (first element is the lowest-latency path).
+func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr netip.AddrPort) ([]scionPathKey, error) {
 	sc := c.pconnSCION
 	if sc == nil {
-		return 0, errNoSCION
+		return nil, errNoSCION
 	}
 
 	paths, err := sc.daemon.Paths(ctx, peerIA, sc.localIA, daemon.PathReqFlags{Refresh: false})
 	if err != nil {
-		return 0, fmt.Errorf("querying SCION paths to %s: %w", peerIA, err)
+		return nil, fmt.Errorf("querying SCION paths to %s: %w", peerIA, err)
 	}
 	if len(paths) == 0 {
-		return 0, fmt.Errorf("no SCION paths to %s", peerIA)
+		return nil, fmt.Errorf("no SCION paths to %s", peerIA)
 	}
 
-	// Pick the path with lowest total latency.
-	best := paths[0]
-	bestLatency := totalPathLatency(best)
-	for _, p := range paths[1:] {
-		lat := totalPathLatency(p)
-		if lat < bestLatency {
-			best = p
-			bestLatency = lat
+	// Deduplicate by fingerprint (topologically identical paths).
+	type pathWithMeta struct {
+		path        snet.Path
+		fingerprint snet.PathFingerprint
+		latency     time.Duration
+	}
+	seen := make(map[snet.PathFingerprint]bool)
+	var unique []pathWithMeta
+	for _, p := range paths {
+		fp := snet.Fingerprint(p)
+		if fp != "" && seen[fp] {
+			continue
 		}
+		if fp != "" {
+			seen[fp] = true
+		}
+		unique = append(unique, pathWithMeta{
+			path:        p,
+			fingerprint: fp,
+			latency:     totalPathLatency(p),
+		})
 	}
 
-	var expiry time.Time
-	var mtu uint16
-	if md := best.Metadata(); md != nil {
-		expiry = md.Expiry
-		mtu = md.MTU
+	// Sort by latency ascending.
+	sort.Slice(unique, func(i, j int) bool {
+		return unique[i].latency < unique[j].latency
+	})
+
+	// Take top N.
+	maxPaths := scionMaxProbePaths()
+	if len(unique) > maxPaths {
+		unique = unique[:maxPaths]
 	}
 
-	pi := &scionPathInfo{
-		peerIA:   peerIA,
-		hostAddr: hostAddr,
-		path:     best,
-		expiry:   expiry,
-		mtu:      mtu,
+	// Register each path.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	keys := make([]scionPathKey, 0, len(unique))
+	for _, u := range unique {
+		var expiry time.Time
+		var mtu uint16
+		if md := u.path.Metadata(); md != nil {
+			expiry = md.Expiry
+			mtu = md.MTU
+		}
+		pi := &scionPathInfo{
+			peerIA:      peerIA,
+			hostAddr:    hostAddr,
+			fingerprint: u.fingerprint,
+			path:        u.path,
+			expiry:      expiry,
+			mtu:         mtu,
+		}
+		keys = append(keys, c.registerSCIONPath(pi))
 	}
-	return c.registerSCIONPathLocking(pi), nil
+	// Set the first (lowest-latency) path as active for the reverse index.
+	if len(keys) > 0 {
+		c.setActiveSCIONPath(peerIA, hostAddr, keys[0])
+	}
+	return keys, nil
 }
 
 // totalPathLatency returns the sum of all hop latencies for a SCION path.
@@ -797,49 +899,115 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 	}
 	c.mu.Unlock()
 
+	// Group paths by peerIA so we query the daemon once per peer.
+	type peerGroup struct {
+		peerIA      addr.IA
+		needRefresh bool
+		keys        []scionPathKey
+		infos       []*scionPathInfo
+	}
+	groups := make(map[addr.IA]*peerGroup)
+	now := time.Now()
+	for k, pi := range pathsCopy {
+		pi.mu.Lock()
+		peerIA := pi.peerIA
+		needsRefresh := !pi.expiry.IsZero() && now.After(pi.expiry.Add(-1*time.Minute))
+		pi.mu.Unlock()
+
+		g := groups[peerIA]
+		if g == nil {
+			g = &peerGroup{peerIA: peerIA}
+			groups[peerIA] = g
+		}
+		g.keys = append(g.keys, k)
+		g.infos = append(g.infos, pi)
+		if needsRefresh {
+			g.needRefresh = true
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(c.connCtx, 10*time.Second)
 	defer cancel()
 
-	now := time.Now()
 	var lastErr error
-	for _, pi := range pathsCopy {
-		pi.mu.Lock()
-		needsRefresh := !pi.expiry.IsZero() && now.After(pi.expiry.Add(-1*time.Minute))
-		peerIA := pi.peerIA
-		pi.mu.Unlock()
-
-		if !needsRefresh {
+	for _, g := range groups {
+		if !g.needRefresh {
 			continue
 		}
 
-		paths, err := sc.daemon.Paths(ctx, peerIA, sc.localIA, daemon.PathReqFlags{Refresh: true})
-		if err != nil || len(paths) == 0 {
-			c.logf("magicsock: SCION path refresh for %s failed: %v", peerIA, err)
+		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemon.PathReqFlags{Refresh: true})
+		if err != nil || len(daemonPaths) == 0 {
+			c.logf("magicsock: SCION path refresh for %s failed: %v", g.peerIA, err)
 			if err != nil {
 				lastErr = err
 			} else {
-				lastErr = fmt.Errorf("no paths to %s", peerIA)
+				lastErr = fmt.Errorf("no paths to %s", g.peerIA)
 			}
 			continue
 		}
 
-		best := paths[0]
-		bestLatency := totalPathLatency(best)
-		for _, p := range paths[1:] {
+		// Index daemon paths by fingerprint for matching.
+		type daemonPathEntry struct {
+			path snet.Path
+			fp   snet.PathFingerprint
+		}
+		var daemonByFP []daemonPathEntry
+		for _, dp := range daemonPaths {
+			daemonByFP = append(daemonByFP, daemonPathEntry{
+				path: dp,
+				fp:   snet.Fingerprint(dp),
+			})
+		}
+
+		// Find the best daemon path for fallback use.
+		bestDaemon := daemonPaths[0]
+		bestDaemonLat := totalPathLatency(bestDaemon)
+		for _, p := range daemonPaths[1:] {
 			lat := totalPathLatency(p)
-			if lat < bestLatency {
-				best = p
-				bestLatency = lat
+			if lat < bestDaemonLat {
+				bestDaemon = p
+				bestDaemonLat = lat
 			}
 		}
 
-		pi.mu.Lock()
-		pi.path = best
-		if md := best.Metadata(); md != nil {
-			pi.expiry = md.Expiry
-			pi.mtu = md.MTU
+		// Match existing registered paths to daemon paths by fingerprint.
+		// Unmatched paths with known fingerprints (disappeared from daemon)
+		// are left unchanged — they'll be replaced on the next
+		// discoverSCIONPathAsync cycle. Paths with empty fingerprints
+		// (no metadata) get the best daemon path as fallback.
+		for _, pi := range g.infos {
+			pi.mu.Lock()
+			fp := pi.fingerprint
+			pi.mu.Unlock()
+
+			var matched snet.Path
+			if fp != "" {
+				for _, d := range daemonByFP {
+					if d.fp == fp {
+						matched = d.path
+						break
+					}
+				}
+				if matched == nil {
+					// Known fingerprint disappeared from daemon results.
+					// Skip — don't overwrite with a different topology.
+					continue
+				}
+			} else {
+				// No fingerprint (missing metadata). Use best daemon path.
+				matched = bestDaemon
+			}
+
+			pi.mu.Lock()
+			pi.path = matched
+			newFP := snet.Fingerprint(matched)
+			pi.fingerprint = newFP
+			if md := matched.Metadata(); md != nil {
+				pi.expiry = md.Expiry
+				pi.mtu = md.MTU
+			}
+			pi.mu.Unlock()
 		}
-		pi.mu.Unlock()
 	}
 	return lastErr
 }
@@ -933,44 +1101,85 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 	ctx, cancel := context.WithTimeout(de.c.connCtx, 10*time.Second)
 	defer cancel()
 
-	// Capture old key before discovering new path.
+	// Capture old keys before discovering new paths.
 	de.mu.Lock()
-	var oldKey scionPathKey
+	var oldKeys []scionPathKey
 	if de.scionState != nil {
-		oldKey = de.scionState.pathKey
+		for k := range de.scionState.paths {
+			oldKeys = append(oldKeys, k)
+		}
 	}
 	de.mu.Unlock()
 
-	pathKey, err := de.c.discoverSCIONPaths(ctx, peerIA, hostAddr)
+	newKeys, err := de.c.discoverSCIONPaths(ctx, peerIA, hostAddr)
 	if err != nil {
 		de.c.logf("magicsock: SCION path discovery for %s failed: %v", peerIA, err)
 		return
 	}
 
-	// Clean up old path entry if the key changed.
-	if oldKey.IsSet() && oldKey != pathKey {
-		de.c.mu.Lock()
-		de.c.unregisterSCIONPath(oldKey)
-		de.c.mu.Unlock()
+	// Build set of new keys for fast lookup.
+	newKeySet := make(map[scionPathKey]bool, len(newKeys))
+	for _, k := range newKeys {
+		newKeySet[k] = true
 	}
 
+	// Extract fingerprints under c.mu (must be acquired before de.mu per lock ordering).
+	de.c.mu.Lock()
+	fpByKey := make(map[scionPathKey]snet.PathFingerprint, len(newKeys))
+	for _, k := range newKeys {
+		if pi := de.c.lookupSCIONPath(k); pi != nil {
+			fpByKey[k] = pi.fingerprint
+		}
+	}
+	// Clean up old keys that aren't in the new set.
+	for _, k := range oldKeys {
+		if !newKeySet[k] {
+			de.c.unregisterSCIONPath(k)
+		}
+	}
+	de.c.mu.Unlock()
+
+	// Build probe state map, preserving history for surviving paths by fingerprint.
 	de.mu.Lock()
+	var oldProbeByFP map[snet.PathFingerprint]*scionPathProbeState
+	if de.scionState != nil {
+		oldProbeByFP = make(map[snet.PathFingerprint]*scionPathProbeState, len(de.scionState.paths))
+		for _, ps := range de.scionState.paths {
+			if ps.fingerprint != "" {
+				oldProbeByFP[ps.fingerprint] = ps
+			}
+		}
+	}
+
+	newPaths := make(map[scionPathKey]*scionPathProbeState, len(newKeys))
+	for _, k := range newKeys {
+		fp := fpByKey[k]
+		// Preserve existing probe history if the fingerprint matches.
+		if fp != "" && oldProbeByFP != nil {
+			if old, ok := oldProbeByFP[fp]; ok {
+				old.fingerprint = fp // ensure set
+				newPaths[k] = old
+				continue
+			}
+		}
+		newPaths[k] = &scionPathProbeState{fingerprint: fp}
+	}
+
+	activePath := scionPathKey(0)
+	if len(newKeys) > 0 {
+		activePath = newKeys[0]
+	}
+
 	de.scionState = &scionEndpointState{
 		peerIA:          peerIA,
 		hostAddr:        hostAddr,
-		pathKey:         pathKey,
+		paths:           newPaths,
+		activePath:      activePath,
 		lastDiscoveryAt: time.Now(),
 	}
 	de.mu.Unlock()
 
-	pi := de.c.lookupSCIONPathLocking(pathKey)
-	var mtu uint16
-	if pi != nil {
-		pi.mu.Lock()
-		mtu = pi.mtu
-		pi.mu.Unlock()
-	}
-	de.c.logf("magicsock: discovered SCION path to %s (key=%d, mtu=%d)", peerIA, pathKey, mtu)
+	de.c.logf("magicsock: discovered %d SCION paths to %s (active key=%d)", len(newKeys), peerIA, activePath)
 }
 
 // scionKeyForAddr returns the scionPathKey for the given peer IA and host

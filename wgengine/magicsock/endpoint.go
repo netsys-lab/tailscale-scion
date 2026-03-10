@@ -868,14 +868,20 @@ func (de *endpoint) heartbeat() {
 		de.sendDiscoPingsLocked(now, true)
 	} else if de.scionState != nil && de.c.pconnSCION != nil && !de.bestAddr.isSCION() {
 		// Even when the current best path is "good enough" to skip a full ping
-		// round, heartbeat the SCION path so it can compete via betterAddr.
+		// round, heartbeat all SCION paths so they can compete via betterAddr.
 		// Without this, SCION never gets pinged once a low-latency direct path
 		// suppresses wantFullPingLocked.
-		scionEp := epAddr{
-			ap:       de.scionState.hostAddr,
-			scionKey: de.scionState.pathKey,
+		for pk, ps := range de.scionState.paths {
+			if !ps.lastPing.IsZero() && now.Sub(ps.lastPing) < discoPingInterval {
+				continue
+			}
+			ps.lastPing = now
+			scionEp := epAddr{
+				ap:       de.scionState.hostAddr,
+				scionKey: pk,
+			}
+			de.startDiscoPingLocked(scionEp, now, pingHeartbeat, 0, nil)
 		}
-		de.startDiscoPingLocked(scionEp, now, pingHeartbeat, 0, nil)
 	}
 
 	if de.wantUDPRelayPathDiscoveryLocked(now) {
@@ -1037,13 +1043,15 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
 		for ep := range de.endpointState {
 			de.startDiscoPingLocked(epAddr{ap: ep}, now, pingCLI, size, resCB)
 		}
-		// Also ping over SCION if available for this peer.
+		// Also ping all SCION paths if available for this peer.
 		if de.scionState != nil && de.c.pconnSCION != nil {
-			scionEp := epAddr{
-				ap:       de.scionState.hostAddr,
-				scionKey: de.scionState.pathKey,
+			for pk := range de.scionState.paths {
+				scionEp := epAddr{
+					ap:       de.scionState.hostAddr,
+					scionKey: pk,
+				}
+				de.startDiscoPingLocked(scionEp, now, pingCLI, size, resCB)
 			}
-			de.startDiscoPingLocked(scionEp, now, pingCLI, size, resCB)
 		}
 		if de.wantUDPRelayPathDiscoveryLocked(now) {
 			de.discoverUDPRelayPathsLocked(now)
@@ -1419,13 +1427,19 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 
 		de.startDiscoPingLocked(epAddr{ap: ep}, now, pingDiscovery, 0, nil)
 	}
-	// Also ping over SCION if available for this peer.
+	// Also ping all SCION paths if available for this peer.
 	if de.scionState != nil && de.c.pconnSCION != nil {
-		scionEp := epAddr{
-			ap:       de.scionState.hostAddr,
-			scionKey: de.scionState.pathKey,
+		for pk, ps := range de.scionState.paths {
+			if !ps.lastPing.IsZero() && now.Sub(ps.lastPing) < discoPingInterval {
+				continue
+			}
+			ps.lastPing = now
+			scionEp := epAddr{
+				ap:       de.scionState.hostAddr,
+				scionKey: pk,
+			}
+			de.startDiscoPingLocked(scionEp, now, pingDiscovery, 0, nil)
 		}
-		de.startDiscoPingLocked(scionEp, now, pingDiscovery, 0, nil)
 		sentAny = true
 	}
 
@@ -1581,8 +1595,8 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 	de.relayCapable = capVerIsRelayCapable(n.Cap())
 
 	// Check for SCION service advertisement from this peer.
-	// Extract old SCION key for cleanup outside de.mu (lock order: c.mu before de.mu).
-	var oldSCIONKey scionPathKey
+	// Extract old SCION keys for cleanup outside de.mu (lock order: c.mu before de.mu).
+	var oldSCIONKeys []scionPathKey
 	if peerIA, hostAddr, ok := scionServiceFromPeer(n); ok {
 		if de.scionState == nil || de.scionState.peerIA != peerIA || de.scionState.hostAddr != hostAddr {
 			// New or changed SCION address — discover paths asynchronously
@@ -1596,7 +1610,9 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 		}
 	} else if de.scionState != nil {
 		// Peer no longer advertises SCION.
-		oldSCIONKey = de.scionState.pathKey
+		for k := range de.scionState.paths {
+			oldSCIONKeys = append(oldSCIONKeys, k)
+		}
 		de.scionState = nil
 	}
 
@@ -1607,10 +1623,10 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 
 	de.mu.Unlock()
 
-	// Clean up SCION path outside de.mu. c.mu is held by caller (updateNodes),
+	// Clean up SCION paths outside de.mu. c.mu is held by caller (updateNodes),
 	// so call unregisterSCIONPath directly without re-locking.
-	if oldSCIONKey.IsSet() {
-		de.c.unregisterSCIONPath(oldSCIONKey)
+	for _, k := range oldSCIONKeys {
+		de.c.unregisterSCIONPath(k)
 	}
 }
 
@@ -1834,6 +1850,18 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 		})
 	}
 
+	// Record latency for SCION paths in per-path probe state.
+	if !isDerp && src.scionKey.IsSet() {
+		if de.scionState != nil {
+			if ps, ok := de.scionState.paths[src.scionKey]; ok {
+				ps.addPongReply(scionPongReply{
+					latency: latency,
+					pongAt:  now,
+				})
+			}
+		}
+	}
+
 	if sp.purpose != pingHeartbeat && sp.purpose != pingHeartbeatForUDPLifetime {
 		de.c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got pong tx=%x latency=%v pktlen=%v pong.src=%v%v", de.c.discoAtomic.Short(), de.discoShort(), de.publicKey.ShortString(), src, m.TxID[:6], latency.Round(time.Millisecond), pktLen, m.Src, logger.ArgWriter(func(bw *bufio.Writer) {
 			if sp.to != src {
@@ -1874,6 +1902,11 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 					To:   thisPong,
 				})
 				de.setBestAddrLocked(thisPong)
+				// Update activePath when switching to a SCION path.
+				if thisPong.epAddr.scionKey.IsSet() && de.scionState != nil {
+					de.scionState.activePath = thisPong.epAddr.scionKey
+					go de.c.updateActiveSCIONPathLocking(de.scionState.peerIA, de.scionState.hostAddr, thisPong.epAddr.scionKey)
+				}
 			}
 		}
 		if de.bestAddr.epAddr == thisPong.epAddr {
@@ -2175,11 +2208,13 @@ func (de *endpoint) stopAndReset() {
 	atomic.AddInt64(&de.numStopAndResetAtomic, 1)
 	de.mu.Lock()
 
-	// Extract scionPathKey before releasing de.mu so we can clean it up
+	// Extract scionPathKeys before releasing de.mu so we can clean them up
 	// under c.mu afterward (lock order: c.mu before de.mu).
-	var scionKey scionPathKey
+	var scionKeys []scionPathKey
 	if de.scionState != nil {
-		scionKey = de.scionState.pathKey
+		for k := range de.scionState.paths {
+			scionKeys = append(scionKeys, k)
+		}
 		de.scionState = nil
 	}
 
@@ -2202,10 +2237,10 @@ func (de *endpoint) stopAndReset() {
 	}
 	de.mu.Unlock()
 
-	// Clean up SCION path outside de.mu. c.mu is held by caller
+	// Clean up SCION paths outside de.mu. c.mu is held by caller
 	// (updateNodes, SetPrivateKey, Close), so call directly.
-	if scionKey.IsSet() {
-		de.c.unregisterSCIONPath(scionKey)
+	for _, k := range scionKeys {
+		de.c.unregisterSCIONPath(k)
 	}
 }
 
