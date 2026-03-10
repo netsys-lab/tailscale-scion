@@ -5,6 +5,7 @@ package magicsock
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/snet"
 	wgconn "github.com/tailscale/wireguard-go/conn"
+	"golang.org/x/net/ipv4"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
@@ -71,6 +73,7 @@ type scionPathInfo struct {
 	path        snet.Path            // current best SCION path to this peer
 	replyPath   *snet.UDPAddr        // bootstrapped from incoming packet (pre-reversed)
 	cachedDst   *snet.UDPAddr        // pre-built destination addr; rebuilt when path changes
+	fastPath    *scionFastPath       // pre-serialized header template for fast sends
 	expiry      time.Time            // path expiration from path metadata
 	mtu         uint16               // SCION payload MTU from path metadata
 	mu          sync.Mutex
@@ -183,12 +186,182 @@ func (ps *scionPathProbeState) latency() time.Duration {
 	return ps.recentPongs[ps.recentPong].latency
 }
 
+// scionFastPath holds a pre-serialized SCION+UDP header template for a
+// specific path. At send time, the template is copied, per-packet fields
+// (PayloadLen, UDP Length, UDP Checksum) are patched, payload is appended,
+// and the result is sent directly on the underlay UDP socket — bypassing
+// snet.Conn and gopacket serialization entirely.
+type scionFastPath struct {
+	hdr        []byte       // [SCION header][UDP header], no payload
+	udpOffset  int          // byte offset of UDP header within hdr
+	nextHop    *net.UDPAddr // underlay next-hop for this path
+	pseudoCsum uint32       // constant part of SCION pseudo-header checksum
+}
+
+// scionMaxBatchSize is the max number of packets in a single sendmmsg call.
+const scionMaxBatchSize = 64
+
+// scionSendBatch is a reusable set of buffers for sendSCIONBatchFast.
+type scionSendBatch struct {
+	bufs [][]byte
+	msgs []ipv4.Message
+}
+
+var scionSendBatchPool = sync.Pool{
+	New: func() any {
+		b := &scionSendBatch{
+			bufs: make([][]byte, scionMaxBatchSize),
+			msgs: make([]ipv4.Message, scionMaxBatchSize),
+		}
+		for i := range b.bufs {
+			b.bufs[i] = make([]byte, 1500)
+		}
+		for i := range b.msgs {
+			b.msgs[i].Buffers = make([][]byte, 1)
+		}
+		return b
+	},
+}
+
+// scionPseudoHeaderPartial computes the constant part of the SCION
+// pseudo-header checksum: srcIA + dstIA + srcAddr + dstAddr + protocol(17).
+// The per-packet upper-layer length and data are added at send time.
+func scionPseudoHeaderPartial(srcIA, dstIA addr.IA, srcIP, dstIP netip.Addr) uint32 {
+	var csum uint32
+	var buf [8]byte
+
+	// Source IA (8 bytes)
+	binary.BigEndian.PutUint64(buf[:], uint64(srcIA))
+	for i := 0; i < 8; i += 2 {
+		csum += uint32(buf[i]) << 8
+		csum += uint32(buf[i+1])
+	}
+
+	// Destination IA (8 bytes)
+	binary.BigEndian.PutUint64(buf[:], uint64(dstIA))
+	for i := 0; i < 8; i += 2 {
+		csum += uint32(buf[i]) << 8
+		csum += uint32(buf[i+1])
+	}
+
+	// Source address
+	if srcIP.Is4() {
+		b4 := srcIP.As4()
+		csum += uint32(b4[0])<<8 + uint32(b4[1])
+		csum += uint32(b4[2])<<8 + uint32(b4[3])
+	} else {
+		b16 := srcIP.As16()
+		for i := 0; i < 16; i += 2 {
+			csum += uint32(b16[i])<<8 + uint32(b16[i+1])
+		}
+	}
+
+	// Destination address
+	if dstIP.Is4() {
+		b4 := dstIP.As4()
+		csum += uint32(b4[0])<<8 + uint32(b4[1])
+		csum += uint32(b4[2])<<8 + uint32(b4[3])
+	} else {
+		b16 := dstIP.As16()
+		for i := 0; i < 16; i += 2 {
+			csum += uint32(b16[i])<<8 + uint32(b16[i+1])
+		}
+	}
+
+	// Protocol: L4UDP = 17
+	csum += 17
+
+	return csum
+}
+
+// scionFinishChecksum completes the SCION/UDP checksum by adding the
+// upper-layer length and bytes to the pre-computed partial checksum,
+// then folding and complementing.
+func scionFinishChecksum(partialCsum uint32, upperLayer []byte) uint16 {
+	csum := partialCsum
+
+	// Add upper-layer length
+	l := uint32(len(upperLayer))
+	csum += (l >> 16) + (l & 0xffff)
+
+	// Sum upper-layer bytes in 16-bit words
+	n := len(upperLayer)
+	for i := 0; i+1 < n; i += 2 {
+		csum += uint32(upperLayer[i]) << 8
+		csum += uint32(upperLayer[i+1])
+	}
+	if n%2 == 1 {
+		csum += uint32(upperLayer[n-1]) << 8
+	}
+
+	// Fold to 16 bits
+	for csum > 0xffff {
+		csum = (csum >> 16) + (csum & 0xffff)
+	}
+	return ^uint16(csum)
+}
+
+// buildSCIONFastPath creates a pre-serialized header template for fast-path
+// sends. Must be called with pi.mu held (or before pi is shared).
+// Returns nil if the fast path cannot be built (e.g. no discovered path).
+func buildSCIONFastPath(sc *scionConn, pi *scionPathInfo) *scionFastPath {
+	if sc.underlayConn == nil {
+		return nil
+	}
+	dst := pi.cachedDst
+	if dst == nil || dst.Path == nil || dst.NextHop == nil {
+		return nil
+	}
+
+	dstIP, ok := netip.AddrFromSlice(dst.Host.IP)
+	if !ok {
+		return nil
+	}
+	srcIP := sc.localHostIP
+
+	// Use snet.Packet.Serialize() with empty payload to get a correctly
+	// encoded SCION+UDP header template.
+	pkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: snet.SCIONAddress{IA: pi.peerIA, Host: addr.HostIP(dstIP)},
+			Source:      snet.SCIONAddress{IA: sc.localIA, Host: addr.HostIP(srcIP)},
+			Path:        dst.Path,
+			Payload: snet.UDPPayload{
+				SrcPort: sc.localPort,
+				DstPort: uint16(dst.Host.Port),
+				Payload: nil, // empty payload → headers only
+			},
+		},
+	}
+	if err := pkt.Serialize(); err != nil {
+		return nil
+	}
+
+	// pkt.Bytes is now [SCION header][8-byte UDP header]
+	hdr := make([]byte, len(pkt.Bytes))
+	copy(hdr, pkt.Bytes)
+	udpOffset := len(hdr) - 8
+
+	pseudoCsum := scionPseudoHeaderPartial(sc.localIA, pi.peerIA, srcIP, dstIP)
+
+	return &scionFastPath{
+		hdr:        hdr,
+		udpOffset:  udpOffset,
+		nextHop:    dst.NextHop,
+		pseudoCsum: pseudoCsum,
+	}
+}
+
 // scionConn wraps a SCION connection for use by magicsock.
 type scionConn struct {
-	conn    *snet.Conn       // from SCIONNetwork.Listen()
-	localIA addr.IA          // our ISD-AS
-	daemon  daemon.Connector // for path queries
-	topo    snet.Topology    // local topology
+	conn         *snet.Conn         // from SCIONNetwork.Listen()
+	underlayConn *net.UDPConn       // raw underlay for fast-path sends (owned by conn)
+	underlayXPC  *ipv4.PacketConn   // for WriteBatch / sendmmsg
+	localIA      addr.IA            // our ISD-AS
+	localHostIP  netip.Addr         // local host IP (e.g. 127.0.0.1)
+	localPort    uint16             // local SCION/UDP port
+	daemon       daemon.Connector   // for path queries
+	topo         snet.Topology      // local topology
 }
 
 // close shuts down the SCION connection and daemon connector.
@@ -305,10 +478,11 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		return nil, fmt.Errorf("listening on SCION %s: %w", listenAddr, err)
 	}
 
-	// Increase underlay UDP socket buffers to match the regular magicsock
-	// UDP sockets (7 MB). The default kernel buffer (~212 KB) overflows
-	// easily at high throughput, causing packet drops and TCP retransmissions.
+	// Extract the underlay *net.UDPConn for fast-path sends that bypass
+	// snet.Conn serialization. Also increase socket buffer sizes.
+	var underlayConn *net.UDPConn
 	if pc, ok := pconn.(*snet.SCIONPacketConn); ok {
+		underlayConn = pc.Conn
 		if err := pc.SetReadBuffer(socketBufferSize); err != nil {
 			fmt.Fprintf(os.Stderr, "magicsock: SCION: failed to set read buffer to %d: %v\n", socketBufferSize, err)
 		}
@@ -324,11 +498,31 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		return nil, fmt.Errorf("creating SCION conn: %w", err)
 	}
 
+	// Extract local address info for fast-path header templates.
+	var localHostIP netip.Addr
+	var localPort uint16
+	if sa, saOk := sconn.LocalAddr().(*snet.UDPAddr); saOk && sa.Host != nil {
+		if ip, ipOk := netip.AddrFromSlice(sa.Host.IP); ipOk {
+			localHostIP = ip
+		}
+		localPort = uint16(sa.Host.Port)
+	}
+
+	// Wrap underlay conn for sendmmsg batching.
+	var underlayXPC *ipv4.PacketConn
+	if underlayConn != nil {
+		underlayXPC = ipv4.NewPacketConn(underlayConn)
+	}
+
 	return &scionConn{
-		conn:    sconn,
-		localIA: localIA,
-		daemon:  conn,
-		topo:    conn,
+		conn:         sconn,
+		underlayConn: underlayConn,
+		underlayXPC:  underlayXPC,
+		localIA:      localIA,
+		localHostIP:  localHostIP,
+		localPort:    localPort,
+		daemon:       conn,
+		topo:         conn,
 	}, nil
 }
 
@@ -357,6 +551,11 @@ func parseSCIONServiceAddr(description string, port uint16) (ia addr.IA, hostAdd
 // sendSCIONBatch sends a batch of WireGuard packets over the SCION connection.
 // It looks up the full path info from the Conn's scionPaths registry using the
 // scionPathKey from the epAddr.
+//
+// When a fast-path template is available (pre-serialized headers + underlay
+// socket), packets are serialized by patching a header template and sent via
+// sendmmsg in a single syscall. Otherwise, falls back to snet.Conn.WriteTo
+// per packet.
 func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
 	sc := c.pconnSCION
 	if sc == nil {
@@ -372,14 +571,20 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 	pi.mu.Lock()
 	replyPath := pi.replyPath
 	cachedDst := pi.cachedDst
+	fastPath := pi.fastPath
 	expired := !pi.expiry.IsZero() && time.Now().After(pi.expiry)
 	pi.mu.Unlock()
 	if expired {
 		return false, fmt.Errorf("SCION path expired for key %d", addr.scionKey)
 	}
 
-	// If no discovered path, fall back to replyPath (bootstrapped from an
-	// incoming packet before path discovery completes).
+	// Fast path: pre-serialized headers + sendmmsg.
+	if fastPath != nil && sc.underlayXPC != nil {
+		err = c.sendSCIONBatchFast(sc, fastPath, buffs, offset)
+		return err == nil, err
+	}
+
+	// Slow path: snet.Conn.WriteTo per packet.
 	dst := cachedDst
 	if dst == nil && replyPath != nil {
 		dst = replyPath
@@ -395,6 +600,70 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 		}
 	}
 	return true, nil
+}
+
+// sendSCIONBatchFast sends a batch of packets using pre-serialized SCION
+// headers and sendmmsg on the underlay UDP socket. Each packet is built by
+// copying the header template, patching per-packet fields (PayloadLen, UDP
+// Length, UDP Checksum), and appending the WireGuard payload.
+func (c *Conn) sendSCIONBatchFast(sc *scionConn, fp *scionFastPath, buffs [][]byte, offset int) error {
+	batch := scionSendBatchPool.Get().(*scionSendBatch)
+	defer scionSendBatchPool.Put(batch)
+
+	hdrLen := len(fp.hdr)
+	n := len(buffs)
+	if n > scionMaxBatchSize {
+		n = scionMaxBatchSize
+	}
+
+	for i := 0; i < n; i++ {
+		payload := buffs[i][offset:]
+		pktLen := hdrLen + len(payload)
+
+		// Grow buffer if needed.
+		buf := batch.bufs[i]
+		if cap(buf) < pktLen {
+			buf = make([]byte, pktLen)
+			batch.bufs[i] = buf
+		} else {
+			buf = buf[:pktLen]
+		}
+
+		// Copy header template and append payload.
+		copy(buf, fp.hdr)
+		copy(buf[hdrLen:], payload)
+
+		// Patch SCION PayloadLen (bytes 6:8) = UDP header (8) + payload.
+		udpTotalLen := uint16(8 + len(payload))
+		binary.BigEndian.PutUint16(buf[6:], udpTotalLen)
+
+		// Patch UDP Length (udpOffset+4:+6).
+		binary.BigEndian.PutUint16(buf[fp.udpOffset+4:], udpTotalLen)
+
+		// Zero checksum, compute over full upper layer, set result.
+		buf[fp.udpOffset+6] = 0
+		buf[fp.udpOffset+7] = 0
+		upperLayer := buf[fp.udpOffset:pktLen]
+		csum := scionFinishChecksum(fp.pseudoCsum, upperLayer)
+		binary.BigEndian.PutUint16(buf[fp.udpOffset+6:], csum)
+
+		batch.msgs[i].Buffers[0] = buf[:pktLen]
+		batch.msgs[i].Addr = fp.nextHop
+	}
+
+	// WriteBatch uses sendmmsg on Linux for batched sends.
+	msgs := batch.msgs[:n]
+	var head int
+	for {
+		written, err := sc.underlayXPC.WriteBatch(msgs[head:], 0)
+		if err != nil {
+			return err
+		}
+		head += written
+		if head >= n {
+			return nil
+		}
+	}
 }
 
 // sendSCION sends a single packet over SCION, used for disco messages.
@@ -812,6 +1081,9 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 			mtu:         mtu,
 		}
 		pi.buildCachedDst()
+		if sc := c.pconnSCION; sc != nil {
+			pi.fastPath = buildSCIONFastPath(sc, pi)
+		}
 		keys = append(keys, c.registerSCIONPath(pi))
 	}
 	// Set the first (lowest-latency) path as active for the reverse index.
@@ -1002,6 +1274,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 				pi.mtu = md.MTU
 			}
 			pi.buildCachedDst()
+			pi.fastPath = buildSCIONFastPath(sc, pi)
 			pi.mu.Unlock()
 		}
 	}
