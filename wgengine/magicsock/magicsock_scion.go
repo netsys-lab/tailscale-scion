@@ -70,9 +70,27 @@ type scionPathInfo struct {
 	fingerprint snet.PathFingerprint // SHA256 of interface sequence; for matching across refreshes
 	path        snet.Path            // current best SCION path to this peer
 	replyPath   *snet.UDPAddr        // bootstrapped from incoming packet (pre-reversed)
+	cachedDst   *snet.UDPAddr        // pre-built destination addr; rebuilt when path changes
 	expiry      time.Time            // path expiration from path metadata
 	mtu         uint16               // SCION payload MTU from path metadata
 	mu          sync.Mutex
+}
+
+// buildCachedDst constructs the cached destination address from the current
+// path info. Must be called with pi.mu held (or before the info is shared).
+func (pi *scionPathInfo) buildCachedDst() {
+	dst := &snet.UDPAddr{
+		IA: pi.peerIA,
+		Host: &net.UDPAddr{
+			IP:   pi.hostAddr.Addr().AsSlice(),
+			Port: int(pi.hostAddr.Port()),
+		},
+	}
+	if pi.path != nil {
+		dst.Path = pi.path.Dataplane()
+		dst.NextHop = pi.path.UnderlayNextHop()
+	}
+	pi.cachedDst = dst
 }
 
 // scionHeaderOverhead is the fixed overhead added by SCION encapsulation,
@@ -187,30 +205,17 @@ func (sc *scionConn) close() error {
 // writeTo sends b to a peer identified by the given scionPathInfo.
 func (sc *scionConn) writeTo(b []byte, pi *scionPathInfo) (int, error) {
 	pi.mu.Lock()
-	path := pi.path
 	replyPath := pi.replyPath
-	hostAddr := pi.hostAddr
-	peerIA := pi.peerIA
+	cachedDst := pi.cachedDst
 	pi.mu.Unlock()
 
-	// If we have a replyPath (bootstrapped from an incoming packet),
-	// use it directly — it's already reversed by snet's ReplyPather.
-	if path == nil && replyPath != nil {
-		return sc.conn.WriteTo(b, replyPath)
+	dst := cachedDst
+	if dst == nil && replyPath != nil {
+		dst = replyPath
 	}
-
-	dst := &snet.UDPAddr{
-		IA: peerIA,
-		Host: &net.UDPAddr{
-			IP:   hostAddr.Addr().AsSlice(),
-			Port: int(hostAddr.Port()),
-		},
+	if dst == nil {
+		return 0, fmt.Errorf("no SCION destination")
 	}
-	if path != nil {
-		dst.Path = path.Dataplane()
-		dst.NextHop = path.UnderlayNextHop()
-	}
-
 	return sc.conn.WriteTo(b, dst)
 }
 
@@ -365,7 +370,8 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 
 	// Read path info once for the entire batch to avoid repeated locking.
 	pi.mu.Lock()
-	path, replyPath, hostAddr, peerIA := pi.path, pi.replyPath, pi.hostAddr, pi.peerIA
+	replyPath := pi.replyPath
+	cachedDst := pi.cachedDst
 	expired := !pi.expiry.IsZero() && time.Now().After(pi.expiry)
 	pi.mu.Unlock()
 	if expired {
@@ -374,26 +380,12 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 
 	// If no discovered path, fall back to replyPath (bootstrapped from an
 	// incoming packet before path discovery completes).
-	if path == nil && replyPath != nil {
-		for _, buf := range buffs {
-			_, err = sc.conn.WriteTo(buf[offset:], replyPath)
-			if err != nil {
-				return false, err
-			}
-		}
-		return true, nil
+	dst := cachedDst
+	if dst == nil && replyPath != nil {
+		dst = replyPath
 	}
-
-	dst := &snet.UDPAddr{
-		IA: peerIA,
-		Host: &net.UDPAddr{
-			IP:   hostAddr.Addr().AsSlice(),
-			Port: int(hostAddr.Port()),
-		},
-	}
-	if path != nil {
-		dst.Path = path.Dataplane()
-		dst.NextHop = path.UnderlayNextHop()
+	if dst == nil {
+		return false, fmt.Errorf("no SCION destination for key %d", addr.scionKey)
 	}
 
 	for _, buf := range buffs {
@@ -518,7 +510,9 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 	}
 
 	// Initialize lastSCIONRecv so we don't trigger reconnection on startup.
-	c.lastSCIONRecv.CompareAndSwap(0, time.Now().UnixNano())
+	if c.lastSCIONRecv.LoadAtomic() == 0 {
+		c.lastSCIONRecv.StoreAtomic(mono.Now())
+	}
 
 	for {
 		// Check for graceful shutdown.
@@ -577,7 +571,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		}
 
 		// Got a packet — record receive time.
-		c.lastSCIONRecv.Store(time.Now().UnixNano())
+		c.lastSCIONRecv.StoreAtomic(mono.Now())
 
 		b := buffs[0][:n]
 
@@ -651,8 +645,8 @@ func isTimeoutError(err error) bool {
 //  1. No SCION packet has been received for scionReconnectThreshold, AND
 //  2. There are active SCION peers (otherwise silence is expected).
 func (c *Conn) shouldReconnectSCION() bool {
-	lastRecv := time.Unix(0, c.lastSCIONRecv.Load())
-	if time.Since(lastRecv) < scionReconnectThreshold {
+	lastRecv := c.lastSCIONRecv.LoadAtomic()
+	if mono.Since(lastRecv) < scionReconnectThreshold {
 		return false
 	}
 
@@ -684,7 +678,7 @@ func (c *Conn) reconnectSCION() {
 	if err != nil {
 		c.logf("magicsock: SCION reconnect failed: %v", err)
 		// Reset the receive timestamp so we retry after scionReconnectThreshold.
-		c.lastSCIONRecv.Store(time.Now().UnixNano())
+		c.lastSCIONRecv.StoreAtomic(mono.Now())
 		return
 	}
 
@@ -692,7 +686,7 @@ func (c *Conn) reconnectSCION() {
 	c.pconnSCION = newSC
 
 	// Reset the receive timestamp so we don't immediately re-trigger.
-	c.lastSCIONRecv.Store(time.Now().UnixNano())
+	c.lastSCIONRecv.StoreAtomic(mono.Now())
 
 	c.logf("magicsock: SCION reconnected successfully, local IA: %s", newSC.localIA)
 
@@ -713,7 +707,7 @@ func (c *Conn) retrySCIONConnect() {
 		return
 	}
 	c.pconnSCION = newSC
-	c.lastSCIONRecv.Store(time.Now().UnixNano())
+	c.lastSCIONRecv.StoreAtomic(mono.Now())
 	c.logf("magicsock: SCION reconnect retry succeeded, local IA: %s", newSC.localIA)
 	c.rediscoverAllSCIONPaths()
 }
@@ -817,6 +811,7 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 			expiry:      expiry,
 			mtu:         mtu,
 		}
+		pi.buildCachedDst()
 		keys = append(keys, c.registerSCIONPath(pi))
 	}
 	// Set the first (lowest-latency) path as active for the reverse index.
@@ -1006,6 +1001,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 				pi.expiry = md.Expiry
 				pi.mtu = md.MTU
 			}
+			pi.buildCachedDst()
 			pi.mu.Unlock()
 		}
 	}

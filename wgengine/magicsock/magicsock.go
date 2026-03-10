@@ -426,9 +426,9 @@ type Conn struct {
 	scionPathsByAddr map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
 	scionPathSeq    atomic.Uint32                  // monotonic key generator for scionPaths
 
-	// lastSCIONRecv is the last time we received any SCION packet.
+	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
 	// Used by receiveSCION to detect a dead socket and trigger reconnection.
-	lastSCIONRecv atomic.Int64 // unix nanos
+	lastSCIONRecv mono.Time
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
