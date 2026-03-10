@@ -1018,7 +1018,10 @@ func TestStopAndResetCleansSCIONPath(t *testing.T) {
 		pathKey:  k,
 	}
 
+	// stopAndReset requires c.mu to be held (all production callers hold it).
+	c.mu.Lock()
 	de.stopAndReset()
+	c.mu.Unlock()
 
 	if de.scionState != nil {
 		t.Error("scionState should be nil after stopAndReset")

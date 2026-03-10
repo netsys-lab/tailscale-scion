@@ -27,6 +27,11 @@ import (
 // betterAddr points bonus for SCION paths. Default 15; set to 0 to disable.
 var debugSCIONPreference = envknob.RegisterInt("TS_SCION_PREFERENCE")
 
+// preferSCION reports whether TS_PREFER_SCION=1 is set, which makes SCION
+// paths unconditionally preferred over all other path types (direct, relay).
+// Other paths are only used if no SCION path is available.
+var preferSCION = envknob.RegisterBool("TS_PREFER_SCION")
+
 // scionPreferenceBonus returns the betterAddr points bonus for SCION paths.
 // Returns the value of TS_SCION_PREFERENCE if set, otherwise defaults to 15.
 func scionPreferenceBonus() int {
@@ -58,12 +63,13 @@ type scionAddrKey struct {
 // scionPathKey. The actual SCION address and path data live here rather than
 // in epAddr to keep epAddr comparable and small.
 type scionPathInfo struct {
-	peerIA   addr.IA
-	hostAddr netip.AddrPort // peer's SCION host IP:port
-	path     snet.Path      // current best SCION path to this peer
-	expiry   time.Time      // path expiration from path metadata
-	mtu      uint16         // SCION payload MTU from path metadata
-	mu       sync.Mutex
+	peerIA    addr.IA
+	hostAddr  netip.AddrPort  // peer's SCION host IP:port
+	path      snet.Path       // current best SCION path to this peer
+	replyPath *snet.UDPAddr   // bootstrapped from incoming packet (pre-reversed)
+	expiry    time.Time       // path expiration from path metadata
+	mtu       uint16          // SCION payload MTU from path metadata
+	mu        sync.Mutex
 }
 
 // scionHeaderOverhead is the fixed overhead added by SCION encapsulation,
@@ -96,13 +102,6 @@ type scionEndpointState struct {
 	lastDiscoveryAt time.Time      // when path discovery last started (throttle)
 }
 
-// SCION dispatched port range. The SCION endhost stack only directly dispatches
-// packets addressed to ports within this range. Port 0 means auto-select.
-const (
-	scionDispatchedPortMin = 30000
-	scionDispatchedPortMax = 32767
-)
-
 // scionConn wraps a SCION connection for use by magicsock.
 type scionConn struct {
 	conn    *snet.Conn       // from SCIONNetwork.Listen()
@@ -126,9 +125,16 @@ func (sc *scionConn) close() error {
 func (sc *scionConn) writeTo(b []byte, pi *scionPathInfo) (int, error) {
 	pi.mu.Lock()
 	path := pi.path
+	replyPath := pi.replyPath
 	hostAddr := pi.hostAddr
 	peerIA := pi.peerIA
 	pi.mu.Unlock()
+
+	// If we have a replyPath (bootstrapped from an incoming packet),
+	// use it directly — it's already reversed by snet's ReplyPather.
+	if path == nil && replyPath != nil {
+		return sc.conn.WriteTo(b, replyPath)
+	}
 
 	dst := &snet.UDPAddr{
 		IA: peerIA,
@@ -170,15 +176,12 @@ func scionDaemonAddr() string {
 
 // scionListenPort returns the SCION port to use, checking the TS_SCION_PORT
 // environment variable first, then falling back to 0 (auto-select from the
-// topology's dispatched port range). If set, the port must be within the SCION
-// dispatched port range.
+// topology's dispatched port range).
 func scionListenPort() uint16 {
 	if p := os.Getenv("TS_SCION_PORT"); p != "" {
 		var v int
-		if _, err := fmt.Sscanf(p, "%d", &v); err == nil {
-			if v >= scionDispatchedPortMin && v <= scionDispatchedPortMax {
-				return uint16(v)
-			}
+		if _, err := fmt.Sscanf(p, "%d", &v); err == nil && v > 0 && v <= 65535 {
+			return uint16(v)
 		}
 	}
 	return 0 // let snet auto-select from topology port range
@@ -208,6 +211,19 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 	}
 
 	listenPort := scionListenPort()
+	if listenPort != 0 {
+		// Validate the configured port against the daemon's dispatched range.
+		portMin, portMax, err := conn.PortRange(ctx)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("querying SCION port range: %w", err)
+		}
+		if listenPort < portMin || listenPort > portMax {
+			conn.Close()
+			return nil, fmt.Errorf("TS_SCION_PORT=%d outside dispatched range [%d, %d]", listenPort, portMin, portMax)
+		}
+	}
+
 	listenAddr := &net.UDPAddr{
 		IP:   net.IPv4(127, 0, 0, 1),
 		Port: int(listenPort),
@@ -264,11 +280,23 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 
 	// Read path info once for the entire batch to avoid repeated locking.
 	pi.mu.Lock()
-	path, hostAddr, peerIA := pi.path, pi.hostAddr, pi.peerIA
+	path, replyPath, hostAddr, peerIA := pi.path, pi.replyPath, pi.hostAddr, pi.peerIA
 	expired := !pi.expiry.IsZero() && time.Now().After(pi.expiry)
 	pi.mu.Unlock()
 	if expired {
 		return false, fmt.Errorf("SCION path expired for key %d", addr.scionKey)
+	}
+
+	// If no discovered path, fall back to replyPath (bootstrapped from an
+	// incoming packet before path discovery completes).
+	if path == nil && replyPath != nil {
+		for _, buf := range buffs {
+			_, err = sc.conn.WriteTo(buf[offset:], replyPath)
+			if err != nil {
+				return false, err
+			}
+		}
+		return true, nil
 	}
 
 	dst := &snet.UDPAddr{
@@ -396,11 +424,25 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		pt, _ := packetLooksLike(b)
 		if pt == packetLooksLikeDisco {
 			// For disco messages, include the scionKey so pong replies
-			// are routed back over SCION.
+			// are routed back over SCION. Use a single critical section
+			// for the lookup+register to avoid a TOCTOU race where a
+			// concurrent discoverSCIONPaths could register between our
+			// check and our register, creating orphaned entries.
 			srcEpAddr := epAddr{ap: srcHostAddr}
-			if sk := c.scionKeyForAddr(srcAddr.IA, srcHostAddr); sk.IsSet() {
-				srcEpAddr.scionKey = sk
+			c.mu.Lock()
+			sk := c.scionPathsByAddr[scionAddrKey{ia: srcAddr.IA, addr: srcHostAddr}]
+			if !sk.IsSet() {
+				// First disco packet from this SCION peer — bootstrap a
+				// reverse path entry so the pong can go back over SCION.
+				// ReadFrom returns a pre-reversed path suitable for replies.
+				sk = c.registerSCIONPath(&scionPathInfo{
+					peerIA:    srcAddr.IA,
+					hostAddr:  srcHostAddr,
+					replyPath: srcAddr,
+				})
 			}
+			c.mu.Unlock()
+			srcEpAddr.scionKey = sk
 			c.handleDiscoMessage(b, srcEpAddr, false, key.NodePublic{}, discoRXPathSCION)
 			continue
 		}
@@ -674,9 +716,17 @@ func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) {
 
 // discoverSCIONPathAsync runs SCION path discovery in a goroutine,
 // avoiding blocking updateFromNode which holds the endpoint lock.
+// It self-throttles to at most once every 5 seconds to prevent concurrent
+// launches (from updateFromNode and send error paths) from creating
+// orphaned path entries.
 func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPort) {
-	// Record discovery start time for throttling.
+	// Throttle: skip if discovery ran recently. This prevents concurrent
+	// launches from orphaning path entries in the registry.
 	de.mu.Lock()
+	if de.scionState != nil && time.Since(de.scionState.lastDiscoveryAt) < 5*time.Second {
+		de.mu.Unlock()
+		return
+	}
 	if de.scionState != nil {
 		de.scionState.lastDiscoveryAt = time.Now()
 	}

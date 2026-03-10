@@ -1079,13 +1079,13 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		_, err = de.c.sendSCIONBatch(udpAddr, buffs, offset)
 		if err != nil {
 			de.noteBadEndpoint(udpAddr)
-			// Trigger throttled re-discovery so we don't wait up to 30s
-			// for the periodic refreshSCIONPaths to fix an expired path.
+			// Trigger re-discovery so we don't wait up to 30s for the
+			// periodic refreshSCIONPaths to fix an expired path.
+			// discoverSCIONPathAsync self-throttles to once per 5s.
 			de.mu.Lock()
 			st := de.scionState
-			shouldRediscover := st != nil && time.Since(st.lastDiscoveryAt) > 5*time.Second
 			de.mu.Unlock()
-			if shouldRediscover {
+			if st != nil {
 				go de.discoverSCIONPathAsync(st.peerIA, st.hostAddr)
 			}
 		} else if de.c.metrics != nil {
@@ -1589,11 +1589,10 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 
 	de.mu.Unlock()
 
-	// Clean up SCION path outside de.mu (lock order: c.mu before de.mu).
+	// Clean up SCION path outside de.mu. c.mu is held by caller (updateNodes),
+	// so call unregisterSCIONPath directly without re-locking.
 	if oldSCIONKey.IsSet() {
-		de.c.mu.Lock()
 		de.c.unregisterSCIONPath(oldSCIONKey)
-		de.c.mu.Unlock()
 	}
 }
 
@@ -1953,6 +1952,16 @@ func betterAddr(a, b addrQuality) bool {
 		return false
 	}
 
+	// When TS_PREFER_SCION=1, SCION beats everything unconditionally.
+	if preferSCION() {
+		if a.scionKey.IsSet() && !b.scionKey.IsSet() {
+			return true
+		}
+		if b.scionKey.IsSet() && !a.scionKey.IsSet() {
+			return false
+		}
+	}
+
 	// Each address starts with a set of points (from 0 to 100) that
 	// represents how much faster they are than the highest-latency
 	// endpoint. For example, if a has latency 200ms and b has latency
@@ -2140,7 +2149,8 @@ func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
 // stopAndReset stops timers associated with de and resets its state back to zero.
 // It's called when a discovery endpoint is no longer present in the
 // NetworkMap, or when magicsock is transitioning from running to
-// stopped state (via SetPrivateKey(zero))
+// stopped state (via SetPrivateKey(zero)).
+// c.mu must be held.
 func (de *endpoint) stopAndReset() {
 	atomic.AddInt64(&de.numStopAndResetAtomic, 1)
 	de.mu.Lock()
@@ -2172,11 +2182,10 @@ func (de *endpoint) stopAndReset() {
 	}
 	de.mu.Unlock()
 
-	// Clean up SCION path outside de.mu (lock order: c.mu before de.mu).
+	// Clean up SCION path outside de.mu. c.mu is held by caller
+	// (updateNodes, SetPrivateKey, Close), so call directly.
 	if scionKey.IsSet() {
-		de.c.mu.Lock()
 		de.c.unregisterSCIONPath(scionKey)
-		de.c.mu.Unlock()
 	}
 }
 
