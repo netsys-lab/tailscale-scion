@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -573,13 +574,66 @@ func scionListenAddr() *net.UDPAddr {
 	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}
 }
 
-// trySCIONConnect attempts to connect to the local SCION daemon and set up a
-// SCION listener. The listener binds to a localhost address (required by snet,
-// which rejects unspecified addresses) on a port within the dispatched range.
-// The listen IP defaults to 127.0.0.1 but can be overridden via
-// TS_SCION_LISTEN_ADDR (e.g. "::1" for IPv6 underlay).
-// Returns nil if SCION is not available.
+// forceEmbeddedSCION is the TS_SCION_EMBEDDED envknob. When set to "1",
+// the external daemon attempt is skipped and only the embedded connector is tried.
+var forceEmbeddedSCION = envknob.RegisterBool("TS_SCION_EMBEDDED")
+
+// trySCIONConnect attempts to set up a SCION connection using a cascading
+// fallback strategy:
+//  1. External daemon (existing behavior, quick check) — skipped if TS_SCION_EMBEDDED=1
+//  2. Embedded with existing local topology file (TS_SCION_TOPOLOGY or /etc/scion/topology.json)
+//  3. Bootstrap from configured URL (TS_SCION_BOOTSTRAP_URL / TS_SCION_BOOTSTRAP_URLS)
+//  4. DNS-based discovery (SRV for _sciondiscovery._tcp)
+//  5. Hardcoded bootstrap URLs (if any)
+//
+// Returns nil if SCION is not available via any method.
 func trySCIONConnect(ctx context.Context) (*scionConn, error) {
+	var externalErr error
+
+	// Step 1: Try external daemon (unless forced embedded).
+	if !forceEmbeddedSCION() {
+		sc, err := tryExternalDaemon(ctx)
+		if err == nil {
+			return sc, nil
+		}
+		externalErr = err
+	}
+
+	// Step 2: Try embedded with existing local topology file.
+	topoPath := scionTopologyPath()
+	if _, err := os.Stat(topoPath); err == nil {
+		sc, err := tryEmbeddedDaemon(ctx, topoPath)
+		if err == nil {
+			return sc, nil
+		}
+		// Fall through to bootstrap attempts.
+	}
+
+	// Steps 3-5: Try bootstrap from URLs (explicit, DNS-discovered, hardcoded).
+	stateDir := scionStateDir()
+	for _, url := range bootstrapURLs(ctx) {
+		if err := bootstrapSCION(ctx, url, stateDir); err != nil {
+			continue
+		}
+		bootstrappedTopo := filepath.Join(stateDir, "topology.json")
+		if _, err := os.Stat(bootstrappedTopo); err != nil {
+			continue
+		}
+		sc, err := tryEmbeddedDaemon(ctx, bootstrappedTopo)
+		if err == nil {
+			return sc, nil
+		}
+	}
+
+	if externalErr != nil {
+		return nil, fmt.Errorf("external daemon: %w; embedded: no topology available", externalErr)
+	}
+	return nil, fmt.Errorf("SCION not available: no external daemon, no topology file, no bootstrap server")
+}
+
+// tryExternalDaemon attempts to connect to an external SCION daemon and set up
+// a SCION listener. This is the original trySCIONConnect behavior.
+func tryExternalDaemon(ctx context.Context) (*scionConn, error) {
 	daemonAddr := scionDaemonAddr()
 	svc := daemon.Service{Address: daemonAddr}
 	conn, err := svc.Connect(ctx)
@@ -587,28 +641,36 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		return nil, fmt.Errorf("connecting to SCION daemon at %s: %w", daemonAddr, err)
 	}
 
-	localIA, err := conn.LocalIA(ctx)
+	sc, err := finishSCIONConnect(ctx, conn, conn)
 	if err != nil {
 		conn.Close()
+		return nil, err
+	}
+	return sc, nil
+}
+
+// finishSCIONConnect completes the SCION connection setup given a
+// daemon.Connector (for path queries) and snet.Topology (for local info).
+// This is shared between the external daemon and embedded connector paths.
+func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo snet.Topology) (*scionConn, error) {
+	localIA, err := connector.LocalIA(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("querying local IA: %w", err)
 	}
 
-	// In scion v0.12.0, daemon.Connector satisfies snet.Topology.
 	network := &snet.SCIONNetwork{
-		Topology: conn,
+		Topology: topo,
 	}
 
 	listenAddr := scionListenAddr()
 	if listenAddr.Port != 0 {
-		// Validate the configured port against the daemon's dispatched range.
-		portMin, portMax, err := conn.PortRange(ctx)
+		// Validate the configured port against the dispatched range.
+		portMin, portMax, err := connector.PortRange(ctx)
 		if err != nil {
-			conn.Close()
 			return nil, fmt.Errorf("querying SCION port range: %w", err)
 		}
 		listenPort := uint16(listenAddr.Port)
 		if listenPort < portMin || listenPort > portMax {
-			conn.Close()
 			return nil, fmt.Errorf("TS_SCION_PORT=%d outside dispatched range [%d, %d]", listenPort, portMin, portMax)
 		}
 	}
@@ -617,7 +679,6 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 	// buffer sizes on the underlying UDP connection before wrapping it.
 	pconn, err := network.OpenRaw(ctx, listenAddr)
 	if err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("listening on SCION %s: %w", listenAddr, err)
 	}
 
@@ -634,10 +695,9 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		}
 	}
 
-	sconn, err := snet.NewCookedConn(pconn, conn)
+	sconn, err := snet.NewCookedConn(pconn, connector)
 	if err != nil {
 		pconn.Close()
-		conn.Close()
 		return nil, fmt.Errorf("creating SCION conn: %w", err)
 	}
 
@@ -670,8 +730,8 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		localIA:      localIA,
 		localHostIP:  localHostIP,
 		localPort:    localPort,
-		daemon:       conn,
-		topo:         conn,
+		daemon:       connector,
+		topo:         topo,
 	}, nil
 }
 
