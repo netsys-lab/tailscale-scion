@@ -25,6 +25,7 @@ import (
 	"github.com/scionproto/scion/pkg/snet"
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
@@ -102,7 +103,7 @@ func (pi *scionPathInfo) buildCachedDst() {
 
 // scionHeaderOverhead is the fixed overhead added by SCION encapsulation,
 // excluding the variable-length path header:
-//   - Underlay IPv4+UDP: 20 + 8 = 28 bytes
+//   - Underlay IPv4+UDP: 20 + 8 = 28 bytes (or IPv6+UDP: 40 + 8 = 48 bytes)
 //   - SCION common header: 12 bytes
 //   - Address header (IPv4, 2x ISD-AS + 2x IPv4): 2*8 + 2*4 = 24 bytes
 //   - SCION/UDP L4 header: 8 bytes
@@ -473,11 +474,19 @@ func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes
 	}
 }
 
+// scionBatchRW abstracts ipv4.PacketConn and ipv6.PacketConn for
+// batch I/O. Both have identical ReadBatch/WriteBatch signatures
+// since ipv4.Message and ipv6.Message are the same type (socket.Message).
+type scionBatchRW interface {
+	ReadBatch([]ipv4.Message, int) (int, error)
+	WriteBatch([]ipv4.Message, int) (int, error)
+}
+
 // scionConn wraps a SCION connection for use by magicsock.
 type scionConn struct {
 	conn         *snet.Conn         // from SCIONNetwork.Listen()
 	underlayConn *net.UDPConn       // raw underlay for fast-path sends (owned by conn)
-	underlayXPC  *ipv4.PacketConn   // for WriteBatch / sendmmsg
+	underlayXPC  scionBatchRW       // for WriteBatch / sendmmsg (ipv4 or ipv6)
 	localIA      addr.IA            // our ISD-AS
 	localHostIP  netip.Addr         // local host IP (e.g. 127.0.0.1)
 	localPort    uint16             // local SCION/UDP port
@@ -549,9 +558,26 @@ func scionListenPort() uint16 {
 	return 0 // let snet auto-select from topology port range
 }
 
+// scionListenAddr returns the listen address for the SCION underlay socket.
+// TS_SCION_LISTEN_ADDR can override the IP (e.g. "::1" for IPv6 localhost).
+// Defaults to 127.0.0.1 (matches current behavior and snet requirement that
+// the address not be unspecified).
+func scionListenAddr() *net.UDPAddr {
+	port := scionListenPort()
+	if a := os.Getenv("TS_SCION_LISTEN_ADDR"); a != "" {
+		ip := net.ParseIP(a)
+		if ip != nil {
+			return &net.UDPAddr{IP: ip, Port: int(port)}
+		}
+	}
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}
+}
+
 // trySCIONConnect attempts to connect to the local SCION daemon and set up a
-// SCION listener. The listener binds to 127.0.0.1 (required by snet, which
-// rejects unspecified addresses) on a port within the dispatched range.
+// SCION listener. The listener binds to a localhost address (required by snet,
+// which rejects unspecified addresses) on a port within the dispatched range.
+// The listen IP defaults to 127.0.0.1 but can be overridden via
+// TS_SCION_LISTEN_ADDR (e.g. "::1" for IPv6 underlay).
 // Returns nil if SCION is not available.
 func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 	daemonAddr := scionDaemonAddr()
@@ -572,23 +598,19 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		Topology: conn,
 	}
 
-	listenPort := scionListenPort()
-	if listenPort != 0 {
+	listenAddr := scionListenAddr()
+	if listenAddr.Port != 0 {
 		// Validate the configured port against the daemon's dispatched range.
 		portMin, portMax, err := conn.PortRange(ctx)
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("querying SCION port range: %w", err)
 		}
+		listenPort := uint16(listenAddr.Port)
 		if listenPort < portMin || listenPort > portMax {
 			conn.Close()
 			return nil, fmt.Errorf("TS_SCION_PORT=%d outside dispatched range [%d, %d]", listenPort, portMin, portMax)
 		}
-	}
-
-	listenAddr := &net.UDPAddr{
-		IP:   net.IPv4(127, 0, 0, 1),
-		Port: int(listenPort),
 	}
 
 	// Use OpenRaw + NewCookedConn instead of Listen so we can set socket
@@ -629,10 +651,16 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		localPort = uint16(sa.Host.Port)
 	}
 
-	// Wrap underlay conn for sendmmsg batching.
-	var underlayXPC *ipv4.PacketConn
+	// Wrap underlay conn for sendmmsg batching, selecting the correct
+	// address family based on the local address.
+	var underlayXPC scionBatchRW
 	if underlayConn != nil {
-		underlayXPC = ipv4.NewPacketConn(underlayConn)
+		local := underlayConn.LocalAddr().(*net.UDPAddr)
+		if local.IP.To4() != nil {
+			underlayXPC = ipv4.NewPacketConn(underlayConn)
+		} else {
+			underlayXPC = ipv6.NewPacketConn(underlayConn)
+		}
 	}
 
 	return &scionConn{
