@@ -16,8 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/gopacket"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
+	"github.com/scionproto/scion/pkg/slayers"
+	scionpath "github.com/scionproto/scion/pkg/slayers/path/scion"
+	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	"github.com/scionproto/scion/pkg/snet"
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"golang.org/x/net/ipv4"
@@ -223,6 +227,40 @@ var scionSendBatchPool = sync.Pool{
 	},
 }
 
+// scionRecvBatch is a reusable set of buffers for receiveSCIONBatch.
+type scionRecvBatch struct {
+	msgs []ipv4.Message
+	bufs [][]byte
+	scn  slayers.SCION // reusable SCION header parser (with RecyclePaths)
+}
+
+var scionRecvBatchPool = sync.Pool{
+	New: func() any {
+		b := &scionRecvBatch{
+			msgs: make([]ipv4.Message, scionMaxBatchSize),
+			bufs: make([][]byte, scionMaxBatchSize),
+		}
+		b.scn.RecyclePaths()
+		for i := range b.bufs {
+			b.bufs[i] = make([]byte, 1500)
+		}
+		for i := range b.msgs {
+			b.msgs[i].Buffers = [][]byte{b.bufs[i]}
+		}
+		return b
+	},
+}
+
+// putScionRecvBatch resets batch state and returns it to the pool.
+func putScionRecvBatch(batch *scionRecvBatch) {
+	for i := range batch.msgs {
+		batch.msgs[i].N = 0
+		batch.msgs[i].Addr = nil
+		batch.msgs[i].Buffers[0] = batch.bufs[i]
+	}
+	scionRecvBatchPool.Put(batch)
+}
+
 // scionPseudoHeaderPartial computes the constant part of the SCION
 // pseudo-header checksum: srcIA + dstIA + srcAddr + dstAddr + protocol(17).
 // The per-packet upper-layer length and data are added at send time.
@@ -349,6 +387,89 @@ func buildSCIONFastPath(sc *scionConn, pi *scionPathInfo) *scionFastPath {
 		udpOffset:  udpOffset,
 		nextHop:    dst.NextHop,
 		pseudoCsum: pseudoCsum,
+	}
+}
+
+// parseSCIONPacket parses a raw SCION packet from the underlay, extracting
+// the source address info and UDP payload. scn is a reusable slayers.SCION
+// (with RecyclePaths enabled). Returns srcIA, srcAddr, payload, rawPath, ok.
+func parseSCIONPacket(data []byte, scn *slayers.SCION) (
+	srcIA addr.IA, srcAddr netip.AddrPort, payload []byte, rawPathBytes []byte, ok bool,
+) {
+	if err := scn.DecodeFromBytes(data, gopacket.NilDecodeFeedback); err != nil {
+		return 0, netip.AddrPort{}, nil, nil, false
+	}
+	if scn.NextHdr != slayers.L4UDP {
+		return 0, netip.AddrPort{}, nil, nil, false
+	}
+
+	srcHost, err := scn.SrcAddr()
+	if err != nil {
+		return 0, netip.AddrPort{}, nil, nil, false
+	}
+	srcIP := srcHost.IP()
+	srcIA = scn.SrcIA
+
+	// L4 payload starts at HdrLen * 4 bytes (SCION header is HdrLen
+	// 4-byte words). The first 8 bytes are the UDP header.
+	hdrBytes := int(scn.HdrLen) * 4
+	if len(data) < hdrBytes+8 {
+		return 0, netip.AddrPort{}, nil, nil, false
+	}
+	// Extract UDP source port from the first 2 bytes of the L4 header.
+	srcPort := binary.BigEndian.Uint16(data[hdrBytes:])
+	srcAddr = netip.AddrPortFrom(srcIP, srcPort)
+	payload = data[hdrBytes+8:]
+
+	// Extract raw path bytes for potential reversal (disco first-contact).
+	if scn.Path != nil {
+		pathLen := scn.Path.Len()
+		// The path sits between the address header and the L4 header
+		// in the SCION common+address+path header region.
+		addrHdrLen := scn.AddrHdrLen()
+		// Common header is 12 bytes, then address header, then path.
+		pathStart := 12 + addrHdrLen
+		pathEnd := pathStart + pathLen
+		if pathEnd <= hdrBytes && pathLen > 0 {
+			rawPathBytes = data[pathStart:pathEnd]
+		}
+	}
+
+	return srcIA, srcAddr, payload, rawPathBytes, true
+}
+
+// buildSCIONReplyAddr builds an *snet.UDPAddr with reversed path for disco
+// reply routing from raw path bytes extracted during receive.
+func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes []byte) *snet.UDPAddr {
+	if len(rawPathBytes) == 0 {
+		return nil
+	}
+	// Copy path bytes since DecodeFromBytes references the slice.
+	pathCopy := make([]byte, len(rawPathBytes))
+	copy(pathCopy, rawPathBytes)
+
+	var raw scionpath.Raw
+	if err := raw.DecodeFromBytes(pathCopy); err != nil {
+		return nil
+	}
+	reversed, err := raw.Reverse()
+	if err != nil {
+		return nil
+	}
+	// Serialize the reversed path to raw bytes and wrap in snetpath.SCION
+	// which implements snet.DataplanePath.
+	revBytes := make([]byte, reversed.Len())
+	if err := reversed.SerializeTo(revBytes); err != nil {
+		return nil
+	}
+
+	return &snet.UDPAddr{
+		IA: srcIA,
+		Host: &net.UDPAddr{
+			IP:   srcHostAddr.Addr().AsSlice(),
+			Port: int(srcHostAddr.Port()),
+		},
+		Path: snetpath.SCION{Raw: revBytes},
 	}
 }
 
@@ -771,6 +892,10 @@ func (c *Conn) updateActiveSCIONPathLocking(peerIA addr.IA, hostAddr netip.AddrP
 // the socket is still alive. If no packets are received for
 // scionReconnectThreshold while active SCION peers exist, we close the old
 // socket and reconnect.
+//
+// When the underlay socket is available, packets are read in batches via
+// recvmmsg and parsed with lightweight slayers.SCION decoding. Otherwise,
+// falls back to single-packet snet.Conn.ReadFrom.
 func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
 	sc := c.pconnSCION
 	if sc == nil {
@@ -804,34 +929,55 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 			continue
 		}
 
-		// Set a read deadline so we wake up periodically even if the socket
-		// is silently dead (SCION router lost our port registration).
+		// Fast path: batch read from underlay via recvmmsg.
+		if sc.underlayXPC != nil {
+			sc.underlayConn.SetReadDeadline(time.Now().Add(scionReadDeadline))
+
+			n, err := c.receiveSCIONBatch(sc, buffs, sizes, eps)
+			if n > 0 {
+				return n, nil
+			}
+			if err != nil {
+				select {
+				case <-c.donec:
+					return 0, net.ErrClosed
+				default:
+				}
+				if isTimeoutError(err) {
+					if c.shouldReconnectSCION() {
+						c.reconnectSCION()
+					}
+					continue
+				}
+				if errors.Is(err, net.ErrClosed) {
+					continue
+				}
+				c.logf("magicsock: SCION read error: %v", err)
+				continue
+			}
+			// n == 0 and no error means all packets were disco/filtered.
+			continue
+		}
+
+		// Slow path: single-packet snet.Conn.ReadFrom.
 		sc.conn.SetReadDeadline(time.Now().Add(scionReadDeadline))
 
 		n, srcAddr, err := sc.readFrom(buffs[0])
 		if err != nil {
-			// Graceful shutdown: Conn is closing.
 			select {
 			case <-c.donec:
 				return 0, net.ErrClosed
 			default:
 			}
-
-			// Timeout: check if we need to reconnect.
 			if isTimeoutError(err) {
 				if c.shouldReconnectSCION() {
 					c.reconnectSCION()
 				}
 				continue
 			}
-
-			// Socket closed (by reconnectSCION or externally): re-read
-			// pconnSCION on next iteration.
 			if errors.Is(err, net.ErrClosed) {
 				continue
 			}
-
-			// Other errors: log and continue. Never propagate to WireGuard.
 			c.logf("magicsock: SCION read error: %v", err)
 			continue
 		}
@@ -839,28 +985,19 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 			continue
 		}
 
-		// Got a packet — record receive time.
 		c.lastSCIONRecv.StoreAtomic(mono.Now())
 
 		b := buffs[0][:n]
-
 		srcHostAddr := srcAddr.Host.AddrPort()
 
-		// Check for disco packets (same as receiveIP does).
 		pt, _ := packetLooksLike(b)
 		if pt == packetLooksLikeDisco {
-			// For disco messages, include the scionKey so pong replies
-			// are routed back over SCION. Use a single critical section
-			// for the lookup+register to avoid a TOCTOU race where a
-			// concurrent discoverSCIONPaths could register between our
-			// check and our register, creating orphaned entries.
+			// Slow path disco: snet.Conn.ReadFrom returns a pre-reversed
+			// path suitable for replies, so use srcAddr directly.
 			srcEpAddr := epAddr{ap: srcHostAddr}
 			c.mu.Lock()
 			sk := c.scionPathsByAddr[scionAddrKey{ia: srcAddr.IA, addr: srcHostAddr}]
 			if !sk.IsSet() {
-				// First disco packet from this SCION peer — bootstrap a
-				// reverse path entry so the pong can go back over SCION.
-				// ReadFrom returns a pre-reversed path suitable for replies.
 				sk = c.registerSCIONPath(&scionPathInfo{
 					peerIA:    srcAddr.IA,
 					hostAddr:  srcHostAddr,
@@ -878,8 +1015,6 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 			continue
 		}
 
-		// WireGuard packet — look up the endpoint by host addr only
-		// (peerMap is keyed by netip.AddrPort, not scionKey).
 		srcEpAddr := epAddr{ap: srcHostAddr}
 		c.mu.Lock()
 		ep, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
@@ -901,6 +1036,108 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		eps[0] = ep
 		return 1, nil
 	}
+}
+
+// receiveSCIONBatch reads a batch of raw SCION packets from the underlay
+// socket via recvmmsg, parses SCION+UDP headers with slayers, and copies
+// payloads into WireGuard's buffs. Disco packets are handled inline and
+// not reported to the caller.
+func (c *Conn) receiveSCIONBatch(sc *scionConn, buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
+	batch := scionRecvBatchPool.Get().(*scionRecvBatch)
+	defer putScionRecvBatch(batch)
+
+	n := len(buffs)
+	if n > scionMaxBatchSize {
+		n = scionMaxBatchSize
+	}
+
+	numMsgs, err := sc.underlayXPC.ReadBatch(batch.msgs[:n], 0)
+	if err != nil {
+		return 0, err
+	}
+
+	reportToCaller := false
+	count := 0
+	for i := 0; i < numMsgs; i++ {
+		msg := &batch.msgs[i]
+		if msg.N == 0 {
+			sizes[count] = 0
+			continue
+		}
+
+		srcIA, srcHostAddr, payload, rawPath, ok := parseSCIONPacket(
+			msg.Buffers[0][:msg.N], &batch.scn)
+		if !ok || len(payload) == 0 {
+			continue
+		}
+
+		// Copy payload into WireGuard's buffer.
+		pn := copy(buffs[count], payload)
+
+		c.lastSCIONRecv.StoreAtomic(mono.Now())
+
+		pt, _ := packetLooksLike(buffs[count][:pn])
+		if pt == packetLooksLikeDisco {
+			c.handleSCIONDisco(buffs[count][:pn], srcIA, srcHostAddr, rawPath)
+			continue
+		}
+
+		if !c.havePrivateKey.Load() {
+			continue
+		}
+
+		srcEpAddr := epAddr{ap: srcHostAddr}
+		c.mu.Lock()
+		ep, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
+		c.mu.Unlock()
+		if !ok {
+			sizes[count] = pn
+			eps[count] = &lazyEndpoint{c: c, src: srcEpAddr}
+			count++
+			reportToCaller = true
+			continue
+		}
+
+		now := mono.Now()
+		ep.lastRecvUDPAny.StoreAtomic(now)
+		ep.noteRecvActivity(srcEpAddr, now)
+		if c.metrics != nil {
+			c.metrics.inboundPacketsSCIONTotal.Add(1)
+			c.metrics.inboundBytesSCIONTotal.Add(int64(pn))
+		}
+		sizes[count] = pn
+		eps[count] = ep
+		count++
+		reportToCaller = true
+	}
+
+	if reportToCaller {
+		return count, nil
+	}
+	return 0, nil
+}
+
+// handleSCIONDisco handles a disco packet received on the batch path.
+// It looks up or registers a SCION path entry and dispatches to handleDiscoMessage.
+// For first-contact, the raw path bytes are reversed to build a reply path.
+func (c *Conn) handleSCIONDisco(b []byte, srcIA addr.IA, srcHostAddr netip.AddrPort, rawPath []byte) {
+	srcEpAddr := epAddr{ap: srcHostAddr}
+	c.mu.Lock()
+	sk := c.scionPathsByAddr[scionAddrKey{ia: srcIA, addr: srcHostAddr}]
+	if !sk.IsSet() {
+		// First disco packet from this SCION peer — build a reply path
+		// by reversing the raw SCION path from the incoming packet.
+		replyAddr := buildSCIONReplyAddr(srcIA, srcHostAddr, rawPath)
+		sk = c.registerSCIONPath(&scionPathInfo{
+			peerIA:    srcIA,
+			hostAddr:  srcHostAddr,
+			replyPath: replyAddr,
+		})
+		c.setActiveSCIONPath(srcIA, srcHostAddr, sk)
+	}
+	c.mu.Unlock()
+	srcEpAddr.scionKey = sk
+	c.handleDiscoMessage(b, srcEpAddr, false, key.NodePublic{}, discoRXPathSCION)
 }
 
 // isTimeoutError reports whether err is a network timeout (from SetReadDeadline).
