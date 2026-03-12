@@ -231,12 +231,20 @@ func (endHostInspector) HasAttributes(_ context.Context, _ addr.IA, _ trust.Attr
 }
 
 // scionTopologyPath returns the path to the SCION topology file, checking
-// TS_SCION_TOPOLOGY first, then falling back to /etc/scion/topology.json.
+// TS_SCION_TOPOLOGY first, then the platform's SCION config directory
+// (/etc/scion/ on Linux), then a "scion" subdirectory under the tailscaled
+// state directory (for bootstrapped topologies).
 func scionTopologyPath() string {
 	if p := os.Getenv("TS_SCION_TOPOLOGY"); p != "" {
 		return p
 	}
-	return "/etc/scion/topology.json"
+	// Standard SCION installation path (Linux/Unix convention from scionproto).
+	const defaultSCIONTopology = "/etc/scion/topology.json"
+	if _, err := os.Stat(defaultSCIONTopology); err == nil {
+		return defaultSCIONTopology
+	}
+	// Bootstrapped topology under the tailscaled state directory.
+	return filepath.Join(paths.DefaultTailscaledStateDir(), "scion", "topology.json")
 }
 
 // scionStateDir returns the directory for SCION state (PathDB, etc.),
