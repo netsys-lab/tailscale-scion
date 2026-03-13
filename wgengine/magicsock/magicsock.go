@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/scionproto/scion/pkg/addr"
 	"github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"go4.org/mem"
@@ -422,9 +423,10 @@ type Conn struct {
 	// scionPaths is the registry of SCION path information, keyed by
 	// scionPathKey. Each entry holds the full SCION address and path
 	// data for a peer.
-	scionPaths      map[scionPathKey]*scionPathInfo
-	scionPathsByAddr map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
-	scionPathSeq    atomic.Uint32                  // monotonic key generator for scionPaths
+	scionPaths         map[scionPathKey]*scionPathInfo
+	scionPathsByAddr   map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
+	scionPathSeq       atomic.Uint32                 // monotonic key generator for scionPaths
+	scionSoftRefreshAt map[addr.IA]time.Time         // last soft refresh per peer, guarded by c.mu
 
 	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
 	// Used by receiveSCION to detect a dead socket and trigger reconnection.

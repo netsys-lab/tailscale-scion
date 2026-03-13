@@ -876,12 +876,17 @@ func (de *endpoint) heartbeat() {
 				continue
 			}
 			ps.lastPing = now
+			ps.pingsSent++
 			scionEp := epAddr{
 				ap:       de.scionState.hostAddr,
 				scionKey: pk,
 			}
 			de.startDiscoPingLocked(scionEp, now, pingHeartbeat, 0, nil)
 		}
+	} else if de.scionState != nil && de.c.pconnSCION != nil && len(de.scionState.paths) > 1 {
+		// Probe non-best SCION paths one at a time via round-robin so
+		// latency data stays fresh for re-evaluation.
+		de.probeSCIONNonBestLocked(now)
 	}
 
 	if de.wantUDPRelayPathDiscoveryLocked(now) {
@@ -1237,6 +1242,19 @@ func (de *endpoint) discoPingTimeout(txid stun.TxID) {
 		de.c.dlogf("[v1] magicsock: disco: timeout waiting for pong %x from %v (%v, %v)", txid[:6], sp.to, de.publicKey.ShortString(), de.discoShort())
 	}
 	de.removeSentDiscoPingLocked(txid, sp, discoPingTimedOut)
+
+	// Track consecutive loss for SCION paths and demote if unhealthy.
+	if sp.to.scionKey.IsSet() && de.scionState != nil {
+		if ps, ok := de.scionState.paths[sp.to.scionKey]; ok {
+			ps.consecutiveLoss++
+			if ps.consecutiveLoss >= 3 && ps.healthy {
+				ps.healthy = false
+				de.c.logf("magicsock: SCION path %d unhealthy for %v (loss: %d)",
+					sp.to.scionKey, de.publicKey.ShortString(), ps.consecutiveLoss)
+				de.demoteSCIONPathLocked(sp.to.scionKey)
+			}
+		}
+	}
 }
 
 // forgetDiscoPing is called when a ping fails to send.
@@ -1245,6 +1263,161 @@ func (de *endpoint) forgetDiscoPing(txid stun.TxID) {
 	defer de.mu.Unlock()
 	if sp, ok := de.sentPing[txid]; ok {
 		de.removeSentDiscoPingLocked(txid, sp, discoPingFailed)
+	}
+}
+
+// probeSCIONNonBestLocked probes one non-active SCION path per call using
+// round-robin ordering. This keeps latency data fresh for paths that aren't
+// currently the active path, enabling re-evaluation to detect better options.
+// de.mu must be held.
+func (de *endpoint) probeSCIONNonBestLocked(now mono.Time) {
+	if de.scionState == nil {
+		return
+	}
+
+	// Collect non-active path keys and sort for deterministic ordering.
+	var nonBest []scionPathKey
+	for k := range de.scionState.paths {
+		if k != de.scionState.activePath {
+			nonBest = append(nonBest, k)
+		}
+	}
+	if len(nonBest) == 0 {
+		return
+	}
+	slices.SortFunc(nonBest, func(a, b scionPathKey) int {
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+	})
+
+	// Pick one via round-robin.
+	idx := de.scionState.probeRoundRobin % len(nonBest)
+	de.scionState.probeRoundRobin++
+	pk := nonBest[idx]
+	ps := de.scionState.paths[pk]
+
+	// Rate limit per path.
+	if !ps.lastPing.IsZero() && now.Sub(ps.lastPing) < discoPingInterval {
+		return
+	}
+	ps.lastPing = now
+	ps.pingsSent++
+	scionEp := epAddr{
+		ap:       de.scionState.hostAddr,
+		scionKey: pk,
+	}
+	de.startDiscoPingLocked(scionEp, now, pingHeartbeat, 0, nil)
+}
+
+// demoteSCIONPathLocked is called when a SCION path is marked unhealthy.
+// It finds the best remaining healthy path by measured latency and switches
+// activePath and bestAddr if the demoted path was active/best.
+// de.mu must be held.
+func (de *endpoint) demoteSCIONPathLocked(demotedKey scionPathKey) {
+	if de.scionState == nil {
+		return
+	}
+
+	// Find best healthy path by measured latency.
+	var bestKey scionPathKey
+	var bestLatency time.Duration
+	for k, ps := range de.scionState.paths {
+		if k == demotedKey || !ps.healthy {
+			continue
+		}
+		lat := ps.latency()
+		if !bestKey.IsSet() || lat < bestLatency {
+			bestKey = k
+			bestLatency = lat
+		}
+	}
+
+	// Only act if the demoted path was the active path.
+	if de.scionState.activePath != demotedKey {
+		return
+	}
+
+	if bestKey.IsSet() {
+		de.scionState.activePath = bestKey
+		newAddr := addrQuality{
+			epAddr:         epAddr{ap: de.scionState.hostAddr, scionKey: bestKey},
+			latency:        bestLatency,
+			scionPreferred: de.scionPreferred,
+		}
+		de.c.logf("magicsock: SCION path demoted, switching to path %d for %v", bestKey, de.publicKey.ShortString())
+		de.setBestAddrLocked(newAddr)
+		go de.c.updateActiveSCIONPathLocking(de.scionState.peerIA, de.scionState.hostAddr, bestKey)
+	} else {
+		// No healthy SCION paths remain. Clear SCION bestAddr to fall back.
+		de.scionState.activePath = 0
+		if de.bestAddr.isSCION() {
+			de.c.logf("magicsock: no healthy SCION paths for %v, clearing bestAddr", de.publicKey.ShortString())
+			de.clearBestAddrLocked()
+		}
+	}
+}
+
+// reEvalSCIONPathsLocked re-evaluates all SCION paths by measured latency
+// after a pong is recorded. Throttled to once per 2 seconds. If a healthier,
+// lower-latency path is found, switches bestAddr and activePath.
+// de.mu must be held.
+func (de *endpoint) reEvalSCIONPathsLocked(now mono.Time) {
+	if de.scionState == nil || len(de.scionState.paths) < 2 {
+		return
+	}
+	if !de.scionState.lastFullEvalAt.IsZero() && now.Sub(de.scionState.lastFullEvalAt) < 2*time.Second {
+		return
+	}
+	de.scionState.lastFullEvalAt = now
+
+	// Check all paths have at least 1 pong measurement.
+	for _, ps := range de.scionState.paths {
+		if ps.pongCount == 0 {
+			return
+		}
+	}
+
+	// Find the healthy path with lowest measured latency.
+	var bestKey scionPathKey
+	var bestLatency time.Duration
+	for k, ps := range de.scionState.paths {
+		if !ps.healthy {
+			continue
+		}
+		lat := ps.latency()
+		if !bestKey.IsSet() || lat < bestLatency {
+			bestKey = k
+			bestLatency = lat
+		}
+	}
+
+	if !bestKey.IsSet() || bestKey == de.scionState.activePath {
+		return
+	}
+
+	candidate := addrQuality{
+		epAddr:         epAddr{ap: de.scionState.hostAddr, scionKey: bestKey},
+		latency:        bestLatency,
+		scionPreferred: de.scionPreferred,
+	}
+
+	if betterAddr(candidate, de.bestAddr) {
+		de.c.logf("magicsock: SCION re-eval: switching to path %d (latency %v) for %v",
+			bestKey, bestLatency.Round(time.Millisecond), de.publicKey.ShortString())
+		de.debugUpdates.Add(EndpointChange{
+			When: time.Now(),
+			What: "reEvalSCIONPathsLocked-switch",
+			From: de.bestAddr,
+			To:   candidate,
+		})
+		de.setBestAddrLocked(candidate)
+		de.scionState.activePath = bestKey
+		go de.c.updateActiveSCIONPathLocking(de.scionState.peerIA, de.scionState.hostAddr, bestKey)
 	}
 }
 
@@ -1434,6 +1607,7 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 				continue
 			}
 			ps.lastPing = now
+			ps.pingsSent++
 			scionEp := epAddr{
 				ap:       de.scionState.hostAddr,
 				scionKey: pk,
@@ -1858,7 +2032,14 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 					latency: latency,
 					pongAt:  now,
 				})
+				ps.pongsReceived++
+				ps.consecutiveLoss = 0
+				if !ps.healthy {
+					ps.healthy = true
+					de.c.logf("magicsock: SCION path %d recovered for %v", src.scionKey, de.publicKey.ShortString())
+				}
 			}
+			de.reEvalSCIONPathsLocked(now)
 		}
 	}
 
