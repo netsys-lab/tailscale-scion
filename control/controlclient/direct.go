@@ -51,7 +51,6 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/tkatype"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
@@ -383,7 +382,7 @@ func (c *Direct) SetHostinfo(hi *tailcfg.Hostinfo) bool {
 	if hi == nil {
 		panic("nil Hostinfo")
 	}
-	hi = ptr.To(*hi)
+	hi = new(*hi)
 	hi.NetInfo = nil
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1485,7 +1484,7 @@ func (c *Direct) answerPing(pr *tailcfg.PingRequest) {
 		}
 		return
 	}
-	for _, t := range strings.Split(pr.Types, ",") {
+	for t := range strings.SplitSeq(pr.Types, ",") {
 		switch pt := tailcfg.PingType(t); pt {
 		case tailcfg.PingTSMP, tailcfg.PingDisco, tailcfg.PingICMP, tailcfg.PingPeerAPI:
 			go doPingerPing(c.logf, httpc, pr, c.pinger, pt)

@@ -171,10 +171,11 @@ type Conn struct {
 	derpActiveFunc         func()
 	idleFunc               func() time.Duration // nil means unknown
 	testOnlyPacketListener nettype.PacketListener
-	noteRecvActivity       func(key.NodePublic) // or nil, see Options.NoteRecvActivity
-	netMon                 *netmon.Monitor      // must be non-nil
-	health                 *health.Tracker      // or nil
-	controlKnobs           *controlknobs.Knobs  // or nil
+	noteRecvActivity       func(key.NodePublic)                   // or nil, see Options.NoteRecvActivity
+	onDERPRecv             func(int, key.NodePublic, []byte) bool // or nil, see Options.OnDERPRecv
+	netMon                 *netmon.Monitor                        // must be non-nil
+	health                 *health.Tracker                        // or nil
+	controlKnobs           *controlknobs.Knobs                    // or nil
 
 	// ================================================================
 	// No locking required to access these fields, either because
@@ -518,6 +519,20 @@ type Options struct {
 	// DisablePortMapper, if true, disables the portmapper.
 	// This is primarily useful in tests.
 	DisablePortMapper bool
+
+	// ForceDiscoKey, if non-zero, forces the use of a specific disco
+	// private key. This should only be used for special cases and
+	// experiments, not for production. The recommended normal path is to
+	// leave it zero, in which case a new disco key is generated per
+	// Tailscale start and kept only in memory.
+	ForceDiscoKey key.DiscoPrivate
+
+	// OnDERPRecv, if non-nil, is called for every non-disco packet
+	// received from DERP before the peer map lookup. If it returns
+	// true, the packet is considered handled and is not passed to
+	// WireGuard. The pkt slice is borrowed and must be copied if
+	// the callee needs to retain it.
+	OnDERPRecv func(regionID int, src key.NodePublic, pkt []byte) bool
 }
 
 func (o *Options) logf() logger.Logf {
@@ -645,6 +660,9 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c := newConn(opts.logf())
+	if !opts.ForceDiscoKey.IsZero() {
+		c.discoAtomic.Set(opts.ForceDiscoKey)
+	}
 	c.eventBus = opts.EventBus
 	c.port.Store(uint32(opts.Port))
 	c.controlKnobs = opts.ControlKnobs
@@ -653,6 +671,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c.idleFunc = opts.IdleFunc
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
+	c.onDERPRecv = opts.OnDERPRecv
 
 	// Set up publishers and subscribers. Subscribe calls must return before
 	// NewConn otherwise published events can be missed.
@@ -1510,8 +1529,7 @@ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool,
 		err = c.pconn4.WriteWireGuardBatchTo(buffs, addr, offset)
 	}
 	if err != nil {
-		var errGSO neterror.ErrUDPGSODisabled
-		if errors.As(err, &errGSO) {
+		if errGSO, ok := errors.AsType[neterror.ErrUDPGSODisabled](err); ok {
 			c.logf("magicsock: %s", errGSO.Error())
 			err = errGSO.RetryErr
 		} else {
@@ -4332,6 +4350,7 @@ func (c *Conn) HandleDiscoKeyAdvertisement(node tailcfg.NodeView, update packet.
 	// If the key did not change, count it and return.
 	if oldDiscoKey.Compare(discoKey) == 0 {
 		metricTSMPDiscoKeyAdvertisementUnchanged.Add(1)
+		c.logf("magicsock: disco key did not change for node %v", nodeKey.ShortString())
 		return
 	}
 	c.discoInfoForKnownPeerLocked(discoKey)

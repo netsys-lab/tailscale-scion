@@ -334,8 +334,7 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 		if expr, useAutoExitNode := ipn.ParseAutoExitNodeString(upArgs.exitNodeIP); useAutoExitNode {
 			prefs.AutoExitNode = expr
 		} else if err := prefs.SetExitNodeIP(upArgs.exitNodeIP, st); err != nil {
-			var e ipn.ExitNodeLocalIPError
-			if errors.As(err, &e) {
+			if _, ok := errors.AsType[ipn.ExitNodeLocalIPError](err); ok {
 				return nil, fmt.Errorf("%w; did you mean --advertise-exit-node?", err)
 			}
 			return nil, err
@@ -543,9 +542,6 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 	}
 
 	warnOnAdvertiseRoutes(ctx, prefs)
-	if err := checkExitNodeRisk(ctx, prefs, upArgs.acceptedRisks); err != nil {
-		return err
-	}
 
 	curPrefs, err := localClient.GetPrefs(ctx)
 	if err != nil {
@@ -834,7 +830,6 @@ func upWorthyWarning(s string) bool {
 	return strings.Contains(s, healthmsg.TailscaleSSHOnBut) ||
 		strings.Contains(s, healthmsg.WarnAcceptRoutesOff) ||
 		strings.Contains(s, healthmsg.LockedOut) ||
-		strings.Contains(s, healthmsg.WarnExitNodeUsage) ||
 		strings.Contains(s, healthmsg.InMemoryTailnetLockState) ||
 		strings.Contains(strings.ToLower(s), "update available: ")
 }
@@ -916,7 +911,7 @@ func addPrefFlagMapping(flagName string, prefNames ...string) {
 	prefType := reflect.TypeFor[ipn.Prefs]()
 	for _, pref := range prefNames {
 		t := prefType
-		for _, name := range strings.Split(pref, ".") {
+		for name := range strings.SplitSeq(pref, ".") {
 			// Crash at runtime if there's a typo in the prefName.
 			f, ok := t.FieldByName(name)
 			if !ok {
