@@ -14,19 +14,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
-	"tailscale.com/net/dns/resolvconffile"
+	"tailscale.com/atomicfile"
+	"tailscale.com/envknob"
+	"tailscale.com/types/logger"
 )
 
 const (
 	// bootstrapHTTPTimeout is the timeout for HTTP requests to the bootstrap server.
 	bootstrapHTTPTimeout = 10 * time.Second
-
-	// defaultBootstrapPort is the default port for SCION discovery servers.
-	defaultBootstrapPort = "8041"
 
 	// scionDiscoverySRV is the SRV record name for SCION discovery.
 	scionDiscoverySRV = "_sciondiscovery._tcp"
@@ -40,10 +38,14 @@ var defaultBootstrapURLs []string = []string{
 	"http://128.143.201.144:8041",
 }
 
+var (
+	scionBootstrapURL  = envknob.RegisterString("TS_SCION_BOOTSTRAP_URL")
+	scionBootstrapURLs = envknob.RegisterString("TS_SCION_BOOTSTRAP_URLS")
+)
 
 // bootstrapSCION fetches topology.json and TRCs from a bootstrap server,
 // saving them to destDir.
-func bootstrapSCION(ctx context.Context, serverURL string, destDir string) error {
+func bootstrapSCION(ctx context.Context, logf logger.Logf, serverURL string, destDir string) error {
 	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return fmt.Errorf("creating bootstrap directory %s: %w", destDir, err)
 	}
@@ -57,15 +59,17 @@ func bootstrapSCION(ctx context.Context, serverURL string, destDir string) error
 		return fmt.Errorf("fetching topology from %s: %w", topoURL, err)
 	}
 	topoPath := filepath.Join(destDir, "topology.json")
-	if err := os.WriteFile(topoPath, topoData, 0o644); err != nil {
+	if err := atomicfile.WriteFile(topoPath, topoData, 0o644); err != nil {
 		return fmt.Errorf("writing topology to %s: %w", topoPath, err)
 	}
+	logf("scion: bootstrap: fetched topology from %s", serverURL)
 
 	// Fetch TRC index.
 	trcsURL := strings.TrimRight(serverURL, "/") + "/trcs"
 	trcsData, err := httpGet(ctx, client, trcsURL)
 	if err != nil {
 		// TRCs are optional for Phase 1 (accept-all verification).
+		logf("scion: bootstrap: TRC index not available from %s: %v", serverURL, err)
 		return nil
 	}
 
@@ -78,33 +82,56 @@ func bootstrapSCION(ctx context.Context, serverURL string, destDir string) error
 	var trcIndex []trcEntry
 	if err := json.Unmarshal(trcsData, &trcIndex); err != nil {
 		// Non-fatal: TRC index may not be JSON array on all servers.
+		logf("scion: bootstrap: failed to parse TRC index: %v", err)
 		return nil
 	}
 
+	fetched := 0
 	for _, entry := range trcIndex {
-		blobURL := strings.TrimRight(serverURL, "/") + "/trcs/" + entry.ID + "/blob"
+		if entry.ID.ISD == 0 {
+			continue // skip unparseable entries
+		}
+		idStr := entry.ID.String()
+		blobURL := strings.TrimRight(serverURL, "/") + "/trcs/" + idStr + "/blob"
 		blob, err := httpGet(ctx, client, blobURL)
 		if err != nil {
 			continue // Best-effort TRC download.
 		}
-		trcPath := filepath.Join(certsDir, entry.ID+".trc")
-		_ = os.WriteFile(trcPath, blob, 0o644)
+		trcPath := filepath.Join(certsDir, idStr+".trc")
+		if err := atomicfile.WriteFile(trcPath, blob, 0o644); err != nil {
+			continue
+		}
+		fetched++
 	}
+	logf("scion: bootstrap: fetched %d/%d TRCs from %s", fetched, len(trcIndex), serverURL)
 
 	return nil
 }
 
 // trcEntry represents an entry in the TRC index returned by the bootstrap server.
+// The server returns {"id": {"isd": 19, "base_number": 1, "serial_number": 1}}.
 type trcEntry struct {
-	ID string `json:"id"`
+	ID trcID `json:"id"`
+}
+
+// trcID represents the composite identifier for a TRC.
+type trcID struct {
+	ISD          int `json:"isd"`
+	BaseNumber   int `json:"base_number"`
+	SerialNumber int `json:"serial_number"`
+}
+
+// String returns a filesystem-safe representation of the TRC ID,
+// e.g. "isd19-b1-s1".
+func (id trcID) String() string {
+	return fmt.Sprintf("isd%d-b%d-s%d", id.ISD, id.BaseNumber, id.SerialNumber)
 }
 
 // discoverBootstrapURL attempts DNS-based discovery of a SCION bootstrap server.
 // It follows the JPAN discovery chain:
 //  1. SRV lookup for _sciondiscovery._tcp.<domain>
 //  2. TXT lookup for _sciondiscovery._tcp.<domain> for port override
-//  3. Fallback to port 8041
-func discoverBootstrapURL(ctx context.Context) (string, error) {
+func discoverBootstrapURL(ctx context.Context, logf logger.Logf) (string, error) {
 	// Determine local search domain from system resolver.
 	domain, err := localSearchDomain()
 	if err != nil {
@@ -118,20 +145,21 @@ func discoverBootstrapURL(ctx context.Context) (string, error) {
 
 	// Try SRV lookup.
 	_, addrs, err := r.LookupSRV(ctx, "sciondiscovery", "tcp", domain)
-	if err == nil && len(addrs) > 0 {
-		host := strings.TrimRight(addrs[0].Target, ".")
-		port := fmt.Sprintf("%d", addrs[0].Port)
-
-		// Check for TXT record port override.
-		if txtPort, err := lookupDiscoveryPort(ctx, r, domain); err == nil && txtPort != "" {
-			port = txtPort
-		}
-
-		return fmt.Sprintf("http://%s:%s", host, port), nil
+	if err != nil || len(addrs) == 0 {
+		return "", fmt.Errorf("SRV lookup for %s.%s failed: %w", scionDiscoverySRV, domain, err)
 	}
 
-	// Fallback: try the domain itself on the default port.
-	return fmt.Sprintf("http://%s:%s", domain, defaultBootstrapPort), nil
+	host := strings.TrimRight(addrs[0].Target, ".")
+	port := fmt.Sprintf("%d", addrs[0].Port)
+
+	// Check for TXT record port override.
+	if txtPort, err := lookupDiscoveryPort(ctx, r, domain); err == nil && txtPort != "" {
+		port = txtPort
+	}
+
+	url := fmt.Sprintf("http://%s:%s", host, port)
+	logf("scion: bootstrap: discovered %s via DNS SRV for %s", url, domain)
+	return url, nil
 }
 
 // lookupDiscoveryPort queries TXT records for the discovery port override.
@@ -149,26 +177,9 @@ func lookupDiscoveryPort(ctx context.Context, r *net.Resolver, domain string) (s
 	return "", fmt.Errorf("no x-sciondiscovery TXT record found")
 }
 
-// localSearchDomain returns the first search domain from the system's DNS
-// configuration, using Tailscale's cross-platform resolv.conf parser.
-func localSearchDomain() (string, error) {
-	if runtime.GOOS == "windows" || runtime.GOOS == "android" {
-		return localSearchDomainFromHostname()
-	}
-	cfg, err := resolvconffile.ParseFile(resolvconffile.Path)
-	if err != nil {
-		return "", err
-	}
-	if len(cfg.SearchDomains) > 0 {
-		return cfg.SearchDomains[0].WithoutTrailingDot(), nil
-	}
-	return "", nil
-}
-
 // localSearchDomainFromHostname infers the search domain from the
-// system hostname. Used on platforms without resolv.conf.
-// Note: on Windows, os.Hostname() typically returns a short NetBIOS name
-// without a domain suffix, so this will usually return an error.
+// system hostname. Used as a fallback on platforms where the primary
+// DNS discovery method fails.
 func localSearchDomainFromHostname() (string, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -177,7 +188,7 @@ func localSearchDomainFromHostname() (string, error) {
 	if i := strings.IndexByte(hostname, '.'); i >= 0 {
 		return hostname[i+1:], nil
 	}
-	return "", fmt.Errorf("no search domain found")
+	return "", fmt.Errorf("no domain suffix in hostname %q", hostname)
 }
 
 // httpGet performs an HTTP GET request and returns the response body.
@@ -206,16 +217,16 @@ func httpGet(ctx context.Context, client *http.Client, url string) ([]byte, erro
 
 // bootstrapURLs returns the list of bootstrap URLs to try, from explicit
 // configuration, DNS discovery, and hardcoded defaults.
-func bootstrapURLs(ctx context.Context) []string {
+func bootstrapURLs(ctx context.Context, logf logger.Logf) []string {
 	var urls []string
 
 	// Explicit URL from environment.
-	if u := os.Getenv("TS_SCION_BOOTSTRAP_URL"); u != "" {
+	if u := scionBootstrapURL(); u != "" {
 		urls = append(urls, u)
 	}
 
 	// Comma-separated list from environment.
-	if u := os.Getenv("TS_SCION_BOOTSTRAP_URLS"); u != "" {
+	if u := scionBootstrapURLs(); u != "" {
 		for _, url := range strings.Split(u, ",") {
 			url = strings.TrimSpace(url)
 			if url != "" {
@@ -225,12 +236,13 @@ func bootstrapURLs(ctx context.Context) []string {
 	}
 
 	// DNS-discovered URL.
-	if discovered, err := discoverBootstrapURL(ctx); err == nil {
+	if discovered, err := discoverBootstrapURL(ctx, logf); err == nil {
 		urls = append(urls, discovered)
 	}
 
 	// Hardcoded defaults.
 	urls = append(urls, defaultBootstrapURLs...)
 
+	logf("scion: bootstrap: %d URLs to try", len(urls))
 	return urls
 }
