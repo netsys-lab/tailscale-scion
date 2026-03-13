@@ -25,9 +25,9 @@ import (
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/slayers"
 	scionpath "github.com/scionproto/scion/pkg/slayers/path/scion"
-	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/addrutil"
+	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -87,13 +87,13 @@ type scionAddrKey struct {
 // scionPathKey. The actual SCION address and path data live here rather than
 // in epAddr to keep epAddr comparable and small.
 type scionPathInfo struct {
-	peerIA      addr.IA
-	hostAddr    netip.AddrPort       // peer's SCION host IP:port
-	fingerprint snet.PathFingerprint // SHA256 of interface sequence; for matching across refreshes
-	path        snet.Path            // current best SCION path to this peer
-	replyPath   *snet.UDPAddr        // bootstrapped from incoming packet (pre-reversed)
-	cachedDst   *snet.UDPAddr        // pre-built destination addr; rebuilt when path changes
-	fastPath    *scionFastPath       // pre-serialized header template for fast sends
+	peerIA           addr.IA
+	hostAddr         netip.AddrPort       // peer's SCION host IP:port
+	fingerprint      snet.PathFingerprint // SHA256 of interface sequence; for matching across refreshes
+	path             snet.Path            // current best SCION path to this peer
+	replyPath        *snet.UDPAddr        // bootstrapped from incoming packet (pre-reversed)
+	cachedDst        *snet.UDPAddr        // pre-built destination addr; rebuilt when path changes
+	fastPath         *scionFastPath       // pre-serialized header template for fast sends
 	expiry           time.Time            // path expiration from path metadata
 	mtu              uint16               // SCION payload MTU from path metadata
 	refreshMissCount int                  // consecutive refresh cycles fingerprint absent from daemon
@@ -139,17 +139,9 @@ const scionFallbackPayloadMTU = 1280
 // reports LatencyUnset for a hop. Conservative estimate for path selection.
 const scionUnsetHopLatency = 10 * time.Millisecond
 
-// scionReadDeadline is the read deadline set on the SCION socket.
-// If no packet is received within this duration, we check whether the
-// socket is still alive. This must be long enough to avoid spurious
-// reconnections during idle periods, but short enough to detect a dead
-// socket promptly.
-const scionReadDeadline = 30 * time.Second
-
-// scionReconnectThreshold is the maximum time without receiving any SCION
-// packet before we consider the socket dead and attempt to reconnect.
-// This is only checked when there are active SCION peers.
-const scionReconnectThreshold = 30 * time.Second
+// scionDaemonProbeTimeout is the timeout for probing the SCION daemon
+// connector to check if it's still alive (used for tiered reconnection).
+const scionDaemonProbeTimeout = 5 * time.Second
 
 // defaultSCIONProbePaths is the default number of SCION paths to probe per peer.
 const defaultSCIONProbePaths = 5
@@ -173,13 +165,13 @@ func scionMaxProbePaths() int {
 
 // scionEndpointState tracks SCION-specific per-peer state on an endpoint.
 type scionEndpointState struct {
-	peerIA          addr.IA                                // peer's ISD-AS from Services advertisement
-	hostAddr        netip.AddrPort                         // peer's SCION host IP:port
-	paths           map[scionPathKey]*scionPathProbeState  // probed paths (up to scionMaxProbePaths)
-	activePath      scionPathKey                           // currently selected best path for data
-	lastDiscoveryAt time.Time                              // when path discovery last started (throttle)
-	lastFullEvalAt  mono.Time                              // throttles re-evaluation of SCION path latencies
-	probeRoundRobin int                                    // round-robin index for non-best path probing
+	peerIA          addr.IA                               // peer's ISD-AS from Services advertisement
+	hostAddr        netip.AddrPort                        // peer's SCION host IP:port
+	paths           map[scionPathKey]*scionPathProbeState // probed paths (up to scionMaxProbePaths)
+	activePath      scionPathKey                          // currently selected best path for data
+	lastDiscoveryAt time.Time                             // when path discovery last started (throttle)
+	lastFullEvalAt  mono.Time                             // throttles re-evaluation of SCION path latencies
+	probeRoundRobin int                                   // round-robin index for non-best path probing
 }
 
 // scionPathProbeState tracks disco probing state for one SCION path.
@@ -513,14 +505,14 @@ type scionBatchRW interface {
 
 // scionConn wraps a SCION connection for use by magicsock.
 type scionConn struct {
-	conn         *snet.Conn         // from SCIONNetwork.Listen()
-	underlayConn *net.UDPConn       // raw underlay for fast-path sends (owned by conn)
-	underlayXPC  scionBatchRW       // for WriteBatch / sendmmsg (ipv4 or ipv6)
-	localIA      addr.IA            // our ISD-AS
-	localHostIP  netip.Addr         // local host IP (e.g. 127.0.0.1)
-	localPort    uint16             // local SCION/UDP port
-	daemon       daemon.Connector   // for path queries
-	topo         snet.Topology      // local topology
+	conn         *snet.Conn       // from SCIONNetwork.Listen()
+	underlayConn *net.UDPConn     // raw underlay for fast-path sends (owned by conn)
+	underlayXPC  scionBatchRW     // for WriteBatch / sendmmsg (ipv4 or ipv6)
+	localIA      addr.IA          // our ISD-AS
+	localHostIP  netip.Addr       // local host IP (e.g. 127.0.0.1)
+	localPort    uint16           // local SCION/UDP port
+	daemon       daemon.Connector // for path queries
+	topo         snet.Topology    // local topology
 }
 
 // close shuts down the SCION connection and daemon connector.
@@ -532,6 +524,17 @@ func (sc *scionConn) close() error {
 		sc.daemon.Close()
 	}
 	return nil
+}
+
+// closeSocket closes only the SCION socket (conn, underlayConn, underlayXPC),
+// preserving the daemon connector and topology for socket-only reconnection.
+func (sc *scionConn) closeSocket() {
+	if sc.conn != nil {
+		sc.conn.Close()
+	}
+	sc.conn = nil
+	sc.underlayConn = nil
+	sc.underlayXPC = nil
 }
 
 // writeTo sends b to a peer identified by the given scionPathInfo.
@@ -649,6 +652,7 @@ func scionListenAddr(ctx context.Context, connector daemon.Connector) *net.UDPAd
 // forceEmbeddedSCION is the TS_SCION_EMBEDDED envknob. When set to "1",
 // the external daemon attempt is skipped and only the embedded connector is tried.
 var forceEmbeddedSCION = envknob.RegisterBool("TS_SCION_EMBEDDED")
+
 // forceBootstrapSCION is the TS_SCION_FORCE_BOOTSTRAP envknob. When set to "1",
 // the local topology file attempt is skipped and only the bootstrap attempt is tried.
 var forceBootstrapSCION = envknob.RegisterBool("TS_SCION_FORCE_BOOTSTRAP")
@@ -675,7 +679,7 @@ func trySCIONConnect(ctx context.Context, logf logger.Logf, netMon *netmon.Monit
 	}
 
 	// Step 2: Try embedded with existing local topology file.
-	if !forceEmbeddedSCION() {
+	if !forceBootstrapSCION() {
 		topoPath := scionTopologyPath()
 		if _, err := os.Stat(topoPath); err == nil {
 			sc, err := tryEmbeddedDaemon(ctx, topoPath, logf, netMon)
@@ -967,6 +971,9 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 	// Fast path: pre-serialized headers + sendmmsg.
 	if fastPath != nil && sc.underlayXPC != nil {
 		err = c.sendSCIONBatchFast(sc, fastPath, buffs, offset)
+		if err != nil {
+			c.handleSCIONSendError(err)
+		}
 		return err == nil, err
 	}
 
@@ -982,6 +989,7 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 	for _, buf := range buffs {
 		_, err = sc.conn.WriteTo(buf[offset:], dst)
 		if err != nil {
+			c.handleSCIONSendError(err)
 			return false, err
 		}
 	}
@@ -1070,9 +1078,27 @@ func (c *Conn) sendSCION(sk scionPathKey, b []byte) (bool, error) {
 	}
 	_, err := sc.writeTo(b, pi)
 	if err != nil {
+		c.handleSCIONSendError(err)
 		return false, err
 	}
 	return true, nil
+}
+
+// handleSCIONSendError triggers SCION reconnection when a send fails with
+// a socket error. This is the primary reconnection mechanism — rather than
+// polling for liveness on the receive side, we reconnect when sends actually
+// fail. The receive loop picks up the new socket automatically because the
+// old socket's close unblocks its read with net.ErrClosed.
+func (c *Conn) handleSCIONSendError(err error) {
+	if err == nil {
+		return
+	}
+	// Don't reconnect for logical errors (nil path, expired path, no SCION).
+	if errors.Is(err, errNoSCION) {
+		return
+	}
+	c.logf("magicsock: SCION send failed: %v, triggering reconnect", err)
+	go c.reconnectSCION()
 }
 
 // lookupSCIONPath returns the scionPathInfo for the given key, or nil if not found.
@@ -1148,15 +1174,16 @@ func (c *Conn) updateActiveSCIONPathLocking(peerIA addr.IA, hostAddr netip.AddrP
 // receiveSCION is the conn.ReceiveFunc for SCION packets. It reads from the
 // SCION connection and dispatches disco or WireGuard packets.
 //
-// Unlike receiveIP, this function handles read timeouts internally and never
+// Unlike receiveIP, this function handles read errors internally and never
 // propagates them to WireGuard. This is critical because WireGuard's
 // RoutineReceiveIncoming exits the goroutine permanently after 10 consecutive
 // temporary errors, and we need to survive SCION socket death + reconnection.
 //
-// The function uses SetReadDeadline to periodically wake up and check whether
-// the socket is still alive. If no packets are received for
-// scionReconnectThreshold while active SCION peers exist, we close the old
-// socket and reconnect.
+// The read blocks indefinitely (like IPv4/IPv6 sockets). On shutdown,
+// closeSCIONBindLocked sets an immediate deadline to unblock the read.
+// On socket swap (reconnection from the send path), the old socket is
+// closed which unblocks the read with net.ErrClosed; the loop then
+// re-reads c.pconnSCION to pick up the new socket.
 //
 // When the underlay socket is available, packets are read in batches via
 // recvmmsg and parsed with lightweight slayers.SCION decoding. Otherwise,
@@ -1166,11 +1193,6 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 	if sc == nil {
 		<-c.donec
 		return 0, net.ErrClosed
-	}
-
-	// Initialize lastSCIONRecv so we don't trigger reconnection on startup.
-	if c.lastSCIONRecv.LoadAtomic() == 0 {
-		c.lastSCIONRecv.StoreAtomic(mono.Now())
 	}
 
 	for {
@@ -1195,9 +1217,10 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		}
 
 		// Fast path: batch read from underlay via recvmmsg.
+		// No read deadline — blocks indefinitely like IPv4/IPv6 sockets.
+		// On shutdown, closeSCIONBindLocked sets an immediate deadline.
+		// On reconnection, the old socket is closed → net.ErrClosed.
 		if sc.underlayXPC != nil {
-			sc.underlayConn.SetReadDeadline(time.Now().Add(scionReadDeadline))
-
 			n, err := c.receiveSCIONBatch(sc, buffs, sizes, eps)
 			if n > 0 {
 				return n, nil
@@ -1208,13 +1231,9 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 					return 0, net.ErrClosed
 				default:
 				}
-				if isTimeoutError(err) {
-					if c.shouldReconnectSCION() {
-						c.reconnectSCION()
-					}
-					continue
-				}
-				if errors.Is(err, net.ErrClosed) {
+				if errors.Is(err, net.ErrClosed) || isTimeoutError(err) {
+					// Socket closed (reconnection or shutdown) or
+					// deadline set by closeSCIONBindLocked — re-check.
 					continue
 				}
 				c.logf("magicsock: SCION read error: %v", err)
@@ -1225,8 +1244,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		}
 
 		// Slow path: single-packet snet.Conn.ReadFrom.
-		sc.conn.SetReadDeadline(time.Now().Add(scionReadDeadline))
-
+		// No read deadline — blocks indefinitely.
 		n, srcAddr, err := sc.readFrom(buffs[0])
 		if err != nil {
 			select {
@@ -1234,13 +1252,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 				return 0, net.ErrClosed
 			default:
 			}
-			if isTimeoutError(err) {
-				if c.shouldReconnectSCION() {
-					c.reconnectSCION()
-				}
-				continue
-			}
-			if errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) || isTimeoutError(err) {
 				continue
 			}
 			c.logf("magicsock: SCION read error: %v", err)
@@ -1411,28 +1423,68 @@ func isTimeoutError(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-// shouldReconnectSCION reports whether the SCION socket appears dead and
-// should be reconnected. The socket is considered dead when:
-//  1. No SCION packet has been received for scionReconnectThreshold, AND
-//  2. There are active SCION peers (otherwise silence is expected).
-func (c *Conn) shouldReconnectSCION() bool {
-	lastRecv := c.lastSCIONRecv.LoadAtomic()
-	if mono.Since(lastRecv) < scionReconnectThreshold {
+// scionDaemonAlive probes the SCION daemon connector to check if it's
+// still responsive. For the embedded connector this is trivial (field read);
+// for external daemons it's a gRPC call confirming the process is alive.
+func (c *Conn) scionDaemonAlive() bool {
+	sc := c.pconnSCION
+	if sc == nil || sc.daemon == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(c.connCtx, scionDaemonProbeTimeout)
+	defer cancel()
+	_, err := sc.daemon.LocalIA(ctx)
+	return err == nil
+}
+
+// reconnectSCIONSocket attempts a socket-only reconnection: close the
+// socket but keep the daemon connector and topology, then call
+// finishSCIONConnect to create a new socket with the existing connector.
+// Returns true on success.
+func (c *Conn) reconnectSCIONSocket() bool {
+	sc := c.pconnSCION
+	if sc == nil {
 		return false
 	}
 
-	// Check if any endpoint has SCION state (active SCION peers).
-	c.mu.Lock()
-	hasSCIONPeers := len(c.scionPaths) > 0
-	c.mu.Unlock()
-	return hasSCIONPeers
+	savedDaemon := sc.daemon
+	savedTopo := sc.topo
+
+	// Close socket, release the port for rebinding.
+	sc.closeSocket()
+	c.pconnSCION = nil
+
+	newSC, err := finishSCIONConnect(c.connCtx, savedDaemon, savedTopo, c.logf, c.netMon)
+	if err != nil {
+		c.logf("magicsock: SCION socket-only reconnect failed: %v", err)
+		return false
+	}
+
+	c.pconnSCION = newSC
+	c.logf("magicsock: SCION socket-only reconnect succeeded, local IA: %s", newSC.localIA)
+	return true
 }
 
-// reconnectSCION closes the current SCION socket and creates a new one.
-// The receiveSCION loop will pick up the new socket on the next iteration.
+// reconnectSCION performs tiered SCION reconnection:
+//   - Tier 1: If the daemon connector is alive, do a socket-only reconnect
+//     (avoids expensive bootstrap: DNS SRV, topology fetch, TRCs, etc.)
+//   - Tier 2: Full bootstrap — close everything, trySCIONConnect from scratch
+//
+// The receiveSCION loop picks up the new socket on the next iteration
+// because the old socket's close unblocks the read with net.ErrClosed.
 func (c *Conn) reconnectSCION() {
-	c.logf("magicsock: SCION socket appears dead (no recv for %v), reconnecting...", scionReconnectThreshold)
+	// Tier 1: socket-only reconnect if daemon is alive.
+	if c.scionDaemonAlive() {
+		c.logf("magicsock: SCION daemon alive, trying socket-only reconnect")
+		if c.reconnectSCIONSocket() {
+			c.rediscoverAllSCIONPaths()
+			return
+		}
+		c.logf("magicsock: SCION socket-only reconnect failed, falling through to full bootstrap")
+	}
 
+	// Tier 2: full bootstrap.
+	c.logf("magicsock: SCION doing full bootstrap reconnect")
 	oldSC := c.pconnSCION
 
 	// Close old connection first — we must release the port before binding
@@ -1448,21 +1500,11 @@ func (c *Conn) reconnectSCION() {
 	newSC, err := trySCIONConnect(c.connCtx, c.logf, c.netMon)
 	if err != nil {
 		c.logf("magicsock: SCION reconnect failed: %v", err)
-		// Reset the receive timestamp so we retry after scionReconnectThreshold.
-		c.lastSCIONRecv.StoreAtomic(mono.Now())
 		return
 	}
 
-	// Swap in the new connection.
 	c.pconnSCION = newSC
-
-	// Reset the receive timestamp so we don't immediately re-trigger.
-	c.lastSCIONRecv.StoreAtomic(mono.Now())
-
 	c.logf("magicsock: SCION reconnected successfully, local IA: %s", newSC.localIA)
-
-	// Re-discover paths for all SCION peers. We need fresh paths that
-	// use the new socket's local address.
 	c.rediscoverAllSCIONPaths()
 }
 
