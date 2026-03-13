@@ -22,6 +22,7 @@ import (
 	cryptopb "github.com/scionproto/scion/pkg/proto/crypto"
 	"github.com/scionproto/scion/pkg/scrypto/cppki"
 	"github.com/scionproto/scion/pkg/scrypto/signed"
+	"github.com/scionproto/scion/pkg/segment/iface"
 	"github.com/scionproto/scion/pkg/snet"
 	segfetchergrpc "github.com/scionproto/scion/private/segment/segfetcher/grpc"
 	infra "github.com/scionproto/scion/private/segment/verifier"
@@ -33,9 +34,9 @@ import (
 	"tailscale.com/paths"
 )
 
-// embeddedConnector implements daemon.Connector and snet.Topology using an
-// embedded topology loader and path fetcher, eliminating the need for an
-// external SCION daemon process.
+// embeddedConnector implements daemon.Connector using an embedded topology
+// loader and path fetcher, eliminating the need for an external SCION daemon
+// process.
 type embeddedConnector struct {
 	topo     *topology.Loader
 	fetcher  fetcher.Fetcher
@@ -44,11 +45,8 @@ type embeddedConnector struct {
 	cancel   context.CancelFunc // cancels the topology loader goroutine
 }
 
-// Compile-time interface checks.
-var (
-	_ daemon.Connector = (*embeddedConnector)(nil)
-	_ snet.Topology    = (*embeddedConnector)(nil)
-)
+// Compile-time interface check.
+var _ daemon.Connector = (*embeddedConnector)(nil)
 
 // LocalIA returns the local ISD-AS from the topology.
 func (ec *embeddedConnector) LocalIA(_ context.Context) (addr.IA, error) {
@@ -69,6 +67,26 @@ func (ec *embeddedConnector) Interfaces(_ context.Context) (map[uint16]netip.Add
 		result[uint16(id)] = info.InternalAddr
 	}
 	return result, nil
+}
+
+// snetTopology returns an snet.Topology struct built from the embedded
+// topology loader. The Interface callback delegates to the loader for
+// live topology access.
+func (ec *embeddedConnector) snetTopology() snet.Topology {
+	ia := ec.topo.IA()
+	portMin, portMax := ec.topo.PortRange()
+	return snet.Topology{
+		LocalIA:   ia,
+		PortRange: snet.TopologyPortRange{Start: portMin, End: portMax},
+		Interface: func(id uint16) (netip.AddrPort, bool) {
+			ifInfoMap := ec.topo.InterfaceInfoMap()
+			info, ok := ifInfoMap[iface.ID(id)]
+			if !ok {
+				return netip.AddrPort{}, false
+			}
+			return info.InternalAddr, true
+		},
+	}
 }
 
 // Paths resolves end-to-end paths using the embedded fetcher (segment fetch + combination).
@@ -267,5 +285,5 @@ func tryEmbeddedDaemon(ctx context.Context, topoPath string) (*scionConn, error)
 		return nil, fmt.Errorf("creating embedded connector: %w", err)
 	}
 
-	return finishSCIONConnect(ctx, ec, ec)
+	return finishSCIONConnect(ctx, ec, ec.snetTopology())
 }

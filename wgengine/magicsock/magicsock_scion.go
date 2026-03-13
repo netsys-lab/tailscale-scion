@@ -6,6 +6,7 @@ package magicsock
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -17,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/gopacket"
+	"github.com/gopacket/gopacket"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/slayers"
@@ -570,8 +571,8 @@ func scionListenPort() uint16 {
 // the user should set TS_SCION_LISTEN_ADDR explicitly.
 //
 // Falls back to 127.0.0.1 if no interfaces or resolution fails.
-func scionResolveLocalIP(ctx context.Context, topo snet.Topology) netip.Addr {
-	ifMap, err := topo.Interfaces(ctx)
+func scionResolveLocalIP(ctx context.Context, connector daemon.Connector) netip.Addr {
+	ifMap, err := connector.Interfaces(ctx)
 	if err != nil || len(ifMap) == 0 {
 		return netip.AddrFrom4([4]byte{127, 0, 0, 1})
 	}
@@ -607,7 +608,7 @@ func scionResolveLocalIP(ctx context.Context, topo snet.Topology) netip.Addr {
 // scionListenAddr returns the listen address for the SCION underlay socket.
 // TS_SCION_LISTEN_ADDR can override the IP (e.g. "::1" for IPv6 localhost).
 // Otherwise resolves the local IP from the topology's BR internal addresses.
-func scionListenAddr(ctx context.Context, topo snet.Topology) *net.UDPAddr {
+func scionListenAddr(ctx context.Context, connector daemon.Connector) *net.UDPAddr {
 	port := scionListenPort()
 	if a := os.Getenv("TS_SCION_LISTEN_ADDR"); a != "" {
 		ip := net.ParseIP(a)
@@ -615,7 +616,7 @@ func scionListenAddr(ctx context.Context, topo snet.Topology) *net.UDPAddr {
 			return &net.UDPAddr{IP: ip, Port: int(port)}
 		}
 	}
-	ip := scionResolveLocalIP(ctx, topo)
+	ip := scionResolveLocalIP(ctx, connector)
 	return &net.UDPAddr{IP: ip.AsSlice(), Port: int(port)}
 }
 
@@ -686,12 +687,87 @@ func tryExternalDaemon(ctx context.Context) (*scionConn, error) {
 		return nil, fmt.Errorf("connecting to SCION daemon at %s: %w", daemonAddr, err)
 	}
 
-	sc, err := finishSCIONConnect(ctx, conn, conn)
+	topo, err := snetTopologyFromConnector(ctx, conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("building topology from daemon: %w", err)
+	}
+
+	// Probe Paths() to detect wire-format incompatibility with older
+	// daemons (e.g. v0.12 daemon vs v0.14 client). Simple RPCs like
+	// LocalIA/Interfaces/ASInfo use compatible proto types, but Paths
+	// responses with real hop data trigger unmarshal failures.
+	// We need a reachable remote IA to get a non-empty response;
+	// parse the topology file for a neighbor AS.
+	if neighborIA, ok := neighborIAFromTopology(scionTopologyPath()); ok {
+		localIA, _ := conn.LocalIA(ctx)
+		if _, err := conn.Paths(ctx, neighborIA, localIA, daemon.PathReqFlags{}); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("daemon path probe failed (version mismatch?): %w", err)
+		}
+	}
+
+	sc, err := finishSCIONConnect(ctx, conn, topo)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 	return sc, nil
+}
+
+// snetTopologyFromConnector builds an snet.Topology struct by querying
+// a daemon.Connector for local topology information.
+func snetTopologyFromConnector(ctx context.Context, conn daemon.Connector) (snet.Topology, error) {
+	localIA, err := conn.LocalIA(ctx)
+	if err != nil {
+		return snet.Topology{}, fmt.Errorf("querying local IA: %w", err)
+	}
+	portStart, portEnd, err := conn.PortRange(ctx)
+	if err != nil {
+		return snet.Topology{}, fmt.Errorf("querying port range: %w", err)
+	}
+	ifMap, err := conn.Interfaces(ctx)
+	if err != nil {
+		return snet.Topology{}, fmt.Errorf("querying interfaces: %w", err)
+	}
+	return snet.Topology{
+		LocalIA:   localIA,
+		PortRange: snet.TopologyPortRange{Start: portStart, End: portEnd},
+		Interface: func(id uint16) (netip.AddrPort, bool) {
+			ap, ok := ifMap[id]
+			return ap, ok
+		},
+	}, nil
+}
+
+// neighborIAFromTopology parses the SCION topology JSON file and returns
+// the IA of the first neighbor AS found in the border router interfaces.
+// This is used to probe the daemon with a Paths() call that returns real
+// path data, detecting proto wire-format incompatibilities.
+func neighborIAFromTopology(topoPath string) (addr.IA, bool) {
+	data, err := os.ReadFile(topoPath)
+	if err != nil {
+		return 0, false
+	}
+	var topo struct {
+		BorderRouters map[string]struct {
+			Interfaces map[string]struct {
+				ISDAS string `json:"isd_as"`
+			} `json:"interfaces"`
+		} `json:"border_routers"`
+	}
+	if err := json.Unmarshal(data, &topo); err != nil {
+		return 0, false
+	}
+	for _, br := range topo.BorderRouters {
+		for _, iface := range br.Interfaces {
+			ia, err := addr.ParseIA(iface.ISDAS)
+			if err == nil {
+				return ia, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // finishSCIONConnect completes the SCION connection setup given a
@@ -707,7 +783,7 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		Topology: topo,
 	}
 
-	listenAddr := scionListenAddr(ctx, topo)
+	listenAddr := scionListenAddr(ctx, connector)
 	if listenAddr.Port != 0 {
 		// Validate the configured port against the dispatched range.
 		portMin, portMax, err := connector.PortRange(ctx)
@@ -740,7 +816,7 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		}
 	}
 
-	sconn, err := snet.NewCookedConn(pconn, connector)
+	sconn, err := snet.NewCookedConn(pconn, topo)
 	if err != nil {
 		pconn.Close()
 		return nil, fmt.Errorf("creating SCION conn: %w", err)
@@ -1406,7 +1482,7 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 	seen := make(map[snet.PathFingerprint]bool)
 	var unique []pathWithMeta
 	for _, p := range paths {
-		fp := snet.Fingerprint(p)
+		fp := p.Metadata().Fingerprint()
 		if fp != "" && seen[fp] {
 			continue
 		}
@@ -1592,7 +1668,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		for _, dp := range daemonPaths {
 			daemonByFP = append(daemonByFP, daemonPathEntry{
 				path: dp,
-				fp:   snet.Fingerprint(dp),
+				fp:   dp.Metadata().Fingerprint(),
 			})
 		}
 
@@ -1637,7 +1713,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 
 			pi.mu.Lock()
 			pi.path = matched
-			newFP := snet.Fingerprint(matched)
+			newFP := matched.Metadata().Fingerprint()
 			pi.fingerprint = newFP
 			if md := matched.Metadata(); md != nil {
 				pi.expiry = md.Expiry
