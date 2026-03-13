@@ -649,6 +649,9 @@ func scionListenAddr(ctx context.Context, connector daemon.Connector) *net.UDPAd
 // forceEmbeddedSCION is the TS_SCION_EMBEDDED envknob. When set to "1",
 // the external daemon attempt is skipped and only the embedded connector is tried.
 var forceEmbeddedSCION = envknob.RegisterBool("TS_SCION_EMBEDDED")
+// forceBootstrapSCION is the TS_SCION_FORCE_BOOTSTRAP envknob. When set to "1",
+// the local topology file attempt is skipped and only the bootstrap attempt is tried.
+var forceBootstrapSCION = envknob.RegisterBool("TS_SCION_FORCE_BOOTSTRAP")
 
 // trySCIONConnect attempts to set up a SCION connection using a cascading
 // fallback strategy:
@@ -672,13 +675,15 @@ func trySCIONConnect(ctx context.Context, logf logger.Logf, netMon *netmon.Monit
 	}
 
 	// Step 2: Try embedded with existing local topology file.
-	topoPath := scionTopologyPath()
-	if _, err := os.Stat(topoPath); err == nil {
-		sc, err := tryEmbeddedDaemon(ctx, topoPath, logf, netMon)
-		if err == nil {
-			return sc, nil
+	if !forceEmbeddedSCION() {
+		topoPath := scionTopologyPath()
+		if _, err := os.Stat(topoPath); err == nil {
+			sc, err := tryEmbeddedDaemon(ctx, topoPath, logf, netMon)
+			if err == nil {
+				return sc, nil
+			}
+			// Fall through to bootstrap attempts.
 		}
-		// Fall through to bootstrap attempts.
 	}
 
 	// Steps 3-5: Try bootstrap from URLs (explicit, DNS-discovered, hardcoded).

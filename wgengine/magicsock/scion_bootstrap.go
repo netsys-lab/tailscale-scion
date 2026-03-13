@@ -34,8 +34,9 @@ const (
 // SCION deployments. Populated as deployments are identified; DNS discovery
 // is the primary automatic mechanism.
 var defaultBootstrapURLs []string = []string{
-	"http://141.44.25.151:8041",
-	"http://128.143.201.144:8041",
+	"http://141.44.25.151:8041", // ovgu.de
+	"http://128.143.201.144:8041", // uva
+	"http://netsec-w37w3w.inf.ethz.ch:8041", // ethz.ch
 }
 
 var (
