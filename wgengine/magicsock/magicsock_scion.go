@@ -24,6 +24,7 @@ import (
 	scionpath "github.com/scionproto/scion/pkg/slayers/path/scion"
 	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	"github.com/scionproto/scion/pkg/snet"
+	"github.com/scionproto/scion/pkg/snet/addrutil"
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -559,11 +560,54 @@ func scionListenPort() uint16 {
 	return 0 // let snet auto-select from topology port range
 }
 
+// scionResolveLocalIP determines the local IP for the SCION underlay socket
+// by checking what source IP the OS would use to reach the border routers'
+// internal addresses from the topology. This mirrors how `scion address` works
+// (via addrutil.ResolveLocal).
+//
+// With multiple BRs, if all resolve to the same local IP, that IP is used.
+// If they disagree, the first resolved IP is used and a warning is logged —
+// the user should set TS_SCION_LISTEN_ADDR explicitly.
+//
+// Falls back to 127.0.0.1 if no interfaces or resolution fails.
+func scionResolveLocalIP(ctx context.Context, topo snet.Topology) netip.Addr {
+	ifMap, err := topo.Interfaces(ctx)
+	if err != nil || len(ifMap) == 0 {
+		return netip.AddrFrom4([4]byte{127, 0, 0, 1})
+	}
+
+	var first netip.Addr
+	allSame := true
+	for _, ap := range ifMap {
+		resolved, err := addrutil.ResolveLocal(ap.Addr().AsSlice())
+		if err != nil {
+			continue
+		}
+		ip, ok := netip.AddrFromSlice(resolved)
+		if !ok {
+			continue
+		}
+		ip = ip.Unmap()
+		if !first.IsValid() {
+			first = ip
+		} else if first != ip {
+			allSame = false
+		}
+	}
+
+	if !first.IsValid() {
+		return netip.AddrFrom4([4]byte{127, 0, 0, 1})
+	}
+	if !allSame {
+		fmt.Fprintf(os.Stderr, "magicsock: SCION: multiple BRs resolve to different local IPs; using %s, set TS_SCION_LISTEN_ADDR to override\n", first)
+	}
+	return first
+}
+
 // scionListenAddr returns the listen address for the SCION underlay socket.
 // TS_SCION_LISTEN_ADDR can override the IP (e.g. "::1" for IPv6 localhost).
-// Defaults to 127.0.0.1 (matches current behavior and snet requirement that
-// the address not be unspecified).
-func scionListenAddr() *net.UDPAddr {
+// Otherwise resolves the local IP from the topology's BR internal addresses.
+func scionListenAddr(ctx context.Context, topo snet.Topology) *net.UDPAddr {
 	port := scionListenPort()
 	if a := os.Getenv("TS_SCION_LISTEN_ADDR"); a != "" {
 		ip := net.ParseIP(a)
@@ -571,7 +615,8 @@ func scionListenAddr() *net.UDPAddr {
 			return &net.UDPAddr{IP: ip, Port: int(port)}
 		}
 	}
-	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}
+	ip := scionResolveLocalIP(ctx, topo)
+	return &net.UDPAddr{IP: ip.AsSlice(), Port: int(port)}
 }
 
 // forceEmbeddedSCION is the TS_SCION_EMBEDDED envknob. When set to "1",
@@ -662,7 +707,7 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		Topology: topo,
 	}
 
-	listenAddr := scionListenAddr()
+	listenAddr := scionListenAddr(ctx, topo)
 	if listenAddr.Port != 0 {
 		// Validate the configured port against the dispatched range.
 		portMin, portMax, err := connector.PortRange(ctx)
