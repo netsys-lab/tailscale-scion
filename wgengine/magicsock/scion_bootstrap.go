@@ -32,7 +32,11 @@ const (
 // defaultBootstrapURLs contains well-known bootstrap server URLs for major
 // SCION deployments. Populated as deployments are identified; DNS discovery
 // is the primary automatic mechanism.
-var defaultBootstrapURLs []string
+var defaultBootstrapURLs []string = []string{
+	"http://141.44.25.151:8041",
+	"http://128.143.201.144:8041",
+}
+
 
 // bootstrapSCION fetches topology.json and TRCs from a bootstrap server,
 // saving them to destDir.
