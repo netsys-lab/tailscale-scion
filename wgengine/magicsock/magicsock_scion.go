@@ -50,6 +50,12 @@ var debugSCIONPreference = envknob.RegisterInt("TS_SCION_PREFERENCE")
 // Other paths are only used if no SCION path is available.
 var preferSCION = envknob.RegisterBool("TS_PREFER_SCION")
 
+var (
+	scionDaemonAddress = envknob.RegisterString("SCION_DAEMON_ADDRESS")
+	scionPort          = envknob.RegisterString("TS_SCION_PORT")
+	scionListenAddrEnv = envknob.RegisterString("TS_SCION_LISTEN_ADDR")
+)
+
 // scionPreferenceBonus returns the betterAddr points bonus for SCION paths.
 // Returns the value of TS_SCION_PREFERENCE if set, otherwise defaults to 15.
 func scionPreferenceBonus() int {
@@ -562,7 +568,7 @@ func (sc *scionConn) readFrom(b []byte) (int, *snet.UDPAddr, error) {
 // scionDaemonAddr returns the SCION daemon address to use, checking the
 // environment variable first, then falling back to the default socket.
 func scionDaemonAddr() string {
-	if a := os.Getenv("SCION_DAEMON_ADDRESS"); a != "" {
+	if a := scionDaemonAddress(); a != "" {
 		return a
 	}
 	return daemon.DefaultAPIAddress
@@ -572,7 +578,7 @@ func scionDaemonAddr() string {
 // environment variable first, then falling back to 0 (auto-select from the
 // topology's dispatched port range).
 func scionListenPort() uint16 {
-	if p := os.Getenv("TS_SCION_PORT"); p != "" {
+	if p := scionPort(); p != "" {
 		var v int
 		if _, err := fmt.Sscanf(p, "%d", &v); err == nil && v > 0 && v <= 65535 {
 			return uint16(v)
@@ -630,7 +636,7 @@ func scionResolveLocalIP(ctx context.Context, connector daemon.Connector) netip.
 // Otherwise resolves the local IP from the topology's BR internal addresses.
 func scionListenAddr(ctx context.Context, connector daemon.Connector) *net.UDPAddr {
 	port := scionListenPort()
-	if a := os.Getenv("TS_SCION_LISTEN_ADDR"); a != "" {
+	if a := scionListenAddrEnv(); a != "" {
 		ip := net.ParseIP(a)
 		if ip != nil {
 			return &net.UDPAddr{IP: ip, Port: int(port)}
@@ -683,8 +689,9 @@ func trySCIONConnect(ctx context.Context, logf logger.Logf, netMon *netmon.Monit
 		}
 		return nil, fmt.Errorf("SCION not available: no external daemon, no topology file, no state directory for bootstrap")
 	}
-	for _, url := range bootstrapURLs(ctx) {
-		if err := bootstrapSCION(ctx, url, stateDir); err != nil {
+	for _, url := range bootstrapURLs(ctx, logf) {
+		if err := bootstrapSCION(ctx, logf, url, stateDir); err != nil {
+			logf("scion: bootstrap from %s failed: %v", url, err)
 			continue
 		}
 		bootstrappedTopo := filepath.Join(stateDir, "topology.json")

@@ -37,10 +37,16 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
+	"tailscale.com/envknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/paths"
 	"tailscale.com/types/logger"
+)
+
+var (
+	scionTopology = envknob.RegisterString("TS_SCION_TOPOLOGY")
+	scionStateDirEnv = envknob.RegisterString("TS_SCION_STATE_DIR")
 )
 
 // embeddedConnector implements daemon.Connector using an embedded topology
@@ -304,7 +310,7 @@ func (d *netnsTCPDialer) Dial(ctx context.Context, dst net.Addr) (*grpc.ClientCo
 // (/etc/scion/ on Linux), then a "scion" subdirectory under the tailscaled
 // state directory (for bootstrapped topologies).
 func scionTopologyPath() string {
-	if p := os.Getenv("TS_SCION_TOPOLOGY"); p != "" {
+	if p := scionTopology(); p != "" {
 		return p
 	}
 	if runtime.GOOS == "linux" {
@@ -321,7 +327,7 @@ func scionTopologyPath() string {
 // checking TS_SCION_STATE_DIR first, then falling back to a "scion"
 // subdirectory under the platform's default tailscaled state directory.
 func scionStateDir() string {
-	if d := os.Getenv("TS_SCION_STATE_DIR"); d != "" {
+	if d := scionStateDirEnv(); d != "" {
 		return d
 	}
 	base := paths.DefaultTailscaledStateDir()
