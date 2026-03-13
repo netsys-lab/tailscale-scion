@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_scion
+
 package magicsock
 
 import (
@@ -30,9 +32,12 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"tailscale.com/envknob"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 	"tailscale.com/util/mak"
 )
 
@@ -493,6 +498,8 @@ func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes
 // scionBatchRW abstracts ipv4.PacketConn and ipv6.PacketConn for
 // batch I/O. Both have identical ReadBatch/WriteBatch signatures
 // since ipv4.Message and ipv6.Message are the same type (socket.Message).
+// On non-Linux platforms, ReadBatch/WriteBatch fall back to per-message
+// sendto/recvfrom (golang.org/x/net handles this internally).
 type scionBatchRW interface {
 	ReadBatch([]ipv4.Message, int) (int, error)
 	WriteBatch([]ipv4.Message, int) (int, error)
@@ -646,12 +653,12 @@ var forceEmbeddedSCION = envknob.RegisterBool("TS_SCION_EMBEDDED")
 //  5. Hardcoded bootstrap URLs (if any)
 //
 // Returns nil if SCION is not available via any method.
-func trySCIONConnect(ctx context.Context) (*scionConn, error) {
+func trySCIONConnect(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor) (*scionConn, error) {
 	var externalErr error
 
 	// Step 1: Try external daemon (unless forced embedded).
 	if !forceEmbeddedSCION() {
-		sc, err := tryExternalDaemon(ctx)
+		sc, err := tryExternalDaemon(ctx, logf, netMon)
 		if err == nil {
 			return sc, nil
 		}
@@ -661,7 +668,7 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 	// Step 2: Try embedded with existing local topology file.
 	topoPath := scionTopologyPath()
 	if _, err := os.Stat(topoPath); err == nil {
-		sc, err := tryEmbeddedDaemon(ctx, topoPath)
+		sc, err := tryEmbeddedDaemon(ctx, topoPath, logf, netMon)
 		if err == nil {
 			return sc, nil
 		}
@@ -670,6 +677,12 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 
 	// Steps 3-5: Try bootstrap from URLs (explicit, DNS-discovered, hardcoded).
 	stateDir := scionStateDir()
+	if stateDir == "" {
+		if externalErr != nil {
+			return nil, fmt.Errorf("external daemon: %w; embedded: no state directory available", externalErr)
+		}
+		return nil, fmt.Errorf("SCION not available: no external daemon, no topology file, no state directory for bootstrap")
+	}
 	for _, url := range bootstrapURLs(ctx) {
 		if err := bootstrapSCION(ctx, url, stateDir); err != nil {
 			continue
@@ -678,7 +691,7 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 		if _, err := os.Stat(bootstrappedTopo); err != nil {
 			continue
 		}
-		sc, err := tryEmbeddedDaemon(ctx, bootstrappedTopo)
+		sc, err := tryEmbeddedDaemon(ctx, bootstrappedTopo, logf, netMon)
 		if err == nil {
 			return sc, nil
 		}
@@ -692,7 +705,7 @@ func trySCIONConnect(ctx context.Context) (*scionConn, error) {
 
 // tryExternalDaemon attempts to connect to an external SCION daemon and set up
 // a SCION listener. This is the original trySCIONConnect behavior.
-func tryExternalDaemon(ctx context.Context) (*scionConn, error) {
+func tryExternalDaemon(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor) (*scionConn, error) {
 	daemonAddr := scionDaemonAddr()
 	svc := daemon.Service{Address: daemonAddr}
 	conn, err := svc.Connect(ctx)
@@ -720,7 +733,7 @@ func tryExternalDaemon(ctx context.Context) (*scionConn, error) {
 		}
 	}
 
-	sc, err := finishSCIONConnect(ctx, conn, topo)
+	sc, err := finishSCIONConnect(ctx, conn, topo, logf, netMon)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -786,7 +799,7 @@ func neighborIAFromTopology(topoPath string) (addr.IA, bool) {
 // finishSCIONConnect completes the SCION connection setup given a
 // daemon.Connector (for path queries) and snet.Topology (for local info).
 // This is shared between the external daemon and embedded connector paths.
-func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo snet.Topology) (*scionConn, error) {
+func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo snet.Topology, logf logger.Logf, netMon *netmon.Monitor) (*scionConn, error) {
 	localIA, err := connector.LocalIA(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("querying local IA: %w", err)
@@ -822,10 +835,28 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 	if pc, ok := pconn.(*snet.SCIONPacketConn); ok {
 		underlayConn = pc.Conn
 		if err := pc.SetReadBuffer(socketBufferSize); err != nil {
-			fmt.Fprintf(os.Stderr, "magicsock: SCION: failed to set read buffer to %d: %v\n", socketBufferSize, err)
+			logf("magicsock: SCION: failed to set read buffer to %d: %v", socketBufferSize, err)
 		}
 		if err := pc.SetWriteBuffer(socketBufferSize); err != nil {
-			fmt.Fprintf(os.Stderr, "magicsock: SCION: failed to set write buffer to %d: %v\n", socketBufferSize, err)
+			logf("magicsock: SCION: failed to set write buffer to %d: %v", socketBufferSize, err)
+		}
+	}
+
+	// Apply platform-specific socket options (SO_MARK on Linux,
+	// VpnService.protect on Android, IP_BOUND_IF on macOS) to
+	// prevent the SCION underlay socket from routing through the
+	// VPN tunnel, which would cause loops.
+	if underlayConn != nil {
+		rawConn, err := underlayConn.SyscallConn()
+		if err == nil {
+			lc := netns.Listener(logf, netMon)
+			if lc.Control != nil {
+				if err := lc.Control("udp", underlayConn.LocalAddr().String(), rawConn); err != nil {
+					logf("magicsock: SCION: netns control: %v", err)
+				}
+			}
+		} else {
+			logf("magicsock: SCION: SyscallConn: %v", err)
 		}
 	}
 
@@ -1402,7 +1433,7 @@ func (c *Conn) reconnectSCION() {
 	}
 	c.pconnSCION = nil
 
-	newSC, err := trySCIONConnect(c.connCtx)
+	newSC, err := trySCIONConnect(c.connCtx, c.logf, c.netMon)
 	if err != nil {
 		c.logf("magicsock: SCION reconnect failed: %v", err)
 		// Reset the receive timestamp so we retry after scionReconnectThreshold.
@@ -1429,7 +1460,7 @@ func (c *Conn) retrySCIONConnect() {
 	if c.pconnSCION != nil {
 		return // another goroutine beat us to it
 	}
-	newSC, err := trySCIONConnect(c.connCtx)
+	newSC, err := trySCIONConnect(c.connCtx, c.logf, c.netMon)
 	if err != nil {
 		c.logf("magicsock: SCION reconnect retry failed: %v", err)
 		return

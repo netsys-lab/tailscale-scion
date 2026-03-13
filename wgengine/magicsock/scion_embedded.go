@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_scion
+
 package magicsock
 
 import (
@@ -10,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/scionproto/scion/daemon/config"
 	"github.com/scionproto/scion/daemon/fetcher"
@@ -30,8 +33,14 @@ import (
 	"github.com/scionproto/scion/private/storage"
 	"github.com/scionproto/scion/private/topology"
 	"github.com/scionproto/scion/private/trust"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/paths"
+	"tailscale.com/types/logger"
 )
 
 // embeddedConnector implements daemon.Connector using an embedded topology
@@ -142,7 +151,7 @@ func (ec *embeddedConnector) Close() error {
 // newEmbeddedConnector creates a new embeddedConnector from a topology file.
 // It wires up the path fetcher pipeline following the daemon's own assembly
 // (daemon/cmd/daemon/main.go), but without trust verification (Phase 1).
-func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string) (*embeddedConnector, error) {
+func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf logger.Logf, netMon *netmon.Monitor) (*embeddedConnector, error) {
 	// 1. Load topology.
 	topo, err := topology.NewLoader(topology.LoaderCfg{
 		File:      topoPath,
@@ -173,8 +182,10 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string) (*embe
 
 	revCache := storage.NewRevocationStorage()
 
-	// 3. Create gRPC dialer that resolves CS addresses from the topology.
-	dialer := &libgrpc.TCPDialer{
+	// 3. Create gRPC dialer that resolves CS addresses from the topology,
+	// using netns-aware TCP connections for cross-platform compatibility
+	// (SO_MARK on Linux, VpnService.protect on Android, IP_BOUND_IF on macOS).
+	dialer := &netnsTCPDialer{
 		SvcResolver: func(dst addr.SVC) []resolver.Address {
 			targets := []resolver.Address{}
 			for _, entry := range topo.ControlServiceAddresses() {
@@ -182,6 +193,7 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string) (*embe
 			}
 			return targets
 		},
+		NetDialer: netns.NewDialer(logf, netMon).DialContext,
 	}
 
 	// 4. Create the segment fetcher requester (gRPC to local CS).
@@ -248,6 +260,45 @@ func (endHostInspector) HasAttributes(_ context.Context, _ addr.IA, _ trust.Attr
 	return false, nil
 }
 
+// netnsTCPDialer implements libgrpc.Dialer with netns-aware TCP connections
+// for cross-platform socket control (SO_MARK, VpnService.protect, IP_BOUND_IF).
+type netnsTCPDialer struct {
+	SvcResolver func(addr.SVC) []resolver.Address
+	NetDialer   func(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// Compile-time interface check.
+var _ libgrpc.Dialer = (*netnsTCPDialer)(nil)
+
+func (d *netnsTCPDialer) Dial(ctx context.Context, dst net.Addr) (*grpc.ClientConn, error) {
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			return d.NetDialer(ctx, "tcp", addr)
+		}),
+		libgrpc.UnaryClientInterceptor(),
+		libgrpc.StreamClientInterceptor(),
+	}
+
+	if v, ok := dst.(*snet.SVCAddr); ok {
+		targets := d.SvcResolver(v.SVC)
+		if len(targets) == 0 {
+			return nil, serrors.New("could not resolve", "svc", v.SVC)
+		}
+		r := manual.NewBuilderWithScheme("svc")
+		r.InitialState(resolver.State{Addresses: targets})
+		opts = append(opts,
+			grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
+			grpc.WithResolvers(r),
+		)
+		//nolint:staticcheck // grpc.DialContext is used by scionproto v0.14.0
+		return grpc.DialContext(ctx, r.Scheme()+":///"+v.SVC.BaseString(), opts...)
+	}
+
+	//nolint:staticcheck // grpc.DialContext is used by scionproto v0.14.0
+	return grpc.DialContext(ctx, dst.String(), opts...)
+}
+
 // scionTopologyPath returns the path to the SCION topology file, checking
 // TS_SCION_TOPOLOGY first, then the platform's SCION config directory
 // (/etc/scion/ on Linux), then a "scion" subdirectory under the tailscaled
@@ -256,10 +307,11 @@ func scionTopologyPath() string {
 	if p := os.Getenv("TS_SCION_TOPOLOGY"); p != "" {
 		return p
 	}
-	// Standard SCION installation path (Linux/Unix convention from scionproto).
-	const defaultSCIONTopology = "/etc/scion/topology.json"
-	if _, err := os.Stat(defaultSCIONTopology); err == nil {
-		return defaultSCIONTopology
+	if runtime.GOOS == "linux" {
+		const defaultSCIONTopology = "/etc/scion/topology.json"
+		if _, err := os.Stat(defaultSCIONTopology); err == nil {
+			return defaultSCIONTopology
+		}
 	}
 	// Bootstrapped topology under the tailscaled state directory.
 	return filepath.Join(paths.DefaultTailscaledStateDir(), "scion", "topology.json")
@@ -272,18 +324,27 @@ func scionStateDir() string {
 	if d := os.Getenv("TS_SCION_STATE_DIR"); d != "" {
 		return d
 	}
-	return filepath.Join(paths.DefaultTailscaledStateDir(), "scion")
+	base := paths.DefaultTailscaledStateDir()
+	if base == "" || base == "." {
+		if appDir := paths.AppSharedDir.Load(); appDir != "" {
+			base = appDir
+		}
+	}
+	if base == "" || base == "." {
+		return ""
+	}
+	return filepath.Join(base, "scion")
 }
 
 // tryEmbeddedDaemon attempts to set up a SCION connection using the embedded
 // connector with the given topology file. This mirrors trySCIONConnect but
 // uses the embedded connector instead of an external daemon.
-func tryEmbeddedDaemon(ctx context.Context, topoPath string) (*scionConn, error) {
+func tryEmbeddedDaemon(ctx context.Context, topoPath string, logf logger.Logf, netMon *netmon.Monitor) (*scionConn, error) {
 	stateDir := scionStateDir()
-	ec, err := newEmbeddedConnector(ctx, topoPath, stateDir)
+	ec, err := newEmbeddedConnector(ctx, topoPath, stateDir, logf, netMon)
 	if err != nil {
 		return nil, fmt.Errorf("creating embedded connector: %w", err)
 	}
 
-	return finishSCIONConnect(ctx, ec, ec.snetTopology())
+	return finishSCIONConnect(ctx, ec, ec.snetTopology(), logf, netMon)
 }

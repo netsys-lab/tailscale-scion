@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_scion
+
 package magicsock
 
 import (
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -149,6 +152,9 @@ func lookupDiscoveryPort(ctx context.Context, r *net.Resolver, domain string) (s
 // localSearchDomain returns the first search domain from the system's DNS
 // configuration, using Tailscale's cross-platform resolv.conf parser.
 func localSearchDomain() (string, error) {
+	if runtime.GOOS == "windows" || runtime.GOOS == "android" {
+		return localSearchDomainFromHostname()
+	}
 	cfg, err := resolvconffile.ParseFile(resolvconffile.Path)
 	if err != nil {
 		return "", err
@@ -157,6 +163,21 @@ func localSearchDomain() (string, error) {
 		return cfg.SearchDomains[0].WithoutTrailingDot(), nil
 	}
 	return "", nil
+}
+
+// localSearchDomainFromHostname infers the search domain from the
+// system hostname. Used on platforms without resolv.conf.
+// Note: on Windows, os.Hostname() typically returns a short NetBIOS name
+// without a domain suffix, so this will usually return an error.
+func localSearchDomainFromHostname() (string, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", err
+	}
+	if i := strings.IndexByte(hostname, '.'); i >= 0 {
+		return hostname[i+1:], nil
+	}
+	return "", fmt.Errorf("no search domain found")
 }
 
 // httpGet performs an HTTP GET request and returns the response body.

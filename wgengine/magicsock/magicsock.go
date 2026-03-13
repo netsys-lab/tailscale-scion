@@ -3347,11 +3347,7 @@ func (c *connBind) Close() error {
 	if c.closeDisco6 != nil {
 		c.closeDisco6.Close()
 	}
-	if c.pconnSCION != nil {
-		// Set an immediate read deadline to unblock receiveSCION.
-		// We don't close the SCION socket here; Conn.Close handles that.
-		c.pconnSCION.conn.SetReadDeadline(time.Now())
-	}
+	c.closeSCIONBindLocked()
 	// Send an empty read result to unblock receiveDERP,
 	// which will then check connBind.Closed.
 	// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
@@ -3402,9 +3398,7 @@ func (c *Conn) Close() error {
 	// They will frequently have been closed already by a call to connBind.Close.
 	c.pconn6.Close()
 	c.pconn4.Close()
-	if c.pconnSCION != nil {
-		c.pconnSCION.close()
-	}
+	c.closeSCIONLocked()
 	if c.closeDisco4 != nil {
 		c.closeDisco4.Close()
 	}
@@ -3653,17 +3647,7 @@ func (c *Conn) rebind(curPortFate currentPortFate) error {
 	}
 	c.UpdatePMTUD()
 
-	// Try to set up SCION if not already connected.
-	if c.pconnSCION == nil {
-		sc, err := trySCIONConnect(c.connCtx)
-		if err != nil {
-			c.logf("magicsock: SCION not available: %v", err)
-		} else {
-			c.logf("magicsock: SCION available, local IA: %s", sc.localIA)
-			c.pconnSCION = sc
-			go c.refreshSCIONPaths()
-		}
-	}
+	c.initSCIONLocked(c.connCtx)
 
 	return nil
 }
