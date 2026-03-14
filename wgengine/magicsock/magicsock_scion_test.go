@@ -1927,6 +1927,13 @@ func TestFormatSCIONHops(t *testing.T) {
 			want:   "?",
 		},
 		{
+			name: "single interface",
+			ifaces: []snet.PathInterface{
+				{IA: mustIA("19-ffaa:1:eba"), ID: 2},
+			},
+			want: "19-ffaa:1:eba 2",
+		},
+		{
 			name: "2-hop direct",
 			ifaces: []snet.PathInterface{
 				{IA: mustIA("19-ffaa:1:eba"), ID: 2},

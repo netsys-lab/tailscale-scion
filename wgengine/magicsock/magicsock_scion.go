@@ -136,6 +136,11 @@ func formatSCIONHops(ifaces []snet.PathInterface) string {
 	if len(ifaces) == 0 {
 		return "?"
 	}
+	if len(ifaces) == 1 {
+		// Single interface shouldn't occur in valid SCION paths
+		// (interfaces always come in pairs), but handle gracefully.
+		return fmt.Sprintf("%s %d", ifaces[0].IA, ifaces[0].ID)
+	}
 	var sb strings.Builder
 	// First interface: srcIA ifid
 	fmt.Fprintf(&sb, "%s %d", ifaces[0].IA, ifaces[0].ID)
@@ -1412,11 +1417,13 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 			c.mu.Lock()
 			sk := c.scionPathsByAddr[scionAddrKey{ia: srcAddr.IA, addr: srcHostAddr}]
 			if !sk.IsSet() {
-				sk = c.registerSCIONPath(&scionPathInfo{
+				pi := &scionPathInfo{
 					peerIA:    srcAddr.IA,
 					hostAddr:  srcHostAddr,
 					replyPath: srcAddr,
-				})
+				}
+				pi.buildDisplayStr()
+				sk = c.registerSCIONPath(pi)
 				c.setActiveSCIONPath(srcAddr.IA, srcHostAddr, sk)
 			}
 			c.mu.Unlock()
@@ -1612,11 +1619,13 @@ func (c *Conn) handleSCIONDisco(b []byte, srcIA addr.IA, srcHostAddr netip.AddrP
 		// First disco packet from this SCION peer — build a reply path
 		// by reversing the raw SCION path from the incoming packet.
 		replyAddr := buildSCIONReplyAddr(srcIA, srcHostAddr, rawPath, nextHop)
-		sk = c.registerSCIONPath(&scionPathInfo{
+		pi := &scionPathInfo{
 			peerIA:    srcIA,
 			hostAddr:  srcHostAddr,
 			replyPath: replyAddr,
-		})
+		}
+		pi.buildDisplayStr()
+		sk = c.registerSCIONPath(pi)
 		c.setActiveSCIONPath(srcIA, srcHostAddr, sk)
 	}
 	c.mu.Unlock()
@@ -1782,7 +1791,10 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 	seen := make(map[snet.PathFingerprint]bool)
 	var unique []pathWithMeta
 	for _, p := range paths {
-		fp := p.Metadata().Fingerprint()
+		var fp snet.PathFingerprint
+		if md := p.Metadata(); md != nil {
+			fp = md.Fingerprint()
+		}
 		if fp != "" && seen[fp] {
 			continue
 		}
@@ -2087,9 +2099,13 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		}
 		var daemonByFP []daemonPathEntry
 		for _, dp := range daemonPaths {
+			var fp snet.PathFingerprint
+			if md := dp.Metadata(); md != nil {
+				fp = md.Fingerprint()
+			}
 			daemonByFP = append(daemonByFP, daemonPathEntry{
 				path: dp,
-				fp:   dp.Metadata().Fingerprint(),
+				fp:   fp,
 			})
 		}
 
@@ -2141,9 +2157,8 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 			pi.mu.Lock()
 			pi.refreshMissCount = 0
 			pi.path = matched
-			newFP := matched.Metadata().Fingerprint()
-			pi.fingerprint = newFP
 			if md := matched.Metadata(); md != nil {
+				pi.fingerprint = md.Fingerprint()
 				pi.expiry = md.Expiry
 				pi.mtu = md.MTU
 			}
@@ -2212,7 +2227,10 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 
 		var newPaths []snet.Path
 		for _, dp := range daemonPaths {
-			fp := dp.Metadata().Fingerprint()
+			var fp snet.PathFingerprint
+			if md := dp.Metadata(); md != nil {
+				fp = md.Fingerprint()
+			}
 			if fp == "" || knownFPs[fp] {
 				continue
 			}
@@ -2256,10 +2274,14 @@ func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, 
 			expiry = md.Expiry
 			mtu = md.MTU
 		}
+		var fp snet.PathFingerprint
+		if md != nil {
+			fp = md.Fingerprint()
+		}
 		pi := &scionPathInfo{
 			peerIA:      peerIA,
 			hostAddr:    hostAddr,
-			fingerprint: md.Fingerprint(),
+			fingerprint: fp,
 			path:        p,
 			expiry:      expiry,
 			mtu:         mtu,
@@ -2512,7 +2534,7 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 			const wgOverhead = 32
 			if pi.mtu > 0 && hdrLen > 0 && maxWG < 1280+wgOverhead {
 				de.c.logf("magicsock: WARNING: SCION path MTU %d too small for TUN 1280 (need %d, have %d for WG payload)",
-					pi.mtu, 1280+wgOverhead+hdrLen, pi.mtu)
+					pi.mtu, 1280+wgOverhead+hdrLen, maxWG)
 			}
 		}
 		de.c.mu.Unlock()
