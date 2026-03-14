@@ -10,6 +10,7 @@ import (
 	"time"
 
 	wgconn "github.com/tailscale/wireguard-go/conn"
+	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 )
@@ -20,13 +21,23 @@ type scionPathKey uint32
 
 func (k scionPathKey) IsSet() bool { return false }
 
-type scionConn struct{}
+type scionBatchRW interface{}
+
+type scionConn struct {
+	shimXPC scionBatchRW
+}
 
 func (sc *scionConn) close() error { return nil }
 
 type scionPathInfo struct{}
+
+func (pi *scionPathInfo) String() string { return "" }
+
 type scionAddrKey struct{}
 type scionEndpointState struct{}
+type scionIAKey = uint64
+
+const scionWireMTU = tstun.WireMTU(1280)
 
 // Stub Conn methods.
 

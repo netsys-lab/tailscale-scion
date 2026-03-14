@@ -77,6 +77,10 @@ func scionPreferenceBonus() int {
 	return 15
 }
 
+// scionIAKey is a type alias for addr.IA, used in Conn fields shared with
+// the ts_omit_scion omit file (which defines scionIAKey = uint64).
+type scionIAKey = addr.IA
+
 // scionPathKey is a compact index into the Conn-level scionPaths registry.
 // This keeps epAddr small and comparable (snet.UDPAddr contains slices).
 // A zero value means "not a SCION path."
