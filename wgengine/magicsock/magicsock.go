@@ -3332,6 +3332,9 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 	}
 	if c.pconnSCION != nil {
 		fns = append(fns, c.receiveSCION)
+		if c.pconnSCION.shimXPC != nil {
+			fns = append(fns, c.receiveSCIONShim)
+		}
 	}
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?

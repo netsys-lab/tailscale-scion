@@ -34,6 +34,7 @@ func (c *Conn) initSCIONLocked(_ context.Context)                               
 func (c *Conn) closeSCIONLocked()                                                        {}
 func (c *Conn) closeSCIONBindLocked()                                                    {}
 func (c *Conn) receiveSCION(_ [][]byte, _ []int, _ []wgconn.Endpoint) (int, error)       { return 0, nil }
+func (c *Conn) receiveSCIONShim(_ [][]byte, _ []int, _ []wgconn.Endpoint) (int, error)  { return 0, nil }
 func (c *Conn) sendSCION(_ scionPathKey, _ []byte) (bool, error)                         { return false, nil }
 func (c *Conn) unregisterSCIONPath(_ scionPathKey)                                       {}
 

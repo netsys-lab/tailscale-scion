@@ -43,5 +43,9 @@ func (c *Conn) closeSCIONBindLocked() {
 		// Set an immediate read deadline to unblock receiveSCION.
 		// We don't close the SCION socket here; Conn.Close handles that.
 		c.pconnSCION.conn.SetReadDeadline(time.Now())
+		// Also unblock the dispatcher shim's ReadBatch if present.
+		if c.pconnSCION.shimConn != nil {
+			c.pconnSCION.shimConn.SetReadDeadline(time.Now())
+		}
 	}
 }

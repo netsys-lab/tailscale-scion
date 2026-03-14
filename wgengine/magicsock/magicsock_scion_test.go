@@ -1848,3 +1848,61 @@ func TestScionProbeSCIONNonBestLocked(t *testing.T) {
 		t.Error("round-robin should pick different paths on consecutive calls")
 	}
 }
+
+func TestDispatcherShim(t *testing.T) {
+	t.Run("binds_when_port_available", func(t *testing.T) {
+		sc := &scionConn{
+			localHostIP: netip.MustParseAddr("127.0.0.1"),
+			localPort:   32766,
+		}
+		openDispatcherShim(sc, t.Logf, nil)
+		if sc.shimConn == nil {
+			t.Fatal("expected shimConn to be set when port 30041 is available")
+		}
+		defer sc.shimConn.Close()
+		if sc.shimXPC == nil {
+			t.Fatal("expected shimXPC to be set")
+		}
+		addr := sc.shimConn.LocalAddr().(*net.UDPAddr)
+		if addr.Port != scionDispatcherPort {
+			t.Errorf("shimConn port = %d, want %d", addr.Port, scionDispatcherPort)
+		}
+	})
+
+	t.Run("graceful_on_EADDRINUSE", func(t *testing.T) {
+		// Occupy port 30041 first.
+		blocker, err := net.ListenUDP("udp", &net.UDPAddr{
+			IP:   net.IPv4(127, 0, 0, 1),
+			Port: scionDispatcherPort,
+		})
+		if err != nil {
+			t.Skipf("cannot bind port %d for test: %v", scionDispatcherPort, err)
+		}
+		defer blocker.Close()
+
+		sc := &scionConn{
+			localHostIP: netip.MustParseAddr("127.0.0.1"),
+			localPort:   32766,
+		}
+		openDispatcherShim(sc, t.Logf, nil)
+		if sc.shimConn != nil {
+			sc.shimConn.Close()
+			t.Fatal("expected shimConn to be nil when port is already in use")
+		}
+		if sc.shimXPC != nil {
+			t.Fatal("expected shimXPC to be nil when port is already in use")
+		}
+	})
+
+	t.Run("skipped_when_main_on_dispatcher_port", func(t *testing.T) {
+		sc := &scionConn{
+			localHostIP: netip.MustParseAddr("127.0.0.1"),
+			localPort:   scionDispatcherPort,
+		}
+		openDispatcherShim(sc, t.Logf, nil)
+		if sc.shimConn != nil {
+			sc.shimConn.Close()
+			t.Fatal("expected shimConn to be nil when main socket is on dispatcher port")
+		}
+	})
+}

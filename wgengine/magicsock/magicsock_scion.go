@@ -50,10 +50,16 @@ var debugSCIONPreference = envknob.RegisterInt("TS_SCION_PREFERENCE")
 // Other paths are only used if no SCION path is available.
 var preferSCION = envknob.RegisterBool("TS_PREFER_SCION")
 
+// scionDispatcherPort is the legacy SCION dispatcher port. Older deployments
+// redirect all SCION traffic to this port instead of delivering to application
+// ports directly.
+const scionDispatcherPort = 30041
+
 var (
 	scionDaemonAddress = envknob.RegisterString("SCION_DAEMON_ADDRESS")
 	scionPort          = envknob.RegisterString("TS_SCION_PORT")
 	scionListenAddrEnv = envknob.RegisterString("TS_SCION_LISTEN_ADDR")
+	noDispatcherShim   = envknob.RegisterBool("TS_SCION_NO_DISPATCHER_SHIM")
 )
 
 // scionPreferenceBonus returns the betterAddr points bonus for SCION paths.
@@ -513,10 +519,15 @@ type scionConn struct {
 	localPort    uint16           // local SCION/UDP port
 	daemon       daemon.Connector // for path queries
 	topo         snet.Topology    // local topology
+	shimConn     *net.UDPConn     // receive-only socket on port 30041; nil if unavailable
+	shimXPC      scionBatchRW     // batch reader for shim socket
 }
 
 // close shuts down the SCION connection and daemon connector.
 func (sc *scionConn) close() error {
+	if sc.shimConn != nil {
+		sc.shimConn.Close()
+	}
 	if sc.conn != nil {
 		sc.conn.Close()
 	}
@@ -526,9 +537,15 @@ func (sc *scionConn) close() error {
 	return nil
 }
 
-// closeSocket closes only the SCION socket (conn, underlayConn, underlayXPC),
-// preserving the daemon connector and topology for socket-only reconnection.
+// closeSocket closes only the SCION socket (conn, underlayConn, underlayXPC)
+// and the dispatcher shim, preserving the daemon connector and topology for
+// socket-only reconnection.
 func (sc *scionConn) closeSocket() {
+	if sc.shimConn != nil {
+		sc.shimConn.Close()
+	}
+	sc.shimConn = nil
+	sc.shimXPC = nil
 	if sc.conn != nil {
 		sc.conn.Close()
 	}
@@ -904,7 +921,7 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		}
 	}
 
-	return &scionConn{
+	sc := &scionConn{
 		conn:         sconn,
 		underlayConn: underlayConn,
 		underlayXPC:  underlayXPC,
@@ -913,7 +930,69 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		localPort:    localPort,
 		daemon:       connector,
 		topo:         topo,
-	}, nil
+	}
+	openDispatcherShim(sc, logf, netMon)
+	return sc, nil
+}
+
+// openDispatcherShim tries to bind a receive-only UDP socket on the legacy
+// dispatcher port (30041). In older SCION deployments, border routers send all
+// packets to this port instead of directly to the application's endhost port.
+// If binding succeeds (no dispatcher running), the shim socket receives packets
+// identically to the main socket. If binding fails (EADDRINUSE), we log and
+// continue — the real dispatcher handles forwarding.
+func openDispatcherShim(sc *scionConn, logf logger.Logf, netMon *netmon.Monitor) {
+	if noDispatcherShim() {
+		logf("magicsock: SCION dispatcher shim disabled via TS_SCION_NO_DISPATCHER_SHIM")
+		return
+	}
+	if sc.localPort == scionDispatcherPort {
+		logf("magicsock: SCION main socket already on dispatcher port %d, skipping shim", scionDispatcherPort)
+		return
+	}
+
+	shimAddr := &net.UDPAddr{
+		IP:   sc.localHostIP.AsSlice(),
+		Port: scionDispatcherPort,
+	}
+	shimConn, err := net.ListenUDP("udp", shimAddr)
+	if err != nil {
+		logf("magicsock: SCION dispatcher shim on :%d: %v (continuing without shim)", scionDispatcherPort, err)
+		return
+	}
+
+	if err := shimConn.SetReadBuffer(socketBufferSize); err != nil {
+		logf("magicsock: SCION shim: failed to set read buffer to %d: %v", socketBufferSize, err)
+	}
+
+	// Apply platform-specific socket options (SO_MARK, VPN isolation)
+	// to prevent the shim socket from routing through the VPN tunnel.
+	if netMon != nil {
+		rawConn, err := shimConn.SyscallConn()
+		if err == nil {
+			lc := netns.Listener(logf, netMon)
+			if lc.Control != nil {
+				if err := lc.Control("udp", shimConn.LocalAddr().String(), rawConn); err != nil {
+					logf("magicsock: SCION shim: netns control: %v", err)
+				}
+			}
+		} else {
+			logf("magicsock: SCION shim: SyscallConn: %v", err)
+		}
+	}
+
+	// Wrap for batch I/O, selecting address family based on local address.
+	var xpc scionBatchRW
+	local := shimConn.LocalAddr().(*net.UDPAddr)
+	if local.IP.To4() != nil {
+		xpc = ipv4.NewPacketConn(shimConn)
+	} else {
+		xpc = ipv6.NewPacketConn(shimConn)
+	}
+
+	sc.shimConn = shimConn
+	sc.shimXPC = xpc
+	logf("magicsock: SCION dispatcher shim listening on %s", shimConn.LocalAddr())
 }
 
 // parseSCIONServiceAddr parses a SCION service description string of the form
@@ -1221,7 +1300,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		// On shutdown, closeSCIONBindLocked sets an immediate deadline.
 		// On reconnection, the old socket is closed → net.ErrClosed.
 		if sc.underlayXPC != nil {
-			n, err := c.receiveSCIONBatch(sc, buffs, sizes, eps)
+			n, err := c.receiveSCIONBatch(sc.underlayXPC, buffs, sizes, eps)
 			if n > 0 {
 				return n, nil
 			}
@@ -1315,11 +1394,75 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 	}
 }
 
+// receiveSCIONShim is the conn.ReceiveFunc for the legacy dispatcher shim
+// socket (port 30041). It reads SCION packets identically to the main socket's
+// batch path, reusing receiveSCIONBatch for all parsing and disco handling.
+//
+// Unlike receiveSCION, this function does not trigger reconnections (that is
+// the main socket's responsibility) and has no slow-path fallback (the shim
+// is always a raw *net.UDPConn).
+func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
+	sc := c.pconnSCION
+	if sc == nil || sc.shimXPC == nil {
+		<-c.donec
+		return 0, net.ErrClosed
+	}
+
+	for {
+		select {
+		case <-c.donec:
+			return 0, net.ErrClosed
+		default:
+		}
+
+		// Re-read pconnSCION — it may have been swapped by reconnectSCION.
+		sc = c.pconnSCION
+		if sc == nil {
+			// Main socket reconnection in progress. Wait and retry;
+			// the reconnect may or may not rebind port 30041.
+			select {
+			case <-c.donec:
+				return 0, net.ErrClosed
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+		if sc.shimXPC == nil {
+			// Shim was not rebound after reconnection. Wait and retry.
+			select {
+			case <-c.donec:
+				return 0, net.ErrClosed
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+
+		n, err := c.receiveSCIONBatch(sc.shimXPC, buffs, sizes, eps)
+		if n > 0 {
+			return n, nil
+		}
+		if err != nil {
+			select {
+			case <-c.donec:
+				return 0, net.ErrClosed
+			default:
+			}
+			if errors.Is(err, net.ErrClosed) || isTimeoutError(err) {
+				continue
+			}
+			c.logf("magicsock: SCION shim read error: %v", err)
+			continue
+		}
+		// n == 0 and no error means all packets were disco/filtered.
+		continue
+	}
+}
+
 // receiveSCIONBatch reads a batch of raw SCION packets from the underlay
 // socket via recvmmsg, parses SCION+UDP headers with slayers, and copies
 // payloads into WireGuard's buffs. Disco packets are handled inline and
 // not reported to the caller.
-func (c *Conn) receiveSCIONBatch(sc *scionConn, buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
+func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
 	batch := scionRecvBatchPool.Get().(*scionRecvBatch)
 	defer putScionRecvBatch(batch)
 
@@ -1328,7 +1471,7 @@ func (c *Conn) receiveSCIONBatch(sc *scionConn, buffs [][]byte, sizes []int, eps
 		n = scionMaxBatchSize
 	}
 
-	numMsgs, err := sc.underlayXPC.ReadBatch(batch.msgs[:n], 0)
+	numMsgs, err := xpc.ReadBatch(batch.msgs[:n], 0)
 	if err != nil {
 		return 0, err
 	}
