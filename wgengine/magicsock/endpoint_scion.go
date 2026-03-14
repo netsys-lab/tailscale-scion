@@ -287,6 +287,7 @@ func (de *endpoint) demoteSCIONPathLocked(demotedKey scionPathKey) {
 		newAddr := addrQuality{
 			epAddr:         epAddr{ap: de.scionState.hostAddr, scionKey: bestKey},
 			latency:        bestLatency,
+			wireMTU:        scionWireMTU,
 			scionPreferred: de.scionPreferred,
 		}
 		de.c.logf("magicsock: SCION path demoted, switching to path %d for %v", bestKey, de.publicKey.ShortString())
@@ -343,6 +344,7 @@ func (de *endpoint) reEvalSCIONPathsLocked(now mono.Time) {
 	candidate := addrQuality{
 		epAddr:         epAddr{ap: de.scionState.hostAddr, scionKey: bestKey},
 		latency:        bestLatency,
+		wireMTU:        scionWireMTU,
 		scionPreferred: de.scionPreferred,
 	}
 

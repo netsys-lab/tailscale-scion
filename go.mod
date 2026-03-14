@@ -57,6 +57,7 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/google/nftables v0.2.1-0.20240414091927-5e242ec57806
 	github.com/google/uuid v1.6.0
+	github.com/gopacket/gopacket v1.5.0
 	github.com/goreleaser/nfpm/v2 v2.33.1
 	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/raft v1.7.2
@@ -199,7 +200,6 @@ require (
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/google/renameio/v2 v2.0.0 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
-	github.com/gopacket/gopacket v1.5.0 // indirect
 	github.com/gorilla/securecookie v1.1.2 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/gosuri/uitable v0.0.4 // indirect

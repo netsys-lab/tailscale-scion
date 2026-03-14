@@ -1683,14 +1683,14 @@ func (de *endpoint) noteConnectivityChange() {
 // udpAddr. size is the length of the entire disco message including
 // disco headers. If size is zero, assume it is the safe wire MTU.
 func pingSizeToPktLen(size int, udpAddr epAddr) tstun.WireMTU {
-	if size == 0 {
-		return tstun.SafeWireMTU()
-	}
 	if udpAddr.scionKey.IsSet() {
-		// For SCION paths, the snet library handles all SCION header
-		// serialization internally. The payload we pass to WriteTo is the
-		// WireGuard packet. Since we skip MTU probing for SCION (the path
-		// MTU is known from metadata), just return the safe wire MTU.
+		// SCION wire MTU is fixed regardless of ping size: the WireGuard
+		// packet must fit inside the SCION path's payload budget (path MTU
+		// minus variable SCION headers). We use a conservative value
+		// rather than computing per-path overhead from the hop count.
+		return scionWireMTU
+	}
+	if size == 0 {
 		return tstun.SafeWireMTU()
 	}
 	headerLen := ipv4.HeaderLen
@@ -1808,7 +1808,18 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 		// getting stuck with a dead bestAddr that betterAddr() refuses to
 		// demote due to preference rules (e.g., TS_PREFER_SCION=1).
 		curBestUntrusted := de.bestAddr.ap.IsValid() && now.After(de.trustBestAddrUntil)
-		if curBestUntrusted || betterAddr(thisPong, de.bestAddr) {
+
+		// When the current bestAddr is a trusted SCION path and this pong
+		// is from a different SCION path on the same host, skip generic
+		// betterAddr promotion. The SCION-aware reEvalSCIONPathsLocked
+		// (throttled to 2s) handles multi-path switching to avoid flapping
+		// between paths with similar latency.
+		scionToScion := thisPong.epAddr.isSCION() && de.bestAddr.isSCION() &&
+			thisPong.epAddr.ap == de.bestAddr.ap &&
+			thisPong.epAddr.scionKey != de.bestAddr.scionKey
+		skipPromotion := scionToScion && !curBestUntrusted
+
+		if !skipPromotion && (curBestUntrusted || betterAddr(thisPong, de.bestAddr)) {
 			if thisPong.epAddr != de.bestAddr.epAddr {
 				de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
 				de.debugUpdates.Add(EndpointChange{
@@ -2103,7 +2114,15 @@ func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
 	ps.Active = now.Sub(de.lastSendExt) < sessionActiveTimeout
 
 	if udpAddr, derpAddr, _ := de.addrForSendLocked(now); udpAddr.ap.IsValid() && !derpAddr.IsValid() {
-		if udpAddr.vni.IsSet() {
+		if udpAddr.isSCION() {
+			// Access c.scionPaths directly — c.mu is already held by
+			// our caller (Conn.UpdateStatus).
+			if pi, ok := de.c.scionPaths[udpAddr.scionKey]; ok {
+				ps.CurAddr = pi.String()
+			} else {
+				ps.CurAddr = udpAddr.String()
+			}
+		} else if udpAddr.vni.IsSet() {
 			ps.PeerRelay = udpAddr.String()
 		} else {
 			ps.CurAddr = udpAddr.String()

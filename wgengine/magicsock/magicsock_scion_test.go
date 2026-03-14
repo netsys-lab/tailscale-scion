@@ -1906,3 +1906,107 @@ func TestDispatcherShim(t *testing.T) {
 		}
 	})
 }
+
+func TestFormatSCIONHops(t *testing.T) {
+	mustIA := func(s string) addr.IA {
+		ia, err := addr.ParseIA(s)
+		if err != nil {
+			t.Fatalf("invalid IA %q: %v", s, err)
+		}
+		return ia
+	}
+
+	tests := []struct {
+		name   string
+		ifaces []snet.PathInterface
+		want   string
+	}{
+		{
+			name:   "empty",
+			ifaces: nil,
+			want:   "?",
+		},
+		{
+			name: "2-hop direct",
+			ifaces: []snet.PathInterface{
+				{IA: mustIA("19-ffaa:1:eba"), ID: 2},
+				{IA: mustIA("19-ffaa:1:bf5"), ID: 2},
+			},
+			want: "19-ffaa:1:eba 2>2 19-ffaa:1:bf5",
+		},
+		{
+			name: "3-hop via transit",
+			ifaces: []snet.PathInterface{
+				{IA: mustIA("19-ffaa:1:eba"), ID: 1},
+				{IA: mustIA("19-ffaa:0:1303"), ID: 62},
+				{IA: mustIA("19-ffaa:0:1303"), ID: 104},
+				{IA: mustIA("19-ffaa:1:bf5"), ID: 1},
+			},
+			want: "19-ffaa:1:eba 1>62 19-ffaa:0:1303 104>1 19-ffaa:1:bf5",
+		},
+		{
+			name: "4-hop two transits",
+			ifaces: []snet.PathInterface{
+				{IA: mustIA("19-ffaa:1:eba"), ID: 1},
+				{IA: mustIA("19-ffaa:0:1"), ID: 3},
+				{IA: mustIA("19-ffaa:0:1"), ID: 4},
+				{IA: mustIA("19-ffaa:0:2"), ID: 5},
+				{IA: mustIA("19-ffaa:0:2"), ID: 6},
+				{IA: mustIA("19-ffaa:1:bf5"), ID: 1},
+			},
+			want: "19-ffaa:1:eba 1>3 19-ffaa:0:1 4>5 19-ffaa:0:2 6>1 19-ffaa:1:bf5",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatSCIONHops(tt.ifaces)
+			if got != tt.want {
+				t.Errorf("formatSCIONHops() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScionPathInfoString(t *testing.T) {
+	mustIA := func(s string) addr.IA {
+		ia, err := addr.ParseIA(s)
+		if err != nil {
+			t.Fatalf("invalid IA %q: %v", s, err)
+		}
+		return ia
+	}
+
+	pi := &scionPathInfo{
+		peerIA:   mustIA("19-ffaa:1:bf5"),
+		hostAddr: netip.MustParseAddrPort("127.0.0.1:32766"),
+		path: snetpath.Path{
+			Src: mustIA("19-ffaa:1:eba"),
+			Dst: mustIA("19-ffaa:1:bf5"),
+			Meta: snet.PathMetadata{
+				Interfaces: []snet.PathInterface{
+					{IA: mustIA("19-ffaa:1:eba"), ID: 2},
+					{IA: mustIA("19-ffaa:1:bf5"), ID: 2},
+				},
+				MTU: 1472,
+			},
+		},
+	}
+	pi.buildDisplayStr()
+
+	want := "scion:[19-ffaa:1:eba 2>2 19-ffaa:1:bf5]:[127.0.0.1]:32766"
+	if got := pi.String(); got != want {
+		t.Errorf("scionPathInfo.String() = %q, want %q", got, want)
+	}
+
+	// Test with no metadata
+	piNoMeta := &scionPathInfo{
+		peerIA:   mustIA("19-ffaa:1:bf5"),
+		hostAddr: netip.MustParseAddrPort("127.0.0.1:32766"),
+	}
+	piNoMeta.buildDisplayStr()
+
+	wantNoMeta := "scion:[?]:[127.0.0.1]:32766"
+	if got := piNoMeta.String(); got != wantNoMeta {
+		t.Errorf("scionPathInfo.String() no metadata = %q, want %q", got, wantNoMeta)
+	}
+}

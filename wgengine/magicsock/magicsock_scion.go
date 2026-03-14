@@ -34,6 +34,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
@@ -60,6 +61,7 @@ var (
 	scionPort          = envknob.RegisterString("TS_SCION_PORT")
 	scionListenAddrEnv = envknob.RegisterString("TS_SCION_LISTEN_ADDR")
 	noDispatcherShim   = envknob.RegisterBool("TS_SCION_NO_DISPATCHER_SHIM")
+	scionNoFastPath    = envknob.RegisterBool("TS_SCION_NO_FAST_PATH")
 )
 
 // scionPreferenceBonus returns the betterAddr points bonus for SCION paths.
@@ -103,7 +105,48 @@ type scionPathInfo struct {
 	expiry           time.Time            // path expiration from path metadata
 	mtu              uint16               // SCION payload MTU from path metadata
 	refreshMissCount int                  // consecutive refresh cycles fingerprint absent from daemon
+	displayStr       string               // pre-computed human-readable path string
 	mu               sync.Mutex
+}
+
+// String returns the pre-computed human-readable display string for this path.
+// Format: scion:[srcIA ifid>ifid transitIA ... dstIA]:[host]:port
+func (pi *scionPathInfo) String() string {
+	return pi.displayStr
+}
+
+// buildDisplayStr pre-computes the human-readable display string from the
+// current path metadata and host address. Must be called with pi.mu held
+// (or before the info is shared), and whenever the path is updated.
+func (pi *scionPathInfo) buildDisplayStr() {
+	hops := "?"
+	if pi.path != nil {
+		if md := pi.path.Metadata(); md != nil && len(md.Interfaces) > 0 {
+			hops = formatSCIONHops(md.Interfaces)
+		}
+	}
+	pi.displayStr = fmt.Sprintf("scion:[%s]:[%s]:%d",
+		hops, pi.hostAddr.Addr(), pi.hostAddr.Port())
+}
+
+// formatSCIONHops formats SCION path interfaces into standard hop notation.
+// Produces: "19-ffaa:1:eba 2>2 19-ffaa:1:bf5" for a 2-hop path.
+// Mirrors the format used by snet/path.fmtInterfaces and `scion showpaths`.
+func formatSCIONHops(ifaces []snet.PathInterface) string {
+	if len(ifaces) == 0 {
+		return "?"
+	}
+	var sb strings.Builder
+	// First interface: srcIA ifid
+	fmt.Fprintf(&sb, "%s %d", ifaces[0].IA, ifaces[0].ID)
+	// Middle interfaces come in pairs: entry-ifid transitIA exit-ifid
+	for i := 1; i < len(ifaces)-1; i += 2 {
+		fmt.Fprintf(&sb, ">%d %s %d", ifaces[i].ID, ifaces[i].IA, ifaces[i+1].ID)
+	}
+	// Last interface: ifid dstIA
+	last := ifaces[len(ifaces)-1]
+	fmt.Fprintf(&sb, ">%d %s", last.ID, last.IA)
+	return sb.String()
 }
 
 // buildCachedDst constructs the cached destination address from the current
@@ -123,23 +166,20 @@ func (pi *scionPathInfo) buildCachedDst() {
 	pi.cachedDst = dst
 }
 
-// scionHeaderOverhead is the fixed overhead added by SCION encapsulation,
-// excluding the variable-length path header:
-//   - Underlay IPv4+UDP: 20 + 8 = 28 bytes (or IPv6+UDP: 40 + 8 = 48 bytes)
+// The SCION path metadata MTU is the maximum SCION packet size that can
+// traverse the path (including all SCION headers but excluding underlay
+// IP+UDP). The actual payload budget depends on the variable-length path
+// header, which grows with hop count:
 //   - SCION common header: 12 bytes
-//   - Address header (IPv4, 2x ISD-AS + 2x IPv4): 2*8 + 2*4 = 24 bytes
+//   - Address header (IPv4, 2x ISD-AS + 2x IPv4): 24 bytes
+//   - Path header: ~36 bytes (2 hops) to ~96 bytes (6+ hops)
 //   - SCION/UDP L4 header: 8 bytes
 //
-// Total fixed: 72 bytes. The path header is variable (depends on hop count).
-// Rather than parsing the path to determine the exact overhead, we use the
-// path MTU from metadata directly: the SCION daemon reports the maximum
-// *payload* size that can traverse the path (i.e., MTU already accounts for
-// all SCION headers). So the effective wire MTU for WireGuard is simply the
-// SCION path MTU.
-//
-// However, when no path MTU is available, we use a conservative estimate:
-// 1280 bytes (minimum IPv6-compatible MTU).
-const scionFallbackPayloadMTU = 1280
+// Rather than computing exact overhead per path, we use a conservative
+// wire MTU of 1280 bytes (the minimum IPv6 link MTU). This guarantees
+// WireGuard packets fit within any SCION path's payload budget regardless
+// of hop count.
+const scionWireMTU = tstun.WireMTU(1280)
 
 // scionUnsetHopLatency is the assumed per-hop latency when the SCION daemon
 // reports LatencyUnset for a hop. Conservative estimate for path selection.
@@ -465,8 +505,10 @@ func parseSCIONPacket(data []byte, scn *slayers.SCION) (
 }
 
 // buildSCIONReplyAddr builds an *snet.UDPAddr with reversed path for disco
-// reply routing from raw path bytes extracted during receive.
-func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes []byte) *snet.UDPAddr {
+// reply routing from raw path bytes extracted during receive. nextHop is the
+// underlay border router address from the incoming packet (msg.Addr from
+// recvmmsg); it is required for the reply to be routable.
+func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes []byte, nextHop *net.UDPAddr) *snet.UDPAddr {
 	if len(rawPathBytes) == 0 {
 		return nil
 	}
@@ -495,7 +537,8 @@ func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes
 			IP:   srcHostAddr.Addr().AsSlice(),
 			Port: int(srcHostAddr.Port()),
 		},
-		Path: snetpath.SCION{Raw: revBytes},
+		Path:    snetpath.SCION{Raw: revBytes},
+		NextHop: nextHop,
 	}
 }
 
@@ -1048,7 +1091,7 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 	}
 
 	// Fast path: pre-serialized headers + sendmmsg.
-	if fastPath != nil && sc.underlayXPC != nil {
+	if fastPath != nil && sc.underlayXPC != nil && !scionNoFastPath() {
 		err = c.sendSCIONBatchFast(sc, fastPath, buffs, offset)
 		if err != nil {
 			c.handleSCIONSendError(err)
@@ -1248,6 +1291,21 @@ func (c *Conn) updateActiveSCIONPathLocking(peerIA addr.IA, hostAddr netip.AddrP
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.setActiveSCIONPath(peerIA, hostAddr, k)
+}
+
+// scionPathString returns the human-readable display string for a SCION path
+// key. Returns "scion:<key>" as fallback if the key is not found in the
+// registry. Acquires c.mu.
+func (c *Conn) scionPathString(key scionPathKey) string {
+	if !key.IsSet() {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if pi, ok := c.scionPaths[key]; ok {
+		return pi.String()
+	}
+	return fmt.Sprintf("scion:%d", key)
 }
 
 // receiveSCION is the conn.ReceiveFunc for SCION packets. It reads from the
@@ -1498,7 +1556,12 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 
 		pt, _ := packetLooksLike(buffs[count][:pn])
 		if pt == packetLooksLikeDisco {
-			c.handleSCIONDisco(buffs[count][:pn], srcIA, srcHostAddr, rawPath)
+			// Extract underlay source address (border router) for reply NextHop.
+			var nextHop *net.UDPAddr
+			if ua, ok := msg.Addr.(*net.UDPAddr); ok {
+				nextHop = ua
+			}
+			c.handleSCIONDisco(buffs[count][:pn], srcIA, srcHostAddr, rawPath, nextHop)
 			continue
 		}
 
@@ -1540,14 +1603,15 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 // handleSCIONDisco handles a disco packet received on the batch path.
 // It looks up or registers a SCION path entry and dispatches to handleDiscoMessage.
 // For first-contact, the raw path bytes are reversed to build a reply path.
-func (c *Conn) handleSCIONDisco(b []byte, srcIA addr.IA, srcHostAddr netip.AddrPort, rawPath []byte) {
+// nextHop is the underlay border router address from the incoming packet.
+func (c *Conn) handleSCIONDisco(b []byte, srcIA addr.IA, srcHostAddr netip.AddrPort, rawPath []byte, nextHop *net.UDPAddr) {
 	srcEpAddr := epAddr{ap: srcHostAddr}
 	c.mu.Lock()
 	sk := c.scionPathsByAddr[scionAddrKey{ia: srcIA, addr: srcHostAddr}]
 	if !sk.IsSet() {
 		// First disco packet from this SCION peer — build a reply path
 		// by reversing the raw SCION path from the incoming packet.
-		replyAddr := buildSCIONReplyAddr(srcIA, srcHostAddr, rawPath)
+		replyAddr := buildSCIONReplyAddr(srcIA, srcHostAddr, rawPath, nextHop)
 		sk = c.registerSCIONPath(&scionPathInfo{
 			peerIA:    srcIA,
 			hostAddr:  srcHostAddr,
@@ -1756,6 +1820,7 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 			mtu:         mtu,
 		}
 		pi.buildCachedDst()
+		pi.buildDisplayStr()
 		if sc := c.pconnSCION; sc != nil {
 			pi.fastPath = buildSCIONFastPath(sc, pi)
 		}
@@ -2083,6 +2148,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 				pi.mtu = md.MTU
 			}
 			pi.buildCachedDst()
+			pi.buildDisplayStr()
 			pi.fastPath = buildSCIONFastPath(sc, pi)
 			pi.mu.Unlock()
 		}
@@ -2091,7 +2157,11 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		if len(stalePaths) > 0 {
 			c.mu.Lock()
 			for _, k := range stalePaths {
-				c.logf("magicsock: SCION path %d stale for %s, removing", k, g.peerIA)
+				pathStr := fmt.Sprintf("scion:%d", k)
+				if pi, ok := c.scionPaths[k]; ok {
+					pathStr = pi.String()
+				}
+				c.logf("magicsock: SCION path stale for %s, removing %s", g.peerIA, pathStr)
 				c.unregisterSCIONPath(k)
 			}
 			c.mu.Unlock()
@@ -2153,8 +2223,10 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		}
 
 		if len(newPaths) > 0 {
-			c.addNewSCIONPathsForPeer(g.peerIA, g.hostAddr, newPaths)
-			c.logf("magicsock: SCION soft refresh: %d new paths for %s", len(newPaths), g.peerIA)
+			newKeys := c.addNewSCIONPathsForPeer(g.peerIA, g.hostAddr, newPaths)
+			for i, k := range newKeys {
+				c.logf("magicsock: SCION soft refresh for %s: [%d] %s", g.peerIA, i, c.scionPathString(k))
+			}
 		}
 
 		c.mu.Lock()
@@ -2167,11 +2239,11 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 
 // addNewSCIONPathsForPeer registers new SCION paths and adds probe states
 // to the corresponding endpoint. Called during soft refresh when new paths
-// appear in the daemon's cache.
-func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, paths []snet.Path) {
+// appear in the daemon's cache. Returns the registered path keys.
+func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, paths []snet.Path) []scionPathKey {
 	sc := c.pconnSCION
 	if sc == nil {
-		return
+		return nil
 	}
 
 	c.mu.Lock()
@@ -2193,6 +2265,7 @@ func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, 
 			mtu:         mtu,
 		}
 		pi.buildCachedDst()
+		pi.buildDisplayStr()
 		pi.fastPath = buildSCIONFastPath(sc, pi)
 		k := c.registerSCIONPath(pi)
 		newKeys = append(newKeys, k)
@@ -2216,6 +2289,7 @@ func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, 
 		ep.mu.Unlock()
 	}
 	c.mu.Unlock()
+	return newKeys
 }
 
 // cleanStaleSCIONPathFromEndpoints removes stale SCION path keys from all
@@ -2419,7 +2493,31 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 	}
 	de.mu.Unlock()
 
-	de.c.logf("magicsock: discovered %d SCION paths to %s (active key=%d)", len(newKeys), peerIA, activePath)
+	for i, k := range newKeys {
+		active := ""
+		if k == activePath {
+			active = " (active)"
+		}
+		var mtuInfo string
+		de.c.mu.Lock()
+		if pi, ok := de.c.scionPaths[k]; ok {
+			hdrLen := 0
+			if pi.fastPath != nil {
+				hdrLen = len(pi.fastPath.hdr)
+			}
+			maxWG := int(pi.mtu) - hdrLen
+			mtuInfo = fmt.Sprintf(" pathMTU=%d hdr=%d maxWG=%d", pi.mtu, hdrLen, maxWG)
+			// WG overhead: 4 type + 4 receiver + 8 counter + 16 tag = 32 bytes.
+			// Max TUN packet that fits: maxWG - 32.
+			const wgOverhead = 32
+			if pi.mtu > 0 && hdrLen > 0 && maxWG < 1280+wgOverhead {
+				de.c.logf("magicsock: WARNING: SCION path MTU %d too small for TUN 1280 (need %d, have %d for WG payload)",
+					pi.mtu, 1280+wgOverhead+hdrLen, pi.mtu)
+			}
+		}
+		de.c.mu.Unlock()
+		de.c.logf("magicsock: SCION path to %s: [%d] %s%s%s", peerIA, i, de.c.scionPathString(k), mtuInfo, active)
+	}
 }
 
 // scionKeyForAddr returns the scionPathKey for the given peer IA and host

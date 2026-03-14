@@ -1201,7 +1201,13 @@ func (c *Conn) Ping(peer tailcfg.NodeView, res *ipnstate.PingResult, size int, c
 func (c *Conn) populateCLIPingResponseLocked(res *ipnstate.PingResult, latency time.Duration, ep epAddr) {
 	res.LatencySeconds = latency.Seconds()
 	if ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
-		if ep.vni.IsSet() {
+		if ep.isSCION() {
+			if pi, ok := c.scionPaths[ep.scionKey]; ok {
+				res.Endpoint = pi.String()
+			} else {
+				res.Endpoint = ep.String()
+			}
+		} else if ep.vni.IsSet() {
 			res.PeerRelay = ep.String()
 		} else {
 			res.Endpoint = ep.String()
