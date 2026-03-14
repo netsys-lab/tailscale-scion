@@ -2325,6 +2325,42 @@ func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, 
 		}
 		ep.mu.Unlock()
 	}
+
+	// Recovery: if no endpoint had scionState for this peerIA, the initial
+	// discoverSCIONPathAsync may have failed. Find the endpoint via peerMap
+	// (the plain hostAddr was registered by handlePingLocked from incoming
+	// SCION disco) and initialize scionState so disco probing can begin.
+	if len(newKeys) > 0 {
+		if ep, ok := c.peerMap.endpointForEpAddr(epAddr{ap: hostAddr}); ok {
+			ep.mu.Lock()
+			if ep.scionState == nil {
+				paths := make(map[scionPathKey]*scionPathProbeState, len(newKeys))
+				var activePath scionPathKey
+				for i, k := range newKeys {
+					pi := c.scionPaths[k]
+					paths[k] = &scionPathProbeState{
+						fingerprint: pi.fingerprint,
+						displayStr:  pi.displayStr,
+						healthy:     true,
+					}
+					if i == 0 {
+						activePath = k
+					}
+				}
+				ep.scionState = &scionEndpointState{
+					peerIA:          peerIA,
+					hostAddr:        hostAddr,
+					paths:           paths,
+					activePath:      activePath,
+					lastDiscoveryAt: time.Now(),
+				}
+				c.setActiveSCIONPath(peerIA, hostAddr, activePath)
+				c.logf("magicsock: SCION recovery: initialized scionState for %s with %d paths", peerIA, len(newKeys))
+			}
+			ep.mu.Unlock()
+		}
+	}
+
 	c.mu.Unlock()
 	return newKeys
 }

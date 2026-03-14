@@ -2133,3 +2133,100 @@ func TestScionReEvalAntiFlap(t *testing.T) {
 		t.Errorf("genuine degradation: activePath = %d, want 1 (should switch for 40ms improvement)", activePath)
 	}
 }
+
+// TestScionAddNewPathsRecovery verifies that addNewSCIONPathsForPeer
+// initializes scionState on an endpoint when the initial path discovery
+// failed (scionState == nil) but incoming SCION disco registered the
+// endpoint in the peerMap via handlePingLocked.
+func TestScionAddNewPathsRecovery(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+	c.pconnSCION = &scionConn{daemon: mock_daemon.NewMockConnector(ctrl), localIA: localIA}
+
+	// Create an endpoint and register it in the peerMap at the plain
+	// hostAddr — this is what handlePingLocked does for incoming SCION disco.
+	ep := &endpoint{c: c, nodeID: 1}
+	ep.publicKey = key.NewNode().Public()
+	ep.disco.Store(&endpointDisco{key: key.NewDisco().Public()})
+	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+	c.peerMap.setNodeKeyForEpAddr(epAddr{ap: hostAddr}, ep.publicKey)
+
+	// Simulate failed initial discovery: ep.scionState is nil.
+	if ep.scionState != nil {
+		t.Fatal("precondition: scionState should be nil")
+	}
+
+	// Register a reply-path in c.scionPaths (simulates handleSCIONDisco
+	// creating a path entry from an incoming disco ping).
+	replyPI := &scionPathInfo{
+		peerIA:      peerIA,
+		hostAddr:    hostAddr,
+		fingerprint: "reply-fp",
+		expiry:      time.Now().Add(1 * time.Hour),
+	}
+	replyPI.buildDisplayStr()
+	c.registerSCIONPathLocking(replyPI)
+
+	// Now soft refresh finds new paths from the daemon. Call
+	// addNewSCIONPathsForPeer with two mock paths.
+	p1 := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Latency: []time.Duration{5 * time.Millisecond},
+		Expiry:  time.Now().Add(2 * time.Hour),
+	})
+	p2 := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Latency: []time.Duration{10 * time.Millisecond},
+		Expiry:  time.Now().Add(2 * time.Hour),
+	})
+
+	newKeys := c.addNewSCIONPathsForPeer(peerIA, hostAddr, []snet.Path{p1, p2})
+	if len(newKeys) != 2 {
+		t.Fatalf("addNewSCIONPathsForPeer returned %d keys, want 2", len(newKeys))
+	}
+
+	// Verify recovery initialized scionState.
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	if ep.scionState == nil {
+		t.Fatal("scionState should have been initialized by recovery")
+	}
+	if ep.scionState.peerIA != peerIA {
+		t.Errorf("peerIA = %s, want %s", ep.scionState.peerIA, peerIA)
+	}
+	if ep.scionState.hostAddr != hostAddr {
+		t.Errorf("hostAddr = %s, want %s", ep.scionState.hostAddr, hostAddr)
+	}
+	if len(ep.scionState.paths) != 2 {
+		t.Errorf("paths count = %d, want 2", len(ep.scionState.paths))
+	}
+	if !ep.scionState.activePath.IsSet() {
+		t.Error("activePath should be set")
+	}
+	// activePath should be one of the new keys.
+	if ep.scionState.activePath != newKeys[0] {
+		t.Errorf("activePath = %d, want %d (first new key)", ep.scionState.activePath, newKeys[0])
+	}
+	// Each probe state should be healthy.
+	for _, k := range newKeys {
+		ps, ok := ep.scionState.paths[k]
+		if !ok {
+			t.Errorf("missing probe state for key %d", k)
+			continue
+		}
+		if !ps.healthy {
+			t.Errorf("probe state for key %d should be healthy", k)
+		}
+	}
+}
