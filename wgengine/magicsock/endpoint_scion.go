@@ -303,15 +303,19 @@ func (de *endpoint) demoteSCIONPathLocked(demotedKey scionPathKey) {
 	}
 }
 
+// scionReEvalInterval is the minimum time between SCION path re-evaluations.
+const scionReEvalInterval = 2 * time.Second
+
 // reEvalSCIONPathsLocked re-evaluates all SCION paths by measured latency
-// after a pong is recorded. Throttled to once per 2 seconds. If a healthier,
-// lower-latency path is found, switches bestAddr and activePath.
+// after a pong is recorded. Throttled to scionReEvalInterval. If a healthier,
+// lower-latency path is found, switches bestAddr and activePath. Incumbent
+// bias prevents flapping between paths with similar latency.
 // de.mu must be held.
 func (de *endpoint) reEvalSCIONPathsLocked(now mono.Time) {
 	if de.scionState == nil || len(de.scionState.paths) < 2 {
 		return
 	}
-	if !de.scionState.lastFullEvalAt.IsZero() && now.Sub(de.scionState.lastFullEvalAt) < 2*time.Second {
+	if !de.scionState.lastFullEvalAt.IsZero() && now.Sub(de.scionState.lastFullEvalAt) < scionReEvalInterval {
 		return
 	}
 	de.scionState.lastFullEvalAt = now
@@ -339,6 +343,20 @@ func (de *endpoint) reEvalSCIONPathsLocked(now mono.Time) {
 
 	if !bestKey.IsSet() || bestKey == de.scionState.activePath {
 		return
+	}
+
+	// Require meaningful improvement over active path to avoid flapping
+	// between paths with similar latency. The candidate must be ≥20% faster
+	// or ≥2ms faster (whichever threshold is smaller).
+	if activePS, ok := de.scionState.paths[de.scionState.activePath]; ok && activePS.healthy {
+		activeLat := activePS.latency()
+		threshold := activeLat / 5 // 20%
+		if minThreshold := 2 * time.Millisecond; threshold < minThreshold {
+			threshold = minThreshold
+		}
+		if activeLat-bestLatency < threshold {
+			return
+		}
 	}
 
 	candidate := addrQuality{

@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -253,12 +254,24 @@ func (ps *scionPathProbeState) addPongReply(r scionPongReply) {
 	}
 }
 
-// latency returns the most recent pong latency, or time.Hour if no pongs received.
+// latency returns the median pong latency from available measurements,
+// or time.Hour if no pongs received. The median is robust to single-sample
+// outliers and provides stable path comparison for anti-flap logic.
 func (ps *scionPathProbeState) latency() time.Duration {
 	if ps.pongCount == 0 {
 		return time.Hour
 	}
-	return ps.recentPongs[ps.recentPong].latency
+	n := int(ps.pongCount)
+	if n == 1 {
+		return ps.recentPongs[ps.recentPong].latency
+	}
+	samples := make([]time.Duration, n)
+	for i := range n {
+		idx := (int(ps.recentPong) - i + scionPongHistoryCount) % scionPongHistoryCount
+		samples[i] = ps.recentPongs[idx].latency
+	}
+	slices.Sort(samples)
+	return samples[n/2]
 }
 
 // scionFastPath holds a pre-serialized SCION+UDP header template for a

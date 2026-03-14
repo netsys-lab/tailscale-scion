@@ -2017,3 +2017,119 @@ func TestScionPathInfoString(t *testing.T) {
 		t.Errorf("scionPathInfo.String() no metadata = %q, want %q", got, wantNoMeta)
 	}
 }
+
+func TestScionLatencyMedian(t *testing.T) {
+	tests := []struct {
+		name    string
+		samples []time.Duration
+		want    time.Duration
+	}{
+		{
+			name:    "no samples",
+			samples: nil,
+			want:    time.Hour,
+		},
+		{
+			name:    "single sample",
+			samples: []time.Duration{10 * time.Millisecond},
+			want:    10 * time.Millisecond,
+		},
+		{
+			name:    "two samples returns higher (index 1)",
+			samples: []time.Duration{8 * time.Millisecond, 12 * time.Millisecond},
+			want:    12 * time.Millisecond,
+		},
+		{
+			name:    "four samples returns median",
+			samples: []time.Duration{10, 20, 30, 40},
+			want:    30, // samples[4/2] = samples[2]
+		},
+		{
+			name:    "eight samples median",
+			samples: []time.Duration{5, 10, 15, 20, 25, 30, 35, 40},
+			want:    25, // samples[8/2] = samples[4]
+		},
+		{
+			name:    "outlier resistance",
+			samples: []time.Duration{10, 11, 12, 10, 11, 12, 10, 500},
+			want:    11, // median ignores the 500 outlier
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ps := &scionPathProbeState{}
+			for _, s := range tt.samples {
+				ps.addPongReply(scionPongReply{latency: s})
+			}
+			if got := ps.latency(); got != tt.want {
+				t.Errorf("latency() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScionReEvalAntiFlap(t *testing.T) {
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+
+	// Two paths with very similar latency (10ms vs 11ms).
+	// Path 1 is the incumbent active path.
+	ps1 := &scionPathProbeState{healthy: true}
+	ps1.addPongReply(scionPongReply{latency: 10 * time.Millisecond})
+
+	ps2 := &scionPathProbeState{healthy: true}
+	ps2.addPongReply(scionPongReply{latency: 11 * time.Millisecond})
+
+	de := &endpoint{c: c}
+	de.scionState = &scionEndpointState{
+		peerIA:     peerIA,
+		hostAddr:   hostAddr,
+		activePath: scionPathKey(2), // path 2 is active at 11ms
+		paths: map[scionPathKey]*scionPathProbeState{
+			scionPathKey(1): ps1,
+			scionPathKey(2): ps2,
+		},
+	}
+	de.bestAddr = addrQuality{
+		epAddr:  epAddr{ap: hostAddr, scionKey: scionPathKey(2)},
+		latency: 11 * time.Millisecond,
+	}
+
+	// Re-eval should NOT switch — 1ms improvement is within 2ms minimum threshold.
+	de.mu.Lock()
+	de.reEvalSCIONPathsLocked(mono.Now())
+	activePath := de.scionState.activePath
+	de.mu.Unlock()
+
+	if activePath != scionPathKey(2) {
+		t.Errorf("anti-flap: activePath = %d, want 2 (should not switch for 1ms difference)", activePath)
+	}
+
+	// Now make path 1 significantly worse (50ms) and path 2 stays at 11ms.
+	// Then flip: make path 2 the slow one (50ms) and path 1 = 10ms.
+	// The 40ms improvement exceeds the 20% threshold (20% of 50ms = 10ms).
+	ps2Slow := &scionPathProbeState{healthy: true}
+	ps2Slow.addPongReply(scionPongReply{latency: 50 * time.Millisecond})
+
+	de.mu.Lock()
+	de.scionState.paths[scionPathKey(2)] = ps2Slow
+	de.scionState.lastFullEvalAt = 0 // reset throttle
+	de.bestAddr.latency = 50 * time.Millisecond
+	de.reEvalSCIONPathsLocked(mono.Now())
+	activePath = de.scionState.activePath
+	de.mu.Unlock()
+
+	if activePath != scionPathKey(1) {
+		t.Errorf("genuine degradation: activePath = %d, want 1 (should switch for 40ms improvement)", activePath)
+	}
+}
