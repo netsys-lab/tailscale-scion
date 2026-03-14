@@ -22,6 +22,7 @@ import (
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/mock_snet"
 	snetpath "github.com/scionproto/scion/pkg/snet/path"
+	"tailscale.com/envknob"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
@@ -705,7 +706,8 @@ func TestScionListenPort(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.envVal != "" {
-				t.Setenv("TS_SCION_PORT", tt.envVal)
+				envknob.Setenv("TS_SCION_PORT", tt.envVal)
+				t.Cleanup(func() { envknob.Setenv("TS_SCION_PORT", "") })
 			}
 			got := scionListenPort()
 			if got != tt.want {
