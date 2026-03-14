@@ -49,6 +49,7 @@ func (de *endpoint) handlePongPromoteSCIONLocked(_ addrQuality)                 
 func (de *endpoint) updateFromNodeSCIONLocked(_ tailcfg.NodeView) []scionPathKey         { return nil }
 func (de *endpoint) stopAndResetSCIONLocked() []scionPathKey                             { return nil }
 func (de *endpoint) sendSCIONData(_ epAddr, _ [][]byte, _ int) error                     { return nil }
+func (de *endpoint) scionAddrStr(e epAddr) string                                       { return e.String() }
 
 // SCIONService returns false when SCION is omitted.
 func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) { return tailcfg.Service{}, false }

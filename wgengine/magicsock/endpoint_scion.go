@@ -290,7 +290,7 @@ func (de *endpoint) demoteSCIONPathLocked(demotedKey scionPathKey) {
 			wireMTU:        scionWireMTU,
 			scionPreferred: de.scionPreferred,
 		}
-		de.c.logf("magicsock: SCION path demoted, switching to path %d for %v", bestKey, de.publicKey.ShortString())
+		de.c.logf("magicsock: SCION path demoted, switching to %s for %v", de.scionAddrStr(newAddr.epAddr), de.publicKey.ShortString())
 		de.setBestAddrLocked(newAddr)
 		go de.c.updateActiveSCIONPathLocking(de.scionState.peerIA, de.scionState.hostAddr, bestKey)
 	} else {
@@ -367,8 +367,8 @@ func (de *endpoint) reEvalSCIONPathsLocked(now mono.Time) {
 	}
 
 	if betterAddr(candidate, de.bestAddr) {
-		de.c.logf("magicsock: SCION re-eval: switching to path %d (latency %v) for %v",
-			bestKey, bestLatency.Round(time.Millisecond), de.publicKey.ShortString())
+		de.c.logf("magicsock: SCION re-eval: switching to %s (latency %v) for %v",
+			de.scionAddrStr(candidate.epAddr), bestLatency.Round(time.Millisecond), de.publicKey.ShortString())
 		de.debugUpdates.Add(EndpointChange{
 			When: time.Now(),
 			What: "reEvalSCIONPathsLocked-switch",
@@ -379,4 +379,17 @@ func (de *endpoint) reEvalSCIONPathsLocked(now mono.Time) {
 		de.scionState.activePath = bestKey
 		go de.c.updateActiveSCIONPathLocking(de.scionState.peerIA, de.scionState.hostAddr, bestKey)
 	}
+}
+
+// scionAddrStr returns a human-readable string for a SCION epAddr using
+// cached path info from de.scionState. Falls back to e.String().
+// de.mu must be held.
+func (de *endpoint) scionAddrStr(e epAddr) string {
+	if !e.scionKey.IsSet() || de.scionState == nil {
+		return e.String()
+	}
+	if ps, ok := de.scionState.paths[e.scionKey]; ok && ps.displayStr != "" {
+		return ps.displayStr
+	}
+	return e.String()
 }

@@ -127,7 +127,7 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 		//
 		// TODO(jwhited): add observability around !curBestAddrTrusted and sameRelayServer
 		// TODO(jwhited): collapse path change logging with endpoint.handlePongConnLocked()
-		de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v", de.publicKey.ShortString(), de.discoShort(), maybeBest.epAddr, maybeBest.wireMTU)
+		de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v", de.publicKey.ShortString(), de.discoShort(), de.scionAddrStr(maybeBest.epAddr), maybeBest.wireMTU)
 		de.setBestAddrLocked(maybeBest)
 		de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
 	}
@@ -1821,7 +1821,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 
 		if !skipPromotion && (curBestUntrusted || betterAddr(thisPong, de.bestAddr)) {
 			if thisPong.epAddr != de.bestAddr.epAddr {
-				de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
+				de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), de.scionAddrStr(sp.to), thisPong.wireMTU, m.TxID[:6])
 				de.debugUpdates.Add(EndpointChange{
 					When: time.Now(),
 					What: "handlePongConnLocked-bestAddr-update",

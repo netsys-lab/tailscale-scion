@@ -229,6 +229,7 @@ type scionEndpointState struct {
 // scionPathProbeState tracks disco probing state for one SCION path.
 type scionPathProbeState struct {
 	fingerprint     snet.PathFingerprint
+	displayStr      string // cached from scionPathInfo.displayStr for lock-safe logging
 	lastPing        mono.Time
 	recentPongs     [scionPongHistoryCount]scionPongReply // ring buffer
 	recentPong      uint16                                // index of most recent entry
@@ -2313,9 +2314,10 @@ func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, 
 		if ep.scionState != nil && ep.scionState.peerIA == peerIA {
 			for _, k := range newKeys {
 				if _, exists := ep.scionState.paths[k]; !exists {
-					fp := c.scionPaths[k].fingerprint
+					pi := c.scionPaths[k]
 					ep.scionState.paths[k] = &scionPathProbeState{
-						fingerprint: fp,
+						fingerprint: pi.fingerprint,
+						displayStr:  pi.displayStr,
 						healthy:     true,
 					}
 				}
@@ -2472,12 +2474,16 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 		newKeySet[k] = true
 	}
 
-	// Extract fingerprints under c.mu (must be acquired before de.mu per lock ordering).
+	// Extract fingerprints and display strings under c.mu (must be acquired before de.mu per lock ordering).
+	type pathSnapshot struct {
+		fingerprint snet.PathFingerprint
+		displayStr  string
+	}
 	de.c.mu.Lock()
-	fpByKey := make(map[scionPathKey]snet.PathFingerprint, len(newKeys))
+	snapByKey := make(map[scionPathKey]pathSnapshot, len(newKeys))
 	for _, k := range newKeys {
 		if pi := de.c.lookupSCIONPath(k); pi != nil {
-			fpByKey[k] = pi.fingerprint
+			snapByKey[k] = pathSnapshot{fingerprint: pi.fingerprint, displayStr: pi.displayStr}
 		}
 	}
 	// Clean up old keys that aren't in the new set.
@@ -2502,16 +2508,17 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 
 	newPaths := make(map[scionPathKey]*scionPathProbeState, len(newKeys))
 	for _, k := range newKeys {
-		fp := fpByKey[k]
+		snap := snapByKey[k]
 		// Preserve existing probe history if the fingerprint matches.
-		if fp != "" && oldProbeByFP != nil {
-			if old, ok := oldProbeByFP[fp]; ok {
-				old.fingerprint = fp // ensure set
+		if snap.fingerprint != "" && oldProbeByFP != nil {
+			if old, ok := oldProbeByFP[snap.fingerprint]; ok {
+				old.fingerprint = snap.fingerprint // ensure set
+				old.displayStr = snap.displayStr
 				newPaths[k] = old
 				continue
 			}
 		}
-		newPaths[k] = &scionPathProbeState{fingerprint: fp, healthy: true}
+		newPaths[k] = &scionPathProbeState{fingerprint: snap.fingerprint, displayStr: snap.displayStr, healthy: true}
 	}
 
 	activePath := scionPathKey(0)
