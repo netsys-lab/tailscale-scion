@@ -2623,6 +2623,39 @@ var errNoSCION = fmt.Errorf("SCION not available")
 
 const discoRXPathSCION discoRXPath = "SCION"
 
+// ReconfigureSCION updates SCION configuration at runtime.
+// If disabled, closes the current SCION connection.
+// If enabled, updates envknobs and triggers a reconnection attempt.
+func (c *Conn) ReconfigureSCION(cfg SCIONConfig) {
+	if !cfg.Enabled {
+		c.mu.Lock()
+		c.closeSCIONLocked()
+		c.mu.Unlock()
+		return
+	}
+	if cfg.BootstrapURL != "" {
+		envknob.Setenv("TS_SCION_BOOTSTRAP_URL", cfg.BootstrapURL)
+	}
+	if cfg.Prefer {
+		envknob.Setenv("TS_PREFER_SCION", "true")
+	} else {
+		envknob.Setenv("TS_PREFER_SCION", "")
+	}
+	// Force embedded mode on Android (no external daemon).
+	envknob.Setenv("TS_SCION_EMBEDDED", "1")
+	c.retrySCIONConnect()
+}
+
+// SCIONStatus returns whether SCION is currently connected and the local IA.
+func (c *Conn) SCIONStatus() (connected bool, localIA string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pconnSCION == nil {
+		return false, ""
+	}
+	return true, c.pconnSCION.localIA.String()
+}
+
 // populateSCIONPathsLocked fills ps.SCIONPaths from de.scionState.
 // de.mu must be held. c.mu must be held (caller is Conn.UpdateStatus).
 func (de *endpoint) populateSCIONPathsLocked(ps *ipnstate.PeerStatus) {

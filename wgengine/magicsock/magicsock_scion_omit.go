@@ -67,6 +67,9 @@ func (de *endpoint) populateSCIONPathsLocked(_ *ipnstate.PeerStatus)            
 // SCIONService returns false when SCION is omitted.
 func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) { return tailcfg.Service{}, false }
 
+func (c *Conn) ReconfigureSCION(_ SCIONConfig)                          {}
+func (c *Conn) SCIONStatus() (connected bool, localIA string)           { return false, "" }
+
 // Stub standalone functions used by betterAddr in endpoint.go.
 
 var preferSCION = func() bool { return false }

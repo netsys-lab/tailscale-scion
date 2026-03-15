@@ -99,6 +99,13 @@ const (
 	PathSCION         Path = "scion"
 )
 
+// SCIONConfig holds runtime-configurable SCION parameters.
+type SCIONConfig struct {
+	Enabled      bool
+	BootstrapURL string
+	Prefer       bool
+}
+
 type pathLabel struct {
 	// Path indicates the path that the packet took:
 	// - direct_ipv4
