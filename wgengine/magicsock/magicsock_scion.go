@@ -2625,7 +2625,8 @@ const discoRXPathSCION discoRXPath = "SCION"
 
 // ReconfigureSCION updates SCION configuration at runtime.
 // If disabled, closes the current SCION connection.
-// If enabled, updates envknobs and triggers a reconnection attempt.
+// If enabled, updates envknobs, closes any existing connection, and
+// triggers a fresh reconnection attempt.
 func (c *Conn) ReconfigureSCION(cfg SCIONConfig) {
 	if !cfg.Enabled {
 		c.mu.Lock()
@@ -2641,8 +2642,15 @@ func (c *Conn) ReconfigureSCION(cfg SCIONConfig) {
 	} else {
 		envknob.Setenv("TS_PREFER_SCION", "")
 	}
-	// Force embedded mode on Android (no external daemon).
+	// Force embedded mode and fresh bootstrap on Android.
 	envknob.Setenv("TS_SCION_EMBEDDED", "1")
+	envknob.Setenv("TS_SCION_FORCE_BOOTSTRAP", "1")
+
+	// Close existing connection (if any) so retrySCIONConnect starts fresh.
+	c.mu.Lock()
+	c.closeSCIONLocked()
+	c.mu.Unlock()
+
 	c.retrySCIONConnect()
 }
 
