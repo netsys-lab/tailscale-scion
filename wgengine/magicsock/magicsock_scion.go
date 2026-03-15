@@ -934,12 +934,15 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 	var underlayConn *net.UDPConn
 	if pc, ok := pconn.(*snet.SCIONPacketConn); ok {
 		underlayConn = pc.Conn
+		logf("magicsock: SCION: extracted underlay conn, local=%v", underlayConn.LocalAddr())
 		if err := pc.SetReadBuffer(socketBufferSize); err != nil {
 			logf("magicsock: SCION: failed to set read buffer to %d: %v", socketBufferSize, err)
 		}
 		if err := pc.SetWriteBuffer(socketBufferSize); err != nil {
 			logf("magicsock: SCION: failed to set write buffer to %d: %v", socketBufferSize, err)
 		}
+	} else {
+		logf("magicsock: SCION: WARNING: pconn is %T, not *snet.SCIONPacketConn; cannot extract underlay", pconn)
 	}
 
 	// Apply platform-specific socket options (SO_MARK on Linux,
@@ -951,13 +954,20 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		if err == nil {
 			lc := netns.Listener(logf, netMon)
 			if lc.Control != nil {
+				logf("magicsock: SCION: calling netns control (VpnService.protect) on underlay fd")
 				if err := lc.Control("udp", underlayConn.LocalAddr().String(), rawConn); err != nil {
-					logf("magicsock: SCION: netns control: %v", err)
+					logf("magicsock: SCION: netns control FAILED: %v", err)
+				} else {
+					logf("magicsock: SCION: netns control succeeded on underlay socket")
 				}
+			} else {
+				logf("magicsock: SCION: WARNING: netns Listener.Control is nil, socket NOT protected")
 			}
 		} else {
 			logf("magicsock: SCION: SyscallConn: %v", err)
 		}
+	} else {
+		logf("magicsock: SCION: WARNING: no underlay conn, socket NOT protected from VPN")
 	}
 
 	sconn, err := snet.NewCookedConn(pconn, topo)
@@ -1360,8 +1370,18 @@ func (c *Conn) scionPathString(key scionPathKey) string {
 func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
 	sc := c.pconnSCION
 	if sc == nil {
-		<-c.donec
-		return 0, net.ErrClosed
+		// SCION not connected yet. Wait and retry instead of blocking
+		// forever, so that mid-session SCION connections (e.g. from
+		// ReconfigureSCION on Android) can start receiving.
+		select {
+		case <-c.donec:
+			return 0, net.ErrClosed
+		case <-time.After(5 * time.Second):
+		}
+		sc = c.pconnSCION
+		if sc == nil {
+			return 0, nil // return zero to let WireGuard call us again
+		}
 	}
 
 	for {
@@ -1496,8 +1516,16 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
 	sc := c.pconnSCION
 	if sc == nil || sc.shimXPC == nil {
-		<-c.donec
-		return 0, net.ErrClosed
+		// SCION not connected or no shim. Wait and retry.
+		select {
+		case <-c.donec:
+			return 0, net.ErrClosed
+		case <-time.After(5 * time.Second):
+		}
+		sc = c.pconnSCION
+		if sc == nil || sc.shimXPC == nil {
+			return 0, nil
+		}
 	}
 
 	for {

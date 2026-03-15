@@ -3342,12 +3342,10 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 	if runtime.GOOS == "js" {
 		fns = []conn.ReceiveFunc{c.receiveDERP}
 	}
-	if c.pconnSCION != nil {
-		fns = append(fns, c.receiveSCION)
-		if c.pconnSCION.shimXPC != nil {
-			fns = append(fns, c.receiveSCIONShim)
-		}
-	}
+	// Always register SCION receive funcs so they're available when
+	// SCION connects mid-session (e.g. via ReconfigureSCION from Android).
+	// receiveSCION handles nil pconnSCION by waiting and retrying.
+	fns = append(fns, c.receiveSCION, c.receiveSCIONShim)
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
 	return fns, c.LocalPort(), nil
