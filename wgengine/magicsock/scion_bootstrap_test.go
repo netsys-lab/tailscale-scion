@@ -174,16 +174,7 @@ func TestBootstrapURLs(t *testing.T) {
 }
 
 func TestLocalSearchDomainFromHostname(t *testing.T) {
-	tests := []struct {
-		name    string
-		want    string
-		wantErr bool
-	}{
-		// Note: we can't easily override os.Hostname() in tests,
-		// so we test the parsing logic via the function contract.
-	}
-	_ = tests
-
-	// At minimum, verify the function doesn't panic.
+	// We can't easily override os.Hostname() in tests, so just verify
+	// the function doesn't panic and returns without error on this host.
 	_, _ = localSearchDomainFromHostname()
 }

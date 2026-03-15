@@ -683,7 +683,7 @@ func scionListenPort() uint16 {
 // the user should set TS_SCION_LISTEN_ADDR explicitly.
 //
 // Falls back to 127.0.0.1 if no interfaces or resolution fails.
-func scionResolveLocalIP(ctx context.Context, connector daemon.Connector) netip.Addr {
+func scionResolveLocalIP(ctx context.Context, connector daemon.Connector, logf logger.Logf) netip.Addr {
 	ifMap, err := connector.Interfaces(ctx)
 	if err != nil || len(ifMap) == 0 {
 		return netip.AddrFrom4([4]byte{127, 0, 0, 1})
@@ -712,7 +712,7 @@ func scionResolveLocalIP(ctx context.Context, connector daemon.Connector) netip.
 		return netip.AddrFrom4([4]byte{127, 0, 0, 1})
 	}
 	if !allSame {
-		fmt.Fprintf(os.Stderr, "magicsock: SCION: multiple BRs resolve to different local IPs; using %s, set TS_SCION_LISTEN_ADDR to override\n", first)
+		logf("magicsock: SCION: multiple BRs resolve to different local IPs; using %s, set TS_SCION_LISTEN_ADDR to override", first)
 	}
 	return first
 }
@@ -720,7 +720,7 @@ func scionResolveLocalIP(ctx context.Context, connector daemon.Connector) netip.
 // scionListenAddr returns the listen address for the SCION underlay socket.
 // TS_SCION_LISTEN_ADDR can override the IP (e.g. "::1" for IPv6 localhost).
 // Otherwise resolves the local IP from the topology's BR internal addresses.
-func scionListenAddr(ctx context.Context, connector daemon.Connector) *net.UDPAddr {
+func scionListenAddr(ctx context.Context, connector daemon.Connector, logf logger.Logf) *net.UDPAddr {
 	port := scionListenPort()
 	if a := scionListenAddrEnv(); a != "" {
 		ip := net.ParseIP(a)
@@ -728,7 +728,7 @@ func scionListenAddr(ctx context.Context, connector daemon.Connector) *net.UDPAd
 			return &net.UDPAddr{IP: ip, Port: int(port)}
 		}
 	}
-	ip := scionResolveLocalIP(ctx, connector)
+	ip := scionResolveLocalIP(ctx, connector, logf)
 	return &net.UDPAddr{IP: ip.AsSlice(), Port: int(port)}
 }
 
@@ -908,7 +908,7 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		Topology: topo,
 	}
 
-	listenAddr := scionListenAddr(ctx, connector)
+	listenAddr := scionListenAddr(ctx, connector, logf)
 	if listenAddr.Port != 0 {
 		// Validate the configured port against the dispatched range.
 		portMin, portMax, err := connector.PortRange(ctx)
@@ -979,7 +979,10 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 	// address family based on the local address.
 	var underlayXPC scionBatchRW
 	if underlayConn != nil {
-		local := underlayConn.LocalAddr().(*net.UDPAddr)
+		local, ok := underlayConn.LocalAddr().(*net.UDPAddr)
+		if !ok {
+			return nil, fmt.Errorf("unexpected underlay local address type %T", underlayConn.LocalAddr())
+		}
 		if local.IP.To4() != nil {
 			underlayXPC = ipv4.NewPacketConn(underlayConn)
 		} else {
@@ -1049,7 +1052,12 @@ func openDispatcherShim(sc *scionConn, logf logger.Logf, netMon *netmon.Monitor)
 
 	// Wrap for batch I/O, selecting address family based on local address.
 	var xpc scionBatchRW
-	local := shimConn.LocalAddr().(*net.UDPAddr)
+	local, ok := shimConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		shimConn.Close()
+		logf("magicsock: SCION shim: unexpected local address type %T", shimConn.LocalAddr())
+		return
+	}
 	if local.IP.To4() != nil {
 		xpc = ipv4.NewPacketConn(shimConn)
 	} else {
