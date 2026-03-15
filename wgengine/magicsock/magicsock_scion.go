@@ -2695,6 +2695,10 @@ func (c *Conn) SCIONStatus() (connected bool, localIA string) {
 // populateSCIONPathsLocked fills ps.SCIONPaths from de.scionState.
 // de.mu must be held. c.mu must be held (caller is Conn.UpdateStatus).
 func (de *endpoint) populateSCIONPathsLocked(ps *ipnstate.PeerStatus) {
+	// Don't report paths if SCION is disconnected - they're stale.
+	if de.c.pconnSCION == nil {
+		return
+	}
 	ss := de.scionState
 	if ss == nil || len(ss.paths) == 0 {
 		return
