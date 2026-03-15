@@ -27,11 +27,13 @@ func (c *Conn) initSCIONLocked(ctx context.Context) {
 	go c.refreshSCIONPaths()
 }
 
-// closeSCIONLocked closes the SCION connection if open.
+// closeSCIONLocked closes the SCION connection if open and sets pconnSCION
+// to nil so that receiveSCION and retrySCIONConnect see it as disconnected.
 // c.mu must be held.
 func (c *Conn) closeSCIONLocked() {
 	if c.pconnSCION != nil {
 		c.pconnSCION.close()
+		c.pconnSCION = nil
 	}
 }
 
