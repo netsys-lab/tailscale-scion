@@ -33,6 +33,7 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tstun"
@@ -2621,3 +2622,34 @@ func (c *Conn) scionKeyForAddr(peerIA addr.IA, hostAddr netip.AddrPort) scionPat
 var errNoSCION = fmt.Errorf("SCION not available")
 
 const discoRXPathSCION discoRXPath = "SCION"
+
+// populateSCIONPathsLocked fills ps.SCIONPaths from de.scionState.
+// de.mu must be held. c.mu must be held (caller is Conn.UpdateStatus).
+func (de *endpoint) populateSCIONPathsLocked(ps *ipnstate.PeerStatus) {
+	ss := de.scionState
+	if ss == nil || len(ss.paths) == 0 {
+		return
+	}
+	ps.SCIONPaths = make([]ipnstate.SCIONPathInfo, 0, len(ss.paths))
+	for pk, probe := range ss.paths {
+		info := ipnstate.SCIONPathInfo{
+			Path:    probe.displayStr,
+			Active:  pk == ss.activePath,
+			Healthy: probe.healthy,
+		}
+		lat := probe.latency()
+		if lat < time.Hour {
+			info.LatencyMs = float64(lat.Microseconds()) / 1000.0
+		}
+		// Look up full path info from Conn-level registry for expiry/MTU.
+		if pi, ok := de.c.scionPaths[pk]; ok {
+			if !pi.expiry.IsZero() {
+				info.ExpiresAt = pi.expiry.UTC().Format(time.RFC3339)
+			}
+			if pi.mtu > 0 {
+				info.MTU = int(pi.mtu)
+			}
+		}
+		ps.SCIONPaths = append(ps.SCIONPaths, info)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	wgconn "github.com/tailscale/wireguard-go/conn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
@@ -61,6 +62,7 @@ func (de *endpoint) updateFromNodeSCIONLocked(_ tailcfg.NodeView) []scionPathKey
 func (de *endpoint) stopAndResetSCIONLocked() []scionPathKey                             { return nil }
 func (de *endpoint) sendSCIONData(_ epAddr, _ [][]byte, _ int) error                     { return nil }
 func (de *endpoint) scionAddrStr(e epAddr) string                                       { return e.String() }
+func (de *endpoint) populateSCIONPathsLocked(_ *ipnstate.PeerStatus)                    {}
 
 // SCIONService returns false when SCION is omitted.
 func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) { return tailcfg.Service{}, false }

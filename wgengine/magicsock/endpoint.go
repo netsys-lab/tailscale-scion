@@ -2128,6 +2128,7 @@ func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
 			ps.CurAddr = udpAddr.String()
 		}
 	}
+	de.populateSCIONPathsLocked(ps)
 }
 
 // stopAndReset stops timers associated with de and resets its state back to zero.
