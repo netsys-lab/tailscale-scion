@@ -1794,6 +1794,8 @@ func (c *Conn) retrySCIONConnect() {
 	c.lastSCIONRecv.StoreAtomic(mono.Now())
 	c.logf("magicsock: SCION reconnect retry succeeded, local IA: %s", newSC.localIA)
 	c.rediscoverAllSCIONPaths()
+	c.discoverNewSCIONPeers()
+	c.ReSTUN("scion-connected")
 }
 
 // rediscoverAllSCIONPaths triggers path re-discovery for all endpoints that
@@ -1821,6 +1823,38 @@ func (c *Conn) rediscoverAllSCIONPaths() {
 
 	for _, p := range peers {
 		go p.ep.discoverSCIONPathAsync(p.peerIA, p.hostAddr)
+	}
+}
+
+// discoverNewSCIONPeers scans all known peers for SCION service advertisements
+// and triggers path discovery for any peers that don't yet have scionState.
+// Called after a successful SCION connect to handle the case where the netmap
+// was processed before SCION was available.
+func (c *Conn) discoverNewSCIONPeers() {
+	c.mu.Lock()
+	peers := c.peers
+	c.mu.Unlock()
+
+	for i := range peers.Len() {
+		peer := peers.At(i)
+		peerIA, hostAddr, ok := scionServiceFromPeer(peer)
+		if !ok {
+			continue
+		}
+		c.mu.Lock()
+		ep, ok := c.peerMap.endpointForNodeID(peer.ID())
+		c.mu.Unlock()
+		if !ok || ep == nil {
+			continue
+		}
+		ep.mu.Lock()
+		hasScionState := ep.scionState != nil
+		ep.mu.Unlock()
+		if hasScionState {
+			continue // already tracked by rediscoverAllSCIONPaths
+		}
+		c.logf("magicsock: SCION peer %s at %s, discovering paths (post-connect)...", peerIA, hostAddr)
+		go ep.discoverSCIONPathAsync(peerIA, hostAddr)
 	}
 }
 
