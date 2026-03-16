@@ -2713,7 +2713,7 @@ func (c *Conn) ReconfigureSCION(cfg SCIONConfig) {
 	c.closeSCIONLocked()
 	c.mu.Unlock()
 
-	c.retrySCIONConnect()
+	go c.retrySCIONConnect()
 }
 
 // SCIONStatus returns whether SCION is currently connected and the local IA.
