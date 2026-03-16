@@ -445,7 +445,7 @@ func TestConn(t *testing.T) {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
-				if ctx.Err() != nil {
+				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 					return
 				}
 				t.Errorf("s1.Accept: %v", err)
@@ -2598,7 +2598,7 @@ func buildDNSQuery(name string, srcIP netip.Addr) []byte {
 		0x00, 0x01, // QDCOUNT: 1
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ANCOUNT, NSCOUNT, ARCOUNT
 	}
-	for _, label := range strings.Split(name, ".") {
+	for label := range strings.SplitSeq(name, ".") {
 		dns = append(dns, byte(len(label)))
 		dns = append(dns, label...)
 	}
@@ -2631,6 +2631,10 @@ func TestDeps(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
 		GOARCH: "amd64",
+		BadDeps: map[string]string{
+			"golang.org/x/crypto/ssh":                       "tsnet should not depend on SSH",
+			"golang.org/x/crypto/ssh/internal/bcrypt_pbkdf": "tsnet should not depend on SSH",
+		},
 		OnDep: func(dep string) {
 			if strings.Contains(dep, "portlist") {
 				t.Errorf("unexpected dep: %q", dep)

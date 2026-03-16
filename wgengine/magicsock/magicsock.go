@@ -99,6 +99,13 @@ const (
 	PathSCION         Path = "scion"
 )
 
+// SCIONConfig holds runtime-configurable SCION parameters.
+type SCIONConfig struct {
+	Enabled      bool
+	BootstrapURL string
+	Prefer       bool
+}
+
 type pathLabel struct {
 	// Path indicates the path that the packet took:
 	// - direct_ipv4
@@ -170,10 +177,11 @@ type Conn struct {
 	derpActiveFunc         func()
 	idleFunc               func() time.Duration // nil means unknown
 	testOnlyPacketListener nettype.PacketListener
-	noteRecvActivity       func(key.NodePublic) // or nil, see Options.NoteRecvActivity
-	netMon                 *netmon.Monitor      // must be non-nil
-	health                 *health.Tracker      // or nil
-	controlKnobs           *controlknobs.Knobs  // or nil
+	noteRecvActivity       func(key.NodePublic)                   // or nil, see Options.NoteRecvActivity
+	onDERPRecv             func(int, key.NodePublic, []byte) bool // or nil, see Options.OnDERPRecv
+	netMon                 *netmon.Monitor                        // must be non-nil
+	health                 *health.Tracker                        // or nil
+	controlKnobs           *controlknobs.Knobs                    // or nil
 
 	// ================================================================
 	// No locking required to access these fields, either because
@@ -195,7 +203,9 @@ type Conn struct {
 	pconn6 RebindingUDPConn
 
 	// pconnSCION is the SCION connection, nil if SCION is not available.
-	pconnSCION *scionConn
+	// Accessed atomically from hot-path send/receive goroutines;
+	// writes happen under c.mu for higher-level coordination.
+	pconnSCION atomic.Pointer[scionConn]
 
 	receiveBatchPool sync.Pool
 
@@ -422,9 +432,10 @@ type Conn struct {
 	// scionPaths is the registry of SCION path information, keyed by
 	// scionPathKey. Each entry holds the full SCION address and path
 	// data for a peer.
-	scionPaths      map[scionPathKey]*scionPathInfo
-	scionPathsByAddr map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
-	scionPathSeq    atomic.Uint32                  // monotonic key generator for scionPaths
+	scionPaths         map[scionPathKey]*scionPathInfo
+	scionPathsByAddr   map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
+	scionPathSeq       atomic.Uint32                 // monotonic key generator for scionPaths
+	scionSoftRefreshAt map[scionIAKey]time.Time       // last soft refresh per peer, guarded by c.mu; bounded by unique peer count
 
 	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
 	// Used by receiveSCION to detect a dead socket and trigger reconnection.
@@ -516,6 +527,20 @@ type Options struct {
 	// DisablePortMapper, if true, disables the portmapper.
 	// This is primarily useful in tests.
 	DisablePortMapper bool
+
+	// ForceDiscoKey, if non-zero, forces the use of a specific disco
+	// private key. This should only be used for special cases and
+	// experiments, not for production. The recommended normal path is to
+	// leave it zero, in which case a new disco key is generated per
+	// Tailscale start and kept only in memory.
+	ForceDiscoKey key.DiscoPrivate
+
+	// OnDERPRecv, if non-nil, is called for every non-disco packet
+	// received from DERP before the peer map lookup. If it returns
+	// true, the packet is considered handled and is not passed to
+	// WireGuard. The pkt slice is borrowed and must be copied if
+	// the callee needs to retain it.
+	OnDERPRecv func(regionID int, src key.NodePublic, pkt []byte) bool
 }
 
 func (o *Options) logf() logger.Logf {
@@ -643,6 +668,9 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c := newConn(opts.logf())
+	if !opts.ForceDiscoKey.IsZero() {
+		c.discoAtomic.Set(opts.ForceDiscoKey)
+	}
 	c.eventBus = opts.EventBus
 	c.port.Store(uint32(opts.Port))
 	c.controlKnobs = opts.ControlKnobs
@@ -651,6 +679,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c.idleFunc = opts.IdleFunc
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
+	c.onDERPRecv = opts.OnDERPRecv
 
 	// Set up publishers and subscribers. Subscribe calls must return before
 	// NewConn otherwise published events can be missed.
@@ -1180,7 +1209,13 @@ func (c *Conn) Ping(peer tailcfg.NodeView, res *ipnstate.PingResult, size int, c
 func (c *Conn) populateCLIPingResponseLocked(res *ipnstate.PingResult, latency time.Duration, ep epAddr) {
 	res.LatencySeconds = latency.Seconds()
 	if ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
-		if ep.vni.IsSet() {
+		if ep.isSCION() {
+			if pi, ok := c.scionPaths[ep.scionKey]; ok {
+				res.Endpoint = pi.String()
+			} else {
+				res.Endpoint = ep.String()
+			}
+		} else if ep.vni.IsSet() {
 			res.PeerRelay = ep.String()
 		} else {
 			res.Endpoint = ep.String()
@@ -1508,8 +1543,7 @@ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool,
 		err = c.pconn4.WriteWireGuardBatchTo(buffs, addr, offset)
 	}
 	if err != nil {
-		var errGSO neterror.ErrUDPGSODisabled
-		if errors.As(err, &errGSO) {
+		if errGSO, ok := errors.AsType[neterror.ErrUDPGSODisabled](err); ok {
 			c.logf("magicsock: %s", errGSO.Error())
 			err = errGSO.RetryErr
 		} else {
@@ -3310,9 +3344,10 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 	if runtime.GOOS == "js" {
 		fns = []conn.ReceiveFunc{c.receiveDERP}
 	}
-	if c.pconnSCION != nil {
-		fns = append(fns, c.receiveSCION)
-	}
+	// Always register SCION receive funcs so they're available when
+	// SCION connects mid-session (e.g. via ReconfigureSCION from Android).
+	// receiveSCION handles nil pconnSCION by waiting and retrying.
+	fns = append(fns, c.receiveSCION, c.receiveSCIONShim)
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
 	return fns, c.LocalPort(), nil
@@ -3345,11 +3380,7 @@ func (c *connBind) Close() error {
 	if c.closeDisco6 != nil {
 		c.closeDisco6.Close()
 	}
-	if c.pconnSCION != nil {
-		// Set an immediate read deadline to unblock receiveSCION.
-		// We don't close the SCION socket here; Conn.Close handles that.
-		c.pconnSCION.conn.SetReadDeadline(time.Now())
-	}
+	c.closeSCIONBindLocked()
 	// Send an empty read result to unblock receiveDERP,
 	// which will then check connBind.Closed.
 	// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
@@ -3400,9 +3431,7 @@ func (c *Conn) Close() error {
 	// They will frequently have been closed already by a call to connBind.Close.
 	c.pconn6.Close()
 	c.pconn4.Close()
-	if c.pconnSCION != nil {
-		c.pconnSCION.close()
-	}
+	c.closeSCIONLocked()
 	if c.closeDisco4 != nil {
 		c.closeDisco4.Close()
 	}
@@ -3651,17 +3680,7 @@ func (c *Conn) rebind(curPortFate currentPortFate) error {
 	}
 	c.UpdatePMTUD()
 
-	// Try to set up SCION if not already connected.
-	if c.pconnSCION == nil {
-		sc, err := trySCIONConnect(c.connCtx)
-		if err != nil {
-			c.logf("magicsock: SCION not available: %v", err)
-		} else {
-			c.logf("magicsock: SCION available, local IA: %s", sc.localIA)
-			c.pconnSCION = sc
-			go c.refreshSCIONPaths()
-		}
-	}
+	c.initSCIONLocked(c.connCtx)
 
 	return nil
 }
@@ -4346,6 +4365,7 @@ func (c *Conn) HandleDiscoKeyAdvertisement(node tailcfg.NodeView, update packet.
 	// If the key did not change, count it and return.
 	if oldDiscoKey.Compare(discoKey) == 0 {
 		metricTSMPDiscoKeyAdvertisementUnchanged.Add(1)
+		c.logf("magicsock: disco key did not change for node %v", nodeKey.ShortString())
 		return
 	}
 	c.discoInfoForKnownPeerLocked(discoKey)
