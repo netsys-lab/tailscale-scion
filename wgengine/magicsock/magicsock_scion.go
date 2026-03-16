@@ -1515,12 +1515,25 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 // is always a raw *net.UDPConn).
 func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
 	sc := c.pconnSCION.Load()
-	if sc == nil || sc.shimXPC == nil {
-		// SCION not connected or no shim. Wait and retry.
+	if sc == nil {
+		// SCION not connected yet. Wait for mid-session connect.
 		select {
 		case <-c.donec:
 			return 0, net.ErrClosed
 		case <-time.After(5 * time.Second):
+		}
+		sc = c.pconnSCION.Load()
+		if sc == nil || sc.shimXPC == nil {
+			return 0, nil
+		}
+	} else if sc.shimXPC == nil {
+		// Connected but no dispatcher shim. shimXPC is immutable per
+		// scionConn, so poll infrequently — only a full reconnect
+		// (new scionConn) could create one.
+		select {
+		case <-c.donec:
+			return 0, net.ErrClosed
+		case <-time.After(30 * time.Second):
 		}
 		sc = c.pconnSCION.Load()
 		if sc == nil || sc.shimXPC == nil {
@@ -1548,11 +1561,12 @@ func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoi
 			continue
 		}
 		if sc.shimXPC == nil {
-			// Shim was not rebound after reconnection. Wait and retry.
+			// Shim was not created for this connection (immutable per scionConn).
+			// Poll infrequently — only a full reconnect could add one.
 			select {
 			case <-c.donec:
 				return 0, net.ErrClosed
-			case <-time.After(5 * time.Second):
+			case <-time.After(30 * time.Second):
 			}
 			continue
 		}
