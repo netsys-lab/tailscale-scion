@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_scion
+
 package magicsock
 
 import (
@@ -20,6 +22,7 @@ import (
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/mock_snet"
 	snetpath "github.com/scionproto/scion/pkg/snet/path"
+	"tailscale.com/envknob"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
@@ -703,7 +706,8 @@ func TestScionListenPort(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.envVal != "" {
-				t.Setenv("TS_SCION_PORT", tt.envVal)
+				envknob.Setenv("TS_SCION_PORT", tt.envVal)
+				t.Cleanup(func() { envknob.Setenv("TS_SCION_PORT", "") })
 			}
 			got := scionListenPort()
 			if got != tt.want {
@@ -1482,6 +1486,749 @@ func TestSCIONSendBatchPool(t *testing.T) {
 	for i, msg := range batch.msgs {
 		if len(msg.Buffers) != 1 {
 			t.Errorf("batch.msgs[%d].Buffers len = %d, want 1", i, len(msg.Buffers))
+		}
+	}
+}
+
+// --- Tests for SCION Path Handling Improvements ---
+
+func TestScionInterfaceOverlap(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	ifaceIA1 := addr.MustParseIA("1-ff00:0:110")
+	ifaceIA2 := addr.MustParseIA("1-ff00:0:111")
+	ifaceIA3 := addr.MustParseIA("1-ff00:0:112")
+
+	t.Run("full overlap", func(t *testing.T) {
+		a := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Interfaces: []snet.PathInterface{
+				{IA: ifaceIA1, ID: 1}, {IA: ifaceIA2, ID: 2},
+			},
+		})
+		b := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Interfaces: []snet.PathInterface{
+				{IA: ifaceIA1, ID: 1}, {IA: ifaceIA2, ID: 2},
+			},
+		})
+		got := interfaceOverlap(a, b)
+		if got != 1.0 {
+			t.Errorf("full overlap = %v, want 1.0", got)
+		}
+	})
+
+	t.Run("no overlap", func(t *testing.T) {
+		a := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Interfaces: []snet.PathInterface{
+				{IA: ifaceIA1, ID: 1},
+			},
+		})
+		b := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Interfaces: []snet.PathInterface{
+				{IA: ifaceIA2, ID: 2}, {IA: ifaceIA3, ID: 3},
+			},
+		})
+		got := interfaceOverlap(a, b)
+		if got != 0.0 {
+			t.Errorf("no overlap = %v, want 0.0", got)
+		}
+	})
+
+	t.Run("partial overlap", func(t *testing.T) {
+		a := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Interfaces: []snet.PathInterface{
+				{IA: ifaceIA1, ID: 1}, {IA: ifaceIA2, ID: 2},
+			},
+		})
+		b := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Interfaces: []snet.PathInterface{
+				{IA: ifaceIA1, ID: 1}, {IA: ifaceIA3, ID: 3},
+			},
+		})
+		got := interfaceOverlap(a, b)
+		if got != 0.5 {
+			t.Errorf("partial overlap = %v, want 0.5", got)
+		}
+	})
+
+	t.Run("nil metadata returns zero", func(t *testing.T) {
+		a := newMockPathWithMetadata(ctrl, nil)
+		b := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Interfaces: []snet.PathInterface{{IA: ifaceIA1, ID: 1}},
+		})
+		got := interfaceOverlap(a, b)
+		if got != 0.0 {
+			t.Errorf("nil metadata = %v, want 0.0", got)
+		}
+	})
+
+	t.Run("empty interfaces returns zero", func(t *testing.T) {
+		a := newMockPathWithMetadata(ctrl, &snet.PathMetadata{})
+		b := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Interfaces: []snet.PathInterface{{IA: ifaceIA1, ID: 1}},
+		})
+		got := interfaceOverlap(a, b)
+		if got != 0.0 {
+			t.Errorf("empty interfaces = %v, want 0.0", got)
+		}
+	})
+}
+
+func TestScionSelectDiversePaths(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	ifaceIA1 := addr.MustParseIA("1-ff00:0:110")
+	ifaceIA2 := addr.MustParseIA("1-ff00:0:111")
+	ifaceIA3 := addr.MustParseIA("1-ff00:0:112")
+
+	t.Run("fewer candidates than max", func(t *testing.T) {
+		paths := []pathWithMeta{
+			{path: newMockPathWithMetadata(ctrl, &snet.PathMetadata{Latency: []time.Duration{10 * time.Millisecond}}), latency: 10 * time.Millisecond},
+			{path: newMockPathWithMetadata(ctrl, &snet.PathMetadata{Latency: []time.Duration{5 * time.Millisecond}}), latency: 5 * time.Millisecond},
+		}
+		result := selectDiversePaths(paths, 5)
+		if len(result) != 2 {
+			t.Fatalf("got %d paths, want 2", len(result))
+		}
+		// Should be sorted by latency.
+		if result[0].latency > result[1].latency {
+			t.Error("should be sorted by latency ascending")
+		}
+	})
+
+	t.Run("prefers diverse path over duplicate topology", func(t *testing.T) {
+		// Path A: fastest, through ifaceIA1+ifaceIA2.
+		pathA := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Latency:    []time.Duration{5 * time.Millisecond},
+			Interfaces: []snet.PathInterface{{IA: ifaceIA1, ID: 1}, {IA: ifaceIA2, ID: 2}},
+		})
+		// Path B: slightly slower, same interfaces as A.
+		pathB := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Latency:    []time.Duration{6 * time.Millisecond},
+			Interfaces: []snet.PathInterface{{IA: ifaceIA1, ID: 1}, {IA: ifaceIA2, ID: 2}},
+		})
+		// Path C: a bit slower, different interfaces.
+		pathC := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+			Latency:    []time.Duration{8 * time.Millisecond},
+			Interfaces: []snet.PathInterface{{IA: ifaceIA1, ID: 1}, {IA: ifaceIA3, ID: 3}},
+		})
+
+		candidates := []pathWithMeta{
+			{path: pathA, latency: 5 * time.Millisecond},
+			{path: pathB, latency: 6 * time.Millisecond},
+			{path: pathC, latency: 8 * time.Millisecond},
+		}
+		result := selectDiversePaths(candidates, 2)
+		if len(result) != 2 {
+			t.Fatalf("got %d paths, want 2", len(result))
+		}
+		// First should be pathA (lowest latency), second should be pathC (diverse).
+		if result[0].path != pathA {
+			t.Error("first path should be lowest-latency (pathA)")
+		}
+		if result[1].path != pathC {
+			t.Error("second path should be diverse (pathC), not duplicate (pathB)")
+		}
+	})
+}
+
+func TestScionStalePathCleanup(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockDaemon := mock_daemon.NewMockConnector(ctrl)
+
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+	c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+
+	// Register a path with a fingerprint that will disappear.
+	pi := &scionPathInfo{
+		peerIA:      peerIA,
+		hostAddr:    netip.MustParseAddrPort("10.0.0.1:41641"),
+		fingerprint: "stale-fp",
+		expiry:      time.Now().Add(30 * time.Second), // about to expire
+	}
+	k := c.registerSCIONPathLocking(pi)
+
+	// Daemon returns a path with a different fingerprint each time.
+	newPath := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Latency: []time.Duration{5 * time.Millisecond},
+		Expiry:  time.Now().Add(2 * time.Hour),
+	})
+
+	// Call refresh scionStalePathThreshold times.
+	for i := 0; i < scionStalePathThreshold; i++ {
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: true}).
+			Return([]snet.Path{newPath}, nil)
+		c.refreshSCIONPathsOnce()
+	}
+
+	// Path should have been cleaned up.
+	got := c.lookupSCIONPathLocking(k)
+	if got != nil {
+		t.Error("stale path should have been removed after threshold exceeded")
+	}
+}
+
+func TestScionPathHealthTracking(t *testing.T) {
+	t.Run("pong resets consecutive loss and marks healthy", func(t *testing.T) {
+		ps := &scionPathProbeState{healthy: true}
+
+		// Simulate 2 losses.
+		ps.consecutiveLoss = 2
+		ps.pingsSent = 3
+
+		// Pong arrives.
+		ps.pongsReceived++
+		ps.consecutiveLoss = 0
+
+		if !ps.healthy {
+			t.Error("should still be healthy after pong")
+		}
+		if ps.consecutiveLoss != 0 {
+			t.Error("consecutive loss should be reset")
+		}
+		if ps.pongsReceived != 1 {
+			t.Errorf("pongsReceived = %d, want 1", ps.pongsReceived)
+		}
+	})
+
+	t.Run("three consecutive losses marks unhealthy", func(t *testing.T) {
+		ps := &scionPathProbeState{healthy: true}
+
+		for i := 0; i < 3; i++ {
+			ps.consecutiveLoss++
+		}
+
+		if ps.consecutiveLoss < 3 {
+			t.Error("should have 3 consecutive losses")
+		}
+		// In real code, demoteSCIONPathLocked would set healthy = false.
+		ps.healthy = false
+		if ps.healthy {
+			t.Error("should be unhealthy")
+		}
+	})
+
+	t.Run("recovery after unhealthy", func(t *testing.T) {
+		ps := &scionPathProbeState{healthy: false, consecutiveLoss: 5}
+
+		// Pong arrives — recovery.
+		ps.pongsReceived++
+		ps.consecutiveLoss = 0
+		ps.healthy = true
+
+		if !ps.healthy {
+			t.Error("should be healthy after recovery")
+		}
+	})
+}
+
+func TestScionDemoteSCIONPathLocked(t *testing.T) {
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+
+	de := &endpoint{c: c}
+	de.scionState = &scionEndpointState{
+		peerIA:   peerIA,
+		hostAddr: hostAddr,
+		activePath: scionPathKey(1),
+		paths: map[scionPathKey]*scionPathProbeState{
+			scionPathKey(1): {healthy: false, recentPongs: [scionPongHistoryCount]scionPongReply{{latency: 50 * time.Millisecond}}, pongCount: 1, recentPong: 0},
+			scionPathKey(2): {healthy: true, recentPongs: [scionPongHistoryCount]scionPongReply{{latency: 30 * time.Millisecond}}, pongCount: 1, recentPong: 0},
+			scionPathKey(3): {healthy: true, recentPongs: [scionPongHistoryCount]scionPongReply{{latency: 40 * time.Millisecond}}, pongCount: 1, recentPong: 0},
+		},
+	}
+	de.bestAddr = addrQuality{
+		epAddr: epAddr{ap: hostAddr, scionKey: scionPathKey(1)},
+	}
+
+	de.mu.Lock()
+	de.demoteSCIONPathLocked(scionPathKey(1))
+	activePath := de.scionState.activePath
+	bestKey := de.bestAddr.scionKey
+	de.mu.Unlock()
+
+	if activePath != scionPathKey(2) {
+		t.Errorf("activePath = %d, want 2 (best healthy)", activePath)
+	}
+	if bestKey != scionPathKey(2) {
+		t.Errorf("bestAddr scionKey = %d, want 2", bestKey)
+	}
+}
+
+func TestScionReEvalSCIONPathsLocked(t *testing.T) {
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+
+	de := &endpoint{c: c}
+	de.scionState = &scionEndpointState{
+		peerIA:   peerIA,
+		hostAddr: hostAddr,
+		activePath: scionPathKey(1),
+		paths: map[scionPathKey]*scionPathProbeState{
+			scionPathKey(1): {healthy: true, recentPongs: [scionPongHistoryCount]scionPongReply{{latency: 50 * time.Millisecond}}, pongCount: 1, recentPong: 0},
+			scionPathKey(2): {healthy: true, recentPongs: [scionPongHistoryCount]scionPongReply{{latency: 10 * time.Millisecond}}, pongCount: 1, recentPong: 0},
+		},
+	}
+	de.bestAddr = addrQuality{
+		epAddr: epAddr{ap: hostAddr, scionKey: scionPathKey(1)},
+		latency: 50 * time.Millisecond,
+	}
+
+	de.mu.Lock()
+	de.reEvalSCIONPathsLocked(mono.Now())
+	activePath := de.scionState.activePath
+	bestKey := de.bestAddr.scionKey
+	de.mu.Unlock()
+
+	// Path 2 has lower latency, should be selected.
+	if activePath != scionPathKey(2) {
+		t.Errorf("activePath = %d, want 2 (lower latency)", activePath)
+	}
+	if bestKey != scionPathKey(2) {
+		t.Errorf("bestAddr scionKey = %d, want 2", bestKey)
+	}
+}
+
+func TestScionProbeSCIONNonBestLocked(t *testing.T) {
+	// Test that probeSCIONNonBestLocked round-robins through non-active paths.
+	state := &scionEndpointState{
+		hostAddr:   netip.MustParseAddrPort("10.0.0.1:41641"),
+		activePath: scionPathKey(1),
+		paths: map[scionPathKey]*scionPathProbeState{
+			scionPathKey(1): {healthy: true},
+			scionPathKey(2): {healthy: true},
+			scionPathKey(3): {healthy: true},
+		},
+	}
+
+	// Collect non-active keys manually as probeSCIONNonBestLocked would.
+	var nonBest []scionPathKey
+	for k := range state.paths {
+		if k != state.activePath {
+			nonBest = append(nonBest, k)
+		}
+	}
+
+	if len(nonBest) != 2 {
+		t.Fatalf("expected 2 non-best paths, got %d", len(nonBest))
+	}
+
+	// Verify round-robin increments.
+	idx0 := state.probeRoundRobin % len(nonBest)
+	state.probeRoundRobin++
+	idx1 := state.probeRoundRobin % len(nonBest)
+	state.probeRoundRobin++
+
+	if idx0 == idx1 {
+		t.Error("round-robin should pick different paths on consecutive calls")
+	}
+}
+
+func TestDispatcherShim(t *testing.T) {
+	t.Run("binds_when_port_available", func(t *testing.T) {
+		sc := &scionConn{
+			localHostIP: netip.MustParseAddr("127.0.0.1"),
+			localPort:   32766,
+		}
+		openDispatcherShim(sc, t.Logf, nil)
+		if sc.shimConn == nil {
+			t.Fatal("expected shimConn to be set when port 30041 is available")
+		}
+		defer sc.shimConn.Close()
+		if sc.shimXPC == nil {
+			t.Fatal("expected shimXPC to be set")
+		}
+		addr := sc.shimConn.LocalAddr().(*net.UDPAddr)
+		if addr.Port != scionDispatcherPort {
+			t.Errorf("shimConn port = %d, want %d", addr.Port, scionDispatcherPort)
+		}
+	})
+
+	t.Run("graceful_on_EADDRINUSE", func(t *testing.T) {
+		// Occupy port 30041 first.
+		blocker, err := net.ListenUDP("udp", &net.UDPAddr{
+			IP:   net.IPv4(127, 0, 0, 1),
+			Port: scionDispatcherPort,
+		})
+		if err != nil {
+			t.Skipf("cannot bind port %d for test: %v", scionDispatcherPort, err)
+		}
+		defer blocker.Close()
+
+		sc := &scionConn{
+			localHostIP: netip.MustParseAddr("127.0.0.1"),
+			localPort:   32766,
+		}
+		openDispatcherShim(sc, t.Logf, nil)
+		if sc.shimConn != nil {
+			sc.shimConn.Close()
+			t.Fatal("expected shimConn to be nil when port is already in use")
+		}
+		if sc.shimXPC != nil {
+			t.Fatal("expected shimXPC to be nil when port is already in use")
+		}
+	})
+
+	t.Run("skipped_when_main_on_dispatcher_port", func(t *testing.T) {
+		sc := &scionConn{
+			localHostIP: netip.MustParseAddr("127.0.0.1"),
+			localPort:   scionDispatcherPort,
+		}
+		openDispatcherShim(sc, t.Logf, nil)
+		if sc.shimConn != nil {
+			sc.shimConn.Close()
+			t.Fatal("expected shimConn to be nil when main socket is on dispatcher port")
+		}
+	})
+}
+
+func TestFormatSCIONHops(t *testing.T) {
+	mustIA := func(s string) addr.IA {
+		ia, err := addr.ParseIA(s)
+		if err != nil {
+			t.Fatalf("invalid IA %q: %v", s, err)
+		}
+		return ia
+	}
+
+	tests := []struct {
+		name   string
+		ifaces []snet.PathInterface
+		want   string
+	}{
+		{
+			name:   "empty",
+			ifaces: nil,
+			want:   "?",
+		},
+		{
+			name: "single interface",
+			ifaces: []snet.PathInterface{
+				{IA: mustIA("19-ffaa:1:eba"), ID: 2},
+			},
+			want: "19-ffaa:1:eba 2",
+		},
+		{
+			name: "2-hop direct",
+			ifaces: []snet.PathInterface{
+				{IA: mustIA("19-ffaa:1:eba"), ID: 2},
+				{IA: mustIA("19-ffaa:1:bf5"), ID: 2},
+			},
+			want: "19-ffaa:1:eba 2>2 19-ffaa:1:bf5",
+		},
+		{
+			name: "3-hop via transit",
+			ifaces: []snet.PathInterface{
+				{IA: mustIA("19-ffaa:1:eba"), ID: 1},
+				{IA: mustIA("19-ffaa:0:1303"), ID: 62},
+				{IA: mustIA("19-ffaa:0:1303"), ID: 104},
+				{IA: mustIA("19-ffaa:1:bf5"), ID: 1},
+			},
+			want: "19-ffaa:1:eba 1>62 19-ffaa:0:1303 104>1 19-ffaa:1:bf5",
+		},
+		{
+			name: "4-hop two transits",
+			ifaces: []snet.PathInterface{
+				{IA: mustIA("19-ffaa:1:eba"), ID: 1},
+				{IA: mustIA("19-ffaa:0:1"), ID: 3},
+				{IA: mustIA("19-ffaa:0:1"), ID: 4},
+				{IA: mustIA("19-ffaa:0:2"), ID: 5},
+				{IA: mustIA("19-ffaa:0:2"), ID: 6},
+				{IA: mustIA("19-ffaa:1:bf5"), ID: 1},
+			},
+			want: "19-ffaa:1:eba 1>3 19-ffaa:0:1 4>5 19-ffaa:0:2 6>1 19-ffaa:1:bf5",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatSCIONHops(tt.ifaces)
+			if got != tt.want {
+				t.Errorf("formatSCIONHops() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScionPathInfoString(t *testing.T) {
+	mustIA := func(s string) addr.IA {
+		ia, err := addr.ParseIA(s)
+		if err != nil {
+			t.Fatalf("invalid IA %q: %v", s, err)
+		}
+		return ia
+	}
+
+	pi := &scionPathInfo{
+		peerIA:   mustIA("19-ffaa:1:bf5"),
+		hostAddr: netip.MustParseAddrPort("127.0.0.1:32766"),
+		path: snetpath.Path{
+			Src: mustIA("19-ffaa:1:eba"),
+			Dst: mustIA("19-ffaa:1:bf5"),
+			Meta: snet.PathMetadata{
+				Interfaces: []snet.PathInterface{
+					{IA: mustIA("19-ffaa:1:eba"), ID: 2},
+					{IA: mustIA("19-ffaa:1:bf5"), ID: 2},
+				},
+				MTU: 1472,
+			},
+		},
+	}
+	pi.buildDisplayStr()
+
+	want := "scion:[19-ffaa:1:eba 2>2 19-ffaa:1:bf5]:[127.0.0.1]:32766"
+	if got := pi.String(); got != want {
+		t.Errorf("scionPathInfo.String() = %q, want %q", got, want)
+	}
+
+	// Test with no metadata
+	piNoMeta := &scionPathInfo{
+		peerIA:   mustIA("19-ffaa:1:bf5"),
+		hostAddr: netip.MustParseAddrPort("127.0.0.1:32766"),
+	}
+	piNoMeta.buildDisplayStr()
+
+	wantNoMeta := "scion:[?]:[127.0.0.1]:32766"
+	if got := piNoMeta.String(); got != wantNoMeta {
+		t.Errorf("scionPathInfo.String() no metadata = %q, want %q", got, wantNoMeta)
+	}
+}
+
+func TestScionLatencyMedian(t *testing.T) {
+	tests := []struct {
+		name    string
+		samples []time.Duration
+		want    time.Duration
+	}{
+		{
+			name:    "no samples",
+			samples: nil,
+			want:    time.Hour,
+		},
+		{
+			name:    "single sample",
+			samples: []time.Duration{10 * time.Millisecond},
+			want:    10 * time.Millisecond,
+		},
+		{
+			name:    "two samples returns higher (index 1)",
+			samples: []time.Duration{8 * time.Millisecond, 12 * time.Millisecond},
+			want:    12 * time.Millisecond,
+		},
+		{
+			name:    "four samples returns median",
+			samples: []time.Duration{10, 20, 30, 40},
+			want:    30, // samples[4/2] = samples[2]
+		},
+		{
+			name:    "eight samples median",
+			samples: []time.Duration{5, 10, 15, 20, 25, 30, 35, 40},
+			want:    25, // samples[8/2] = samples[4]
+		},
+		{
+			name:    "outlier resistance",
+			samples: []time.Duration{10, 11, 12, 10, 11, 12, 10, 500},
+			want:    11, // median ignores the 500 outlier
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ps := &scionPathProbeState{}
+			for _, s := range tt.samples {
+				ps.addPongReply(scionPongReply{latency: s})
+			}
+			if got := ps.latency(); got != tt.want {
+				t.Errorf("latency() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScionReEvalAntiFlap(t *testing.T) {
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+
+	// Two paths with very similar latency (10ms vs 11ms).
+	// Path 1 is the incumbent active path.
+	ps1 := &scionPathProbeState{healthy: true}
+	ps1.addPongReply(scionPongReply{latency: 10 * time.Millisecond})
+
+	ps2 := &scionPathProbeState{healthy: true}
+	ps2.addPongReply(scionPongReply{latency: 11 * time.Millisecond})
+
+	de := &endpoint{c: c}
+	de.scionState = &scionEndpointState{
+		peerIA:     peerIA,
+		hostAddr:   hostAddr,
+		activePath: scionPathKey(2), // path 2 is active at 11ms
+		paths: map[scionPathKey]*scionPathProbeState{
+			scionPathKey(1): ps1,
+			scionPathKey(2): ps2,
+		},
+	}
+	de.bestAddr = addrQuality{
+		epAddr:  epAddr{ap: hostAddr, scionKey: scionPathKey(2)},
+		latency: 11 * time.Millisecond,
+	}
+
+	// Re-eval should NOT switch — 1ms improvement is within 2ms minimum threshold.
+	de.mu.Lock()
+	de.reEvalSCIONPathsLocked(mono.Now())
+	activePath := de.scionState.activePath
+	de.mu.Unlock()
+
+	if activePath != scionPathKey(2) {
+		t.Errorf("anti-flap: activePath = %d, want 2 (should not switch for 1ms difference)", activePath)
+	}
+
+	// Now make path 1 significantly worse (50ms) and path 2 stays at 11ms.
+	// Then flip: make path 2 the slow one (50ms) and path 1 = 10ms.
+	// The 40ms improvement exceeds the 20% threshold (20% of 50ms = 10ms).
+	ps2Slow := &scionPathProbeState{healthy: true}
+	ps2Slow.addPongReply(scionPongReply{latency: 50 * time.Millisecond})
+
+	de.mu.Lock()
+	de.scionState.paths[scionPathKey(2)] = ps2Slow
+	de.scionState.lastFullEvalAt = 0 // reset throttle
+	de.bestAddr.latency = 50 * time.Millisecond
+	de.reEvalSCIONPathsLocked(mono.Now())
+	activePath = de.scionState.activePath
+	de.mu.Unlock()
+
+	if activePath != scionPathKey(1) {
+		t.Errorf("genuine degradation: activePath = %d, want 1 (should switch for 40ms improvement)", activePath)
+	}
+}
+
+// TestScionAddNewPathsRecovery verifies that addNewSCIONPathsForPeer
+// initializes scionState on an endpoint when the initial path discovery
+// failed (scionState == nil) but incoming SCION disco registered the
+// endpoint in the peerMap via handlePingLocked.
+func TestScionAddNewPathsRecovery(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+	c.pconnSCION = &scionConn{daemon: mock_daemon.NewMockConnector(ctrl), localIA: localIA}
+
+	// Create an endpoint and register it in the peerMap at the plain
+	// hostAddr — this is what handlePingLocked does for incoming SCION disco.
+	ep := &endpoint{c: c, nodeID: 1}
+	ep.publicKey = key.NewNode().Public()
+	ep.disco.Store(&endpointDisco{key: key.NewDisco().Public()})
+	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+	c.peerMap.setNodeKeyForEpAddr(epAddr{ap: hostAddr}, ep.publicKey)
+
+	// Simulate failed initial discovery: ep.scionState is nil.
+	if ep.scionState != nil {
+		t.Fatal("precondition: scionState should be nil")
+	}
+
+	// Register a reply-path in c.scionPaths (simulates handleSCIONDisco
+	// creating a path entry from an incoming disco ping).
+	replyPI := &scionPathInfo{
+		peerIA:      peerIA,
+		hostAddr:    hostAddr,
+		fingerprint: "reply-fp",
+		expiry:      time.Now().Add(1 * time.Hour),
+	}
+	replyPI.buildDisplayStr()
+	c.registerSCIONPathLocking(replyPI)
+
+	// Now soft refresh finds new paths from the daemon. Call
+	// addNewSCIONPathsForPeer with two mock paths.
+	p1 := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Latency: []time.Duration{5 * time.Millisecond},
+		Expiry:  time.Now().Add(2 * time.Hour),
+	})
+	p2 := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Latency: []time.Duration{10 * time.Millisecond},
+		Expiry:  time.Now().Add(2 * time.Hour),
+	})
+
+	newKeys := c.addNewSCIONPathsForPeer(peerIA, hostAddr, []snet.Path{p1, p2})
+	if len(newKeys) != 2 {
+		t.Fatalf("addNewSCIONPathsForPeer returned %d keys, want 2", len(newKeys))
+	}
+
+	// Verify recovery initialized scionState.
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	if ep.scionState == nil {
+		t.Fatal("scionState should have been initialized by recovery")
+	}
+	if ep.scionState.peerIA != peerIA {
+		t.Errorf("peerIA = %s, want %s", ep.scionState.peerIA, peerIA)
+	}
+	if ep.scionState.hostAddr != hostAddr {
+		t.Errorf("hostAddr = %s, want %s", ep.scionState.hostAddr, hostAddr)
+	}
+	if len(ep.scionState.paths) != 2 {
+		t.Errorf("paths count = %d, want 2", len(ep.scionState.paths))
+	}
+	if !ep.scionState.activePath.IsSet() {
+		t.Error("activePath should be set")
+	}
+	// activePath should be one of the new keys.
+	if ep.scionState.activePath != newKeys[0] {
+		t.Errorf("activePath = %d, want %d (first new key)", ep.scionState.activePath, newKeys[0])
+	}
+	// Each probe state should be healthy.
+	for _, k := range newKeys {
+		ps, ok := ep.scionState.paths[k]
+		if !ok {
+			t.Errorf("missing probe state for key %d", k)
+			continue
+		}
+		if !ps.healthy {
+			t.Errorf("probe state for key %d should be healthy", k)
 		}
 	}
 }

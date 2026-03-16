@@ -235,6 +235,7 @@ var Features = map[FeatureTag]FeatureMeta{
 		Desc: "Linux systemd-resolved integration",
 		Deps: []FeatureTag{"dbus"},
 	},
+	"scion": {Sym: "SCION", Desc: "SCION network integration"},
 	"sdnotify": {
 		Sym:  "SDNotify",
 		Desc: "systemd notification support",
