@@ -14,7 +14,7 @@ import (
 // On success, stores the scionConn and starts the background path refresher.
 // c.mu must be held.
 func (c *Conn) initSCIONLocked(ctx context.Context) {
-	if c.pconnSCION != nil {
+	if c.pconnSCION.Load() != nil {
 		return
 	}
 	sc, err := trySCIONConnect(ctx, c.logf, c.netMon)
@@ -23,7 +23,7 @@ func (c *Conn) initSCIONLocked(ctx context.Context) {
 		return
 	}
 	c.logf("magicsock: SCION available, local IA: %s", sc.localIA)
-	c.pconnSCION = sc
+	c.pconnSCION.Store(sc)
 	go c.refreshSCIONPaths()
 }
 
@@ -31,9 +31,9 @@ func (c *Conn) initSCIONLocked(ctx context.Context) {
 // to nil so that receiveSCION and retrySCIONConnect see it as disconnected.
 // c.mu must be held.
 func (c *Conn) closeSCIONLocked() {
-	if c.pconnSCION != nil {
-		c.pconnSCION.close()
-		c.pconnSCION = nil
+	if sc := c.pconnSCION.Load(); sc != nil {
+		sc.close()
+		c.pconnSCION.Store(nil)
 	}
 }
 
@@ -41,13 +41,13 @@ func (c *Conn) closeSCIONLocked() {
 // to unblock receiveSCION, without closing it. Called from connBind.Close.
 // c.mu must be held (via connBind.mu).
 func (c *Conn) closeSCIONBindLocked() {
-	if c.pconnSCION != nil {
+	if sc := c.pconnSCION.Load(); sc != nil {
 		// Set an immediate read deadline to unblock receiveSCION.
 		// We don't close the SCION socket here; Conn.Close handles that.
-		c.pconnSCION.conn.SetReadDeadline(time.Now())
+		sc.conn.SetReadDeadline(time.Now())
 		// Also unblock the dispatcher shim's ReadBatch if present.
-		if c.pconnSCION.shimConn != nil {
-			c.pconnSCION.shimConn.SetReadDeadline(time.Now())
+		if sc.shimConn != nil {
+			sc.shimConn.SetReadDeadline(time.Now())
 		}
 	}
 }

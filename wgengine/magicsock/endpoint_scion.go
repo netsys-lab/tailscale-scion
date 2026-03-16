@@ -20,7 +20,7 @@ import (
 // paths, it probes non-best paths via round-robin.
 // de.mu must be held.
 func (de *endpoint) heartbeatSCIONLocked(now mono.Time) {
-	if de.scionState == nil || de.c.pconnSCION == nil {
+	if de.scionState == nil || de.c.pconnSCION.Load() == nil {
 		return
 	}
 	if !de.bestAddr.isSCION() {
@@ -51,7 +51,7 @@ func (de *endpoint) heartbeatSCIONLocked(now mono.Time) {
 // full discovery round. Returns true if SCION is available for this peer.
 // de.mu must be held.
 func (de *endpoint) sendDiscoPingsSCIONLocked(now mono.Time) bool {
-	if de.scionState == nil || de.c.pconnSCION == nil {
+	if de.scionState == nil || de.c.pconnSCION.Load() == nil {
 		return false
 	}
 	for pk, ps := range de.scionState.paths {
@@ -72,7 +72,7 @@ func (de *endpoint) sendDiscoPingsSCIONLocked(now mono.Time) bool {
 // cliPingSCIONLocked pings all SCION paths when the user runs "tailscale ping".
 // de.mu must be held.
 func (de *endpoint) cliPingSCIONLocked(now mono.Time, size int, resCB *pingResultAndCallback) {
-	if de.scionState == nil || de.c.pconnSCION == nil {
+	if de.scionState == nil || de.c.pconnSCION.Load() == nil {
 		return
 	}
 	for pk := range de.scionState.paths {
@@ -148,7 +148,7 @@ func (de *endpoint) updateFromNodeSCIONLocked(n tailcfg.NodeView) []scionPathKey
 		if de.scionState == nil || de.scionState.peerIA != peerIA || de.scionState.hostAddr != hostAddr {
 			// New or changed SCION address — discover paths asynchronously
 			// to avoid blocking updateFromNode (which holds the endpoint lock).
-			if de.c.pconnSCION != nil {
+			if de.c.pconnSCION.Load() != nil {
 				de.c.logf("magicsock: SCION peer %s at %s, discovering paths...", peerIA, hostAddr)
 				go de.discoverSCIONPathAsync(peerIA, hostAddr)
 			} else {

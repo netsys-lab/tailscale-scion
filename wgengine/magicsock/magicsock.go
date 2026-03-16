@@ -203,7 +203,9 @@ type Conn struct {
 	pconn6 RebindingUDPConn
 
 	// pconnSCION is the SCION connection, nil if SCION is not available.
-	pconnSCION *scionConn
+	// Accessed atomically from hot-path send/receive goroutines;
+	// writes happen under c.mu for higher-level coordination.
+	pconnSCION atomic.Pointer[scionConn]
 
 	receiveBatchPool sync.Pool
 

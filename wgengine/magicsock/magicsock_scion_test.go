@@ -753,7 +753,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 			Return([]snet.Path{slowPath, fastPath, mediumPath}, nil)
 
 		c := &Conn{}
-		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 		keys, err := c.discoverSCIONPaths(context.Background(), peerIA, hostAddr)
 		if err != nil {
@@ -790,7 +790,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 			Return(nil, nil)
 
 		c := &Conn{}
-		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 		_, err := c.discoverSCIONPaths(context.Background(), peerIA, hostAddr)
 		if err == nil {
@@ -803,7 +803,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 			Return(nil, fmt.Errorf("daemon unavailable"))
 
 		c := &Conn{}
-		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 		_, err := c.discoverSCIONPaths(context.Background(), peerIA, hostAddr)
 		if err == nil {
@@ -825,7 +825,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 			Return([]snet.Path{noMetaPath}, nil)
 
 		c := &Conn{}
-		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 		keys, err := c.discoverSCIONPaths(context.Background(), peerIA, hostAddr)
 		if err != nil {
@@ -868,7 +868,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			connCtx: ctx,
 		}
 		c.logf = t.Logf
-		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 		// Register a path that's about to expire (30s from now, within the 1-min refresh window).
 		pi := &scionPathInfo{
@@ -904,7 +904,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			connCtx: ctx,
 		}
 		c.logf = t.Logf
-		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 		// Register a path that's far from expiry.
 		pi := &scionPathInfo{
@@ -929,7 +929,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			connCtx: ctx,
 		}
 		c.logf = t.Logf
-		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 		oldPath := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
 			Latency: []time.Duration{10 * time.Millisecond},
@@ -977,7 +977,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			connCtx: ctx,
 		}
 		c.logf = t.Logf
-		c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 		pi := &scionPathInfo{
 			peerIA:   peerIA,
@@ -1083,7 +1083,7 @@ func TestNoteRecvActivitySCIONTrustRefresh(t *testing.T) {
 
 func TestSendSCIONBatchExpiredPath(t *testing.T) {
 	c := &Conn{}
-	c.pconnSCION = &scionConn{}
+	c.pconnSCION.Store(&scionConn{})
 
 	pi := &scionPathInfo{
 		peerIA:   addr.MustParseIA("1-ff00:0:111"),
@@ -1104,7 +1104,7 @@ func TestSendSCIONBatchExpiredPath(t *testing.T) {
 
 func TestSendSCIONExpiredPath(t *testing.T) {
 	c := &Conn{}
-	c.pconnSCION = &scionConn{}
+	c.pconnSCION.Store(&scionConn{})
 
 	pi := &scionPathInfo{
 		peerIA:   addr.MustParseIA("1-ff00:0:111"),
@@ -1646,7 +1646,7 @@ func TestScionStalePathCleanup(t *testing.T) {
 		peerMap: newPeerMap(),
 	}
 	c.logf = t.Logf
-	c.pconnSCION = &scionConn{daemon: mockDaemon, localIA: localIA}
+	c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
 
 	// Register a path with a fingerprint that will disappear.
 	pi := &scionPathInfo{
@@ -2155,7 +2155,7 @@ func TestScionAddNewPathsRecovery(t *testing.T) {
 		peerMap: newPeerMap(),
 	}
 	c.logf = t.Logf
-	c.pconnSCION = &scionConn{daemon: mock_daemon.NewMockConnector(ctrl), localIA: localIA}
+	c.pconnSCION.Store(&scionConn{daemon: mock_daemon.NewMockConnector(ctrl), localIA: localIA})
 
 	// Create an endpoint and register it in the peerMap at the plain
 	// hostAddr — this is what handlePingLocked does for incoming SCION disco.

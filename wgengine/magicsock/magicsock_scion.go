@@ -1111,7 +1111,7 @@ func parseSCIONServiceAddr(description string, port uint16) (ia addr.IA, hostAdd
 // sendmmsg in a single syscall. Otherwise, falls back to snet.Conn.WriteTo
 // per packet.
 func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil {
 		return false, errNoSCION
 	}
@@ -1226,7 +1226,7 @@ func (c *Conn) sendSCIONBatchFast(sc *scionConn, fp *scionFastPath, buffs [][]by
 
 // sendSCION sends a single packet over SCION, used for disco messages.
 func (c *Conn) sendSCION(sk scionPathKey, b []byte) (bool, error) {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil {
 		return false, errNoSCION
 	}
@@ -1368,7 +1368,7 @@ func (c *Conn) scionPathString(key scionPathKey) string {
 // recvmmsg and parsed with lightweight slayers.SCION decoding. Otherwise,
 // falls back to single-packet snet.Conn.ReadFrom.
 func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil {
 		// SCION not connected yet. Wait and retry instead of blocking
 		// forever, so that mid-session SCION connections (e.g. from
@@ -1378,7 +1378,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 			return 0, net.ErrClosed
 		case <-time.After(5 * time.Second):
 		}
-		sc = c.pconnSCION
+		sc = c.pconnSCION.Load()
 		if sc == nil {
 			return 0, nil // return zero to let WireGuard call us again
 		}
@@ -1393,7 +1393,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		}
 
 		// Re-read pconnSCION — it may have been swapped by reconnectSCION.
-		sc = c.pconnSCION
+		sc = c.pconnSCION.Load()
 		if sc == nil {
 			// Socket was closed and reconnection failed. Retry.
 			select {
@@ -1514,7 +1514,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 // the main socket's responsibility) and has no slow-path fallback (the shim
 // is always a raw *net.UDPConn).
 func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil || sc.shimXPC == nil {
 		// SCION not connected or no shim. Wait and retry.
 		select {
@@ -1522,7 +1522,7 @@ func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoi
 			return 0, net.ErrClosed
 		case <-time.After(5 * time.Second):
 		}
-		sc = c.pconnSCION
+		sc = c.pconnSCION.Load()
 		if sc == nil || sc.shimXPC == nil {
 			return 0, nil
 		}
@@ -1536,7 +1536,7 @@ func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoi
 		}
 
 		// Re-read pconnSCION — it may have been swapped by reconnectSCION.
-		sc = c.pconnSCION
+		sc = c.pconnSCION.Load()
 		if sc == nil {
 			// Main socket reconnection in progress. Wait and retry;
 			// the reconnect may or may not rebind port 30041.
@@ -1698,7 +1698,7 @@ func isTimeoutError(err error) bool {
 // still responsive. For the embedded connector this is trivial (field read);
 // for external daemons it's a gRPC call confirming the process is alive.
 func (c *Conn) scionDaemonAlive() bool {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil || sc.daemon == nil {
 		return false
 	}
@@ -1713,7 +1713,7 @@ func (c *Conn) scionDaemonAlive() bool {
 // finishSCIONConnect to create a new socket with the existing connector.
 // Returns true on success.
 func (c *Conn) reconnectSCIONSocket() bool {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil {
 		return false
 	}
@@ -1723,7 +1723,7 @@ func (c *Conn) reconnectSCIONSocket() bool {
 
 	// Close socket, release the port for rebinding.
 	sc.closeSocket()
-	c.pconnSCION = nil
+	c.pconnSCION.Store(nil)
 
 	newSC, err := finishSCIONConnect(c.connCtx, savedDaemon, savedTopo, c.logf, c.netMon)
 	if err != nil {
@@ -1731,7 +1731,7 @@ func (c *Conn) reconnectSCIONSocket() bool {
 		return false
 	}
 
-	c.pconnSCION = newSC
+	c.pconnSCION.Store(newSC)
 	c.logf("magicsock: SCION socket-only reconnect succeeded, local IA: %s", newSC.localIA)
 	return true
 }
@@ -1756,7 +1756,7 @@ func (c *Conn) reconnectSCION() {
 
 	// Tier 2: full bootstrap.
 	c.logf("magicsock: SCION doing full bootstrap reconnect")
-	oldSC := c.pconnSCION
+	oldSC := c.pconnSCION.Load()
 
 	// Close old connection first — we must release the port before binding
 	// the new socket. When TS_SCION_PORT is set, both sockets would try
@@ -1766,7 +1766,7 @@ func (c *Conn) reconnectSCION() {
 	if oldSC != nil {
 		oldSC.close()
 	}
-	c.pconnSCION = nil
+	c.pconnSCION.Store(nil)
 
 	newSC, err := trySCIONConnect(c.connCtx, c.logf, c.netMon)
 	if err != nil {
@@ -1774,7 +1774,7 @@ func (c *Conn) reconnectSCION() {
 		return
 	}
 
-	c.pconnSCION = newSC
+	c.pconnSCION.Store(newSC)
 	c.logf("magicsock: SCION reconnected successfully, local IA: %s", newSC.localIA)
 	c.rediscoverAllSCIONPaths()
 }
@@ -1782,7 +1782,7 @@ func (c *Conn) reconnectSCION() {
 // retrySCIONConnect attempts to re-establish a SCION connection when
 // pconnSCION is nil (previous reconnect attempt failed).
 func (c *Conn) retrySCIONConnect() {
-	if c.pconnSCION != nil {
+	if c.pconnSCION.Load() != nil {
 		return // another goroutine beat us to it
 	}
 	newSC, err := trySCIONConnect(c.connCtx, c.logf, c.netMon)
@@ -1790,7 +1790,7 @@ func (c *Conn) retrySCIONConnect() {
 		c.logf("magicsock: SCION reconnect retry failed: %v", err)
 		return
 	}
-	c.pconnSCION = newSC
+	c.pconnSCION.Store(newSC)
 	c.lastSCIONRecv.StoreAtomic(mono.Now())
 	c.logf("magicsock: SCION reconnect retry succeeded, local IA: %s", newSC.localIA)
 	c.rediscoverAllSCIONPaths()
@@ -1863,7 +1863,7 @@ func (c *Conn) discoverNewSCIONPeers() {
 // in the path registry. Returns the scionPathKeys for the registered paths
 // (first element is the lowest-latency path).
 func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr netip.AddrPort) ([]scionPathKey, error) {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil {
 		return nil, errNoSCION
 	}
@@ -1922,7 +1922,7 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		}
 		pi.buildCachedDst()
 		pi.buildDisplayStr()
-		if sc := c.pconnSCION; sc != nil {
+		if sc := c.pconnSCION.Load(); sc != nil {
 			pi.fastPath = buildSCIONFastPath(sc, pi)
 		}
 		keys = append(keys, c.registerSCIONPath(pi))
@@ -2119,7 +2119,7 @@ func (c *Conn) refreshSCIONPaths() {
 }
 
 func (c *Conn) refreshSCIONPathsOnce() error {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil {
 		return nil
 	}
@@ -2348,7 +2348,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 // to the corresponding endpoint. Called during soft refresh when new paths
 // appear in the daemon's cache. Returns the registered path keys.
 func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, paths []snet.Path) []scionPathKey {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil {
 		return nil
 	}
@@ -2521,7 +2521,7 @@ func scionServiceFromPeer(n tailcfg.NodeView) (ia addr.IA, hostAddr netip.AddrPo
 // SCIONService returns the SCION service entry to advertise in Hostinfo,
 // or ok=false if SCION is not available.
 func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) {
-	sc := c.pconnSCION
+	sc := c.pconnSCION.Load()
 	if sc == nil {
 		return tailcfg.Service{}, false
 	}
@@ -2718,19 +2718,18 @@ func (c *Conn) ReconfigureSCION(cfg SCIONConfig) {
 
 // SCIONStatus returns whether SCION is currently connected and the local IA.
 func (c *Conn) SCIONStatus() (connected bool, localIA string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.pconnSCION == nil {
+	sc := c.pconnSCION.Load()
+	if sc == nil {
 		return false, ""
 	}
-	return true, c.pconnSCION.localIA.String()
+	return true, sc.localIA.String()
 }
 
 // populateSCIONPathsLocked fills ps.SCIONPaths from de.scionState.
 // de.mu must be held. c.mu must be held (caller is Conn.UpdateStatus).
 func (de *endpoint) populateSCIONPathsLocked(ps *ipnstate.PeerStatus) {
 	// Don't report paths if SCION is disconnected - they're stale.
-	if de.c.pconnSCION == nil {
+	if de.c.pconnSCION.Load() == nil {
 		return
 	}
 	ss := de.scionState
