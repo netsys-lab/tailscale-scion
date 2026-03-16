@@ -11,6 +11,8 @@ jobs:
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -19,6 +21,8 @@ jobs:
           eval $(go run ./cmd/mkversion)
           echo "Version: $VERSION_LONG"
       - name: Build packages
+        env:
+          TS_USE_TOOLCHAIN: 0
         run: |
           go run ./cmd/dist build \
             "linux/${{ matrix.goarch }}/tgz" \
