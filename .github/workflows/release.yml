@@ -19,9 +19,6 @@ jobs:
           eval $(go run ./cmd/mkversion)
           echo "Version: $VERSION_LONG"
       - name: Build packages
-        env:
-          CGO_ENABLED: 0
-          GOARCH: ${{ matrix.goarch }}
         run: |
           go run ./cmd/dist build \
             "linux/${{ matrix.goarch }}/tgz" \
