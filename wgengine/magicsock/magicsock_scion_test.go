@@ -5,6 +5,7 @@ package magicsock
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -18,6 +19,7 @@ import (
 	"github.com/scionproto/scion/pkg/daemon/mock_daemon"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/mock_snet"
+	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
@@ -1113,5 +1115,373 @@ func TestSendSCIONExpiredPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "expired") {
 		t.Errorf("error should mention 'expired', got: %v", err)
+	}
+}
+
+// TestSCIONPseudoHeaderPartial verifies the partial checksum computation
+// matches the reference SCION implementation for known inputs.
+func TestSCIONPseudoHeaderPartial(t *testing.T) {
+	srcIA := addr.MustParseIA("1-ff00:0:110")
+	dstIA := addr.MustParseIA("1-ff00:0:111")
+	srcIP := netip.MustParseAddr("127.0.0.1")
+	dstIP := netip.MustParseAddr("127.0.0.1")
+
+	partial := scionPseudoHeaderPartial(srcIA, dstIA, srcIP, dstIP)
+
+	// Verify by computing the same checksum manually:
+	// srcIA = 0x0001ff0000000110, dstIA = 0x0001ff0000000111
+	// srcAddr = 127.0.0.1 = [0x7f, 0x00, 0x00, 0x01]
+	// dstAddr = 127.0.0.1 = [0x7f, 0x00, 0x00, 0x01]
+	// protocol = 17
+
+	var expected uint32
+	// srcIA bytes: 00 01 ff 00 00 00 01 10
+	expected += 0x0001 + 0xff00 + 0x0000 + 0x0110
+	// dstIA bytes: 00 01 ff 00 00 00 01 11
+	expected += 0x0001 + 0xff00 + 0x0000 + 0x0111
+	// srcAddr: 7f 00 00 01
+	expected += 0x7f00 + 0x0001
+	// dstAddr: 7f 00 00 01
+	expected += 0x7f00 + 0x0001
+	// protocol
+	expected += 17
+
+	if partial != expected {
+		t.Errorf("scionPseudoHeaderPartial = %d, want %d", partial, expected)
+	}
+}
+
+// TestSCIONPseudoHeaderPartialIPv6 verifies checksum with IPv6 addresses.
+func TestSCIONPseudoHeaderPartialIPv6(t *testing.T) {
+	srcIA := addr.MustParseIA("1-ff00:0:110")
+	dstIA := addr.MustParseIA("1-ff00:0:111")
+	srcIP := netip.MustParseAddr("::1")
+	dstIP := netip.MustParseAddr("fd00::1")
+
+	partial := scionPseudoHeaderPartial(srcIA, dstIA, srcIP, dstIP)
+	if partial == 0 {
+		t.Fatal("checksum should not be zero")
+	}
+
+	// Verify IPv6 addrs are 16 bytes each.
+	// ::1 = 00...01, fd00::1 = fd 00 00...01
+	var expected uint32
+	// IAs
+	expected += 0x0001 + 0xff00 + 0x0000 + 0x0110
+	expected += 0x0001 + 0xff00 + 0x0000 + 0x0111
+	// srcIP ::1 = all zeros except last byte
+	expected += 0x0001
+	// dstIP fd00::1
+	expected += 0xfd00 + 0x0001
+	expected += 17
+
+	if partial != expected {
+		t.Errorf("scionPseudoHeaderPartial(IPv6) = %d, want %d", partial, expected)
+	}
+}
+
+// TestSCIONFinishChecksum verifies the full checksum computation matches
+// the reference SCION implementation by comparing against a packet
+// serialized with snet.Packet.Serialize().
+func TestSCIONFinishChecksum(t *testing.T) {
+	srcIA := addr.MustParseIA("1-ff00:0:110")
+	dstIA := addr.MustParseIA("1-ff00:0:111")
+	srcIP := netip.MustParseAddr("127.0.0.1")
+	dstIP := netip.MustParseAddr("127.0.0.1")
+	srcPort := uint16(32766)
+	dstPort := uint16(32766)
+	payload := []byte("Hello, SCION fast path!")
+
+	// Build the packet using snet's reference serializer.
+	pkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: snet.SCIONAddress{IA: dstIA, Host: addr.HostIP(dstIP)},
+			Source:      snet.SCIONAddress{IA: srcIA, Host: addr.HostIP(srcIP)},
+			Path:        snetpath.Empty{},
+			Payload: snet.UDPPayload{
+				SrcPort: srcPort,
+				DstPort: dstPort,
+				Payload: payload,
+			},
+		},
+	}
+	if err := pkt.Serialize(); err != nil {
+		t.Fatalf("snet.Packet.Serialize: %v", err)
+	}
+
+	// Extract the reference checksum from the serialized packet.
+	// The UDP header is the last 8 bytes before the payload.
+	udpOffset := len(pkt.Bytes) - 8 - len(payload)
+	refChecksum := binary.BigEndian.Uint16(pkt.Bytes[udpOffset+6:])
+
+	// Now compute it using our fast-path functions.
+	partial := scionPseudoHeaderPartial(srcIA, dstIA, srcIP, dstIP)
+
+	// Build the upper layer: UDP header (8 bytes) + payload
+	upperLayer := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint16(upperLayer[0:], srcPort)
+	binary.BigEndian.PutUint16(upperLayer[2:], dstPort)
+	binary.BigEndian.PutUint16(upperLayer[4:], uint16(8+len(payload)))
+	// checksum field = 0 for computation
+	copy(upperLayer[8:], payload)
+
+	fastChecksum := scionFinishChecksum(partial, upperLayer)
+
+	if fastChecksum != refChecksum {
+		t.Errorf("fast-path checksum = 0x%04x, reference = 0x%04x", fastChecksum, refChecksum)
+	}
+}
+
+// TestSCIONFinishChecksumEmptyPayload verifies checksum with empty payload.
+func TestSCIONFinishChecksumEmptyPayload(t *testing.T) {
+	srcIA := addr.MustParseIA("1-ff00:0:110")
+	dstIA := addr.MustParseIA("1-ff00:0:111")
+	srcIP := netip.MustParseAddr("127.0.0.1")
+	dstIP := netip.MustParseAddr("127.0.0.1")
+
+	pkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: snet.SCIONAddress{IA: dstIA, Host: addr.HostIP(dstIP)},
+			Source:      snet.SCIONAddress{IA: srcIA, Host: addr.HostIP(srcIP)},
+			Path:        snetpath.Empty{},
+			Payload: snet.UDPPayload{
+				SrcPort: 1000,
+				DstPort: 2000,
+				Payload: nil,
+			},
+		},
+	}
+	if err := pkt.Serialize(); err != nil {
+		t.Fatalf("snet.Packet.Serialize: %v", err)
+	}
+
+	// UDP header is the last 8 bytes (no payload).
+	udpOffset := len(pkt.Bytes) - 8
+	refChecksum := binary.BigEndian.Uint16(pkt.Bytes[udpOffset+6:])
+
+	partial := scionPseudoHeaderPartial(srcIA, dstIA, srcIP, dstIP)
+	upperLayer := make([]byte, 8)
+	binary.BigEndian.PutUint16(upperLayer[0:], 1000)
+	binary.BigEndian.PutUint16(upperLayer[2:], 2000)
+	binary.BigEndian.PutUint16(upperLayer[4:], 8)
+
+	fastChecksum := scionFinishChecksum(partial, upperLayer)
+
+	if fastChecksum != refChecksum {
+		t.Errorf("fast-path checksum (empty) = 0x%04x, reference = 0x%04x", fastChecksum, refChecksum)
+	}
+}
+
+// TestSCIONFinishChecksumOddPayload verifies correct handling of odd-length payloads.
+func TestSCIONFinishChecksumOddPayload(t *testing.T) {
+	srcIA := addr.MustParseIA("1-ff00:0:110")
+	dstIA := addr.MustParseIA("1-ff00:0:111")
+	srcIP := netip.MustParseAddr("127.0.0.1")
+	dstIP := netip.MustParseAddr("10.0.0.1")
+	payload := []byte("ABC") // 3 bytes, odd
+
+	pkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: snet.SCIONAddress{IA: dstIA, Host: addr.HostIP(dstIP)},
+			Source:      snet.SCIONAddress{IA: srcIA, Host: addr.HostIP(srcIP)},
+			Path:        snetpath.Empty{},
+			Payload: snet.UDPPayload{
+				SrcPort: 5000,
+				DstPort: 6000,
+				Payload: payload,
+			},
+		},
+	}
+	if err := pkt.Serialize(); err != nil {
+		t.Fatalf("snet.Packet.Serialize: %v", err)
+	}
+
+	udpOffset := len(pkt.Bytes) - 8 - len(payload)
+	refChecksum := binary.BigEndian.Uint16(pkt.Bytes[udpOffset+6:])
+
+	partial := scionPseudoHeaderPartial(srcIA, dstIA, srcIP, dstIP)
+	upperLayer := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint16(upperLayer[0:], 5000)
+	binary.BigEndian.PutUint16(upperLayer[2:], 6000)
+	binary.BigEndian.PutUint16(upperLayer[4:], uint16(8+len(payload)))
+	copy(upperLayer[8:], payload)
+
+	fastChecksum := scionFinishChecksum(partial, upperLayer)
+
+	if fastChecksum != refChecksum {
+		t.Errorf("fast-path checksum (odd) = 0x%04x, reference = 0x%04x", fastChecksum, refChecksum)
+	}
+}
+
+// TestBuildSCIONFastPath verifies that buildSCIONFastPath produces a template
+// that matches the reference serializer output for the same parameters.
+func TestBuildSCIONFastPath(t *testing.T) {
+	srcIA := addr.MustParseIA("1-ff00:0:110")
+	dstIA := addr.MustParseIA("1-ff00:0:111")
+	srcIP := netip.MustParseAddr("127.0.0.1")
+	dstIP := netip.MustParseAddr("127.0.0.1")
+	srcPort := uint16(32766)
+	dstPort := uint16(32766)
+
+	sc := &scionConn{
+		underlayConn: &net.UDPConn{}, // non-nil to enable fast path
+		localIA:      srcIA,
+		localHostIP:  srcIP,
+		localPort:    srcPort,
+	}
+
+	pi := &scionPathInfo{
+		peerIA:   dstIA,
+		hostAddr: netip.MustParseAddrPort("127.0.0.1:32766"),
+		cachedDst: &snet.UDPAddr{
+			IA:      dstIA,
+			Host:    &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(dstPort)},
+			Path:    snetpath.Empty{},
+			NextHop: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 30041},
+		},
+	}
+
+	fp := buildSCIONFastPath(sc, pi)
+	if fp == nil {
+		t.Fatal("buildSCIONFastPath returned nil")
+	}
+
+	// The template should match a reference packet with empty payload.
+	refPkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: snet.SCIONAddress{IA: dstIA, Host: addr.HostIP(dstIP)},
+			Source:      snet.SCIONAddress{IA: srcIA, Host: addr.HostIP(srcIP)},
+			Path:        snetpath.Empty{},
+			Payload: snet.UDPPayload{
+				SrcPort: srcPort,
+				DstPort: dstPort,
+				Payload: nil,
+			},
+		},
+	}
+	if err := refPkt.Serialize(); err != nil {
+		t.Fatalf("reference Serialize: %v", err)
+	}
+
+	if len(fp.hdr) != len(refPkt.Bytes) {
+		t.Fatalf("fast-path header len = %d, reference = %d", len(fp.hdr), len(refPkt.Bytes))
+	}
+
+	// Compare header bytes (everything except checksum which may differ
+	// due to computation order, but should be the same for empty payload).
+	for i := range fp.hdr {
+		if fp.hdr[i] != refPkt.Bytes[i] {
+			t.Errorf("byte %d: fast-path=0x%02x, reference=0x%02x", i, fp.hdr[i], refPkt.Bytes[i])
+		}
+	}
+
+	if fp.udpOffset != len(fp.hdr)-8 {
+		t.Errorf("udpOffset = %d, expected %d", fp.udpOffset, len(fp.hdr)-8)
+	}
+
+	if fp.nextHop == nil {
+		t.Error("nextHop should not be nil")
+	}
+}
+
+// TestSCIONFastPathPacketMatchesReference verifies that a packet built with
+// the fast-path template+patching produces identical bytes to one built with
+// snet.Packet.Serialize().
+func TestSCIONFastPathPacketMatchesReference(t *testing.T) {
+	srcIA := addr.MustParseIA("1-ff00:0:110")
+	dstIA := addr.MustParseIA("1-ff00:0:111")
+	srcIP := netip.MustParseAddr("127.0.0.1")
+	dstIP := netip.MustParseAddr("127.0.0.1")
+	srcPort := uint16(32766)
+	dstPort := uint16(32766)
+	payload := []byte("WireGuard test payload data for SCION fast path verification")
+
+	sc := &scionConn{
+		underlayConn: &net.UDPConn{},
+		localIA:      srcIA,
+		localHostIP:  srcIP,
+		localPort:    srcPort,
+	}
+
+	pi := &scionPathInfo{
+		peerIA:   dstIA,
+		hostAddr: netip.MustParseAddrPort("127.0.0.1:32766"),
+		cachedDst: &snet.UDPAddr{
+			IA:      dstIA,
+			Host:    &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(dstPort)},
+			Path:    snetpath.Empty{},
+			NextHop: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 30041},
+		},
+	}
+
+	fp := buildSCIONFastPath(sc, pi)
+	if fp == nil {
+		t.Fatal("buildSCIONFastPath returned nil")
+	}
+
+	// Build packet using fast-path template + patching.
+	hdrLen := len(fp.hdr)
+	pktLen := hdrLen + len(payload)
+	buf := make([]byte, pktLen)
+	copy(buf, fp.hdr)
+	copy(buf[hdrLen:], payload)
+
+	udpTotalLen := uint16(8 + len(payload))
+	binary.BigEndian.PutUint16(buf[6:], udpTotalLen)
+	binary.BigEndian.PutUint16(buf[fp.udpOffset+4:], udpTotalLen)
+	buf[fp.udpOffset+6] = 0
+	buf[fp.udpOffset+7] = 0
+	upperLayer := buf[fp.udpOffset:pktLen]
+	csum := scionFinishChecksum(fp.pseudoCsum, upperLayer)
+	binary.BigEndian.PutUint16(buf[fp.udpOffset+6:], csum)
+
+	// Build reference packet using snet.
+	refPkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: snet.SCIONAddress{IA: dstIA, Host: addr.HostIP(dstIP)},
+			Source:      snet.SCIONAddress{IA: srcIA, Host: addr.HostIP(srcIP)},
+			Path:        snetpath.Empty{},
+			Payload: snet.UDPPayload{
+				SrcPort: srcPort,
+				DstPort: dstPort,
+				Payload: payload,
+			},
+		},
+	}
+	if err := refPkt.Serialize(); err != nil {
+		t.Fatalf("reference Serialize: %v", err)
+	}
+
+	if len(buf) != len(refPkt.Bytes) {
+		t.Fatalf("fast-path pkt len = %d, reference = %d", len(buf), len(refPkt.Bytes))
+	}
+
+	for i := range buf {
+		if buf[i] != refPkt.Bytes[i] {
+			t.Errorf("byte %d: fast-path=0x%02x, reference=0x%02x", i, buf[i], refPkt.Bytes[i])
+		}
+	}
+}
+
+// TestSCIONSendBatchPool verifies the pool returns usable batches.
+func TestSCIONSendBatchPool(t *testing.T) {
+	batch := scionSendBatchPool.Get().(*scionSendBatch)
+	defer scionSendBatchPool.Put(batch)
+
+	if len(batch.bufs) != scionMaxBatchSize {
+		t.Errorf("batch.bufs len = %d, want %d", len(batch.bufs), scionMaxBatchSize)
+	}
+	if len(batch.msgs) != scionMaxBatchSize {
+		t.Errorf("batch.msgs len = %d, want %d", len(batch.msgs), scionMaxBatchSize)
+	}
+	for i, buf := range batch.bufs {
+		if cap(buf) < 1500 {
+			t.Errorf("batch.bufs[%d] cap = %d, want >= 1500", i, cap(buf))
+		}
+	}
+	for i, msg := range batch.msgs {
+		if len(msg.Buffers) != 1 {
+			t.Errorf("batch.msgs[%d].Buffers len = %d, want 1", i, len(msg.Buffers))
+		}
 	}
 }
