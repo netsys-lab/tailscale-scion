@@ -323,10 +323,11 @@ func (b *Build) Command(dir, cmd string, args ...string) *Command {
 		ret.Cmd.Stdout = &ret.Output
 		ret.Cmd.Stderr = &ret.Output
 	}
-	// Don't force gocross — it's opt-in since 2025-06-16 and causes
-	// "no matching files" errors in CI when building deb/rpm packages.
-	// The Tailscale Go toolchain (tool/go) works fine without it.
-	ret.Cmd.Env = append(os.Environ(), "TS_USE_GOCROSS=0")
+	// dist always wants to use gocross if any Go is involved.
+	// Suppress bash debug traces (set -x) from tool/go in CI, because
+	// GoPkg() uses CombinedOutput() and set -x pollutes stdout+stderr,
+	// causing "no matching files" errors when building deb/rpm packages.
+	ret.Cmd.Env = append(os.Environ(), "TS_USE_GOCROSS=1", "NOBASHDEBUG=true")
 	ret.Cmd.Dir = dir
 	return ret
 }
