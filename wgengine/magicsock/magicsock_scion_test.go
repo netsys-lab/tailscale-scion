@@ -126,14 +126,28 @@ func TestParseSCIONServiceAddr(t *testing.T) {
 		wantErr     bool
 	}{
 		{
-			name:        "valid IPv4",
+			name:        "valid IPv4 bracketed",
+			description: "1-ff00:0:110,[192.0.2.1]",
+			port:        41641,
+			wantIA:      addr.MustParseIA("1-ff00:0:110"),
+			wantAddr:    netip.MustParseAddrPort("192.0.2.1:41641"),
+		},
+		{
+			name:        "valid IPv6 bracketed",
+			description: "1-ff00:0:110,[2001:db8::1]",
+			port:        12345,
+			wantIA:      addr.MustParseIA("1-ff00:0:110"),
+			wantAddr:    netip.MustParseAddrPort("[2001:db8::1]:12345"),
+		},
+		{
+			name:        "valid IPv4 unbracketed (backward compat)",
 			description: "1-ff00:0:110,192.0.2.1",
 			port:        41641,
 			wantIA:      addr.MustParseIA("1-ff00:0:110"),
 			wantAddr:    netip.MustParseAddrPort("192.0.2.1:41641"),
 		},
 		{
-			name:        "valid IPv6",
+			name:        "valid IPv6 unbracketed (backward compat)",
 			description: "1-ff00:0:110,2001:db8::1",
 			port:        12345,
 			wantIA:      addr.MustParseIA("1-ff00:0:110"),
@@ -406,19 +420,34 @@ func TestScionServiceFromPeer(t *testing.T) {
 		wantOk   bool
 	}{
 		{
-			name: "peer with SCION service",
+			name: "peer with SCION service (bracketed IPv4)",
 			node: &tailcfg.Node{
 				ID:  1,
 				Key: testNodeKey(),
 				Hostinfo: (&tailcfg.Hostinfo{
 					Services: []tailcfg.Service{
 						{Proto: tailcfg.TCP, Port: 80},
-						{Proto: tailcfg.SCION, Port: 41641, Description: "1-ff00:0:110,192.0.2.1"},
+						{Proto: tailcfg.SCION, Port: 41641, Description: "1-ff00:0:110,[192.0.2.1]"},
 					},
 				}).View(),
 			},
 			wantIA:   addr.MustParseIA("1-ff00:0:110"),
 			wantAddr: netip.MustParseAddrPort("192.0.2.1:41641"),
+			wantOk:   true,
+		},
+		{
+			name: "peer with SCION service (bracketed IPv6)",
+			node: &tailcfg.Node{
+				ID:  1,
+				Key: testNodeKey(),
+				Hostinfo: (&tailcfg.Hostinfo{
+					Services: []tailcfg.Service{
+						{Proto: tailcfg.SCION, Port: 41641, Description: "1-ff00:0:110,[2001:db8::1]"},
+					},
+				}).View(),
+			},
+			wantIA:   addr.MustParseIA("1-ff00:0:110"),
+			wantAddr: netip.MustParseAddrPort("[2001:db8::1]:41641"),
 			wantOk:   true,
 		},
 		{
@@ -457,7 +486,37 @@ func TestScionServiceFromPeer(t *testing.T) {
 			wantOk: false,
 		},
 		{
-			name: "peer with SCION in peerapi4 description (piggyback)",
+			name: "peer with SCION in peerapi4 description (piggyback, bracketed IPv4)",
+			node: &tailcfg.Node{
+				ID:  5,
+				Key: testNodeKey(),
+				Hostinfo: (&tailcfg.Hostinfo{
+					Services: []tailcfg.Service{
+						{Proto: tailcfg.PeerAPI4, Port: 12345, Description: "scion=1-ff00:0:110,[192.0.2.1]:32766"},
+					},
+				}).View(),
+			},
+			wantIA:   addr.MustParseIA("1-ff00:0:110"),
+			wantAddr: netip.MustParseAddrPort("192.0.2.1:32766"),
+			wantOk:   true,
+		},
+		{
+			name: "peer with SCION piggyback (bracketed IPv6)",
+			node: &tailcfg.Node{
+				ID:  5,
+				Key: testNodeKey(),
+				Hostinfo: (&tailcfg.Hostinfo{
+					Services: []tailcfg.Service{
+						{Proto: tailcfg.PeerAPI4, Port: 12345, Description: "scion=1-ff00:0:110,[2001:db8::1]:32766"},
+					},
+				}).View(),
+			},
+			wantIA:   addr.MustParseIA("1-ff00:0:110"),
+			wantAddr: netip.MustParseAddrPort("[2001:db8::1]:32766"),
+			wantOk:   true,
+		},
+		{
+			name: "peer with SCION piggyback (unbracketed IPv4, backward compat)",
 			node: &tailcfg.Node{
 				ID:  5,
 				Key: testNodeKey(),

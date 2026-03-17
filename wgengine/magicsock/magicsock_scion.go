@@ -1081,12 +1081,13 @@ func openDispatcherShim(sc *scionConn, logf logger.Logf, netMon *netmon.Monitor)
 }
 
 // parseSCIONServiceAddr parses a SCION service description string of the form
-// "ISD-AS,host-IP" and returns the IA and host address. The port comes from the
-// Service.Port field.
+// "ISD-AS,[host-IP]" and returns the IA and host address. The port comes from
+// the Service.Port field. Accepts both bracketed ("[192.0.2.1]", "[2001:db8::1]")
+// and unbracketed ("192.0.2.1", "2001:db8::1") IP formats for backward compatibility.
 func parseSCIONServiceAddr(description string, port uint16) (ia addr.IA, hostAddr netip.AddrPort, err error) {
 	parts := strings.SplitN(description, ",", 2)
 	if len(parts) != 2 {
-		return 0, netip.AddrPort{}, fmt.Errorf("invalid SCION service description %q: want ISD-AS,host-IP", description)
+		return 0, netip.AddrPort{}, fmt.Errorf("invalid SCION service description %q: want ISD-AS,[host-IP]", description)
 	}
 
 	ia, err = addr.ParseIA(parts[0])
@@ -1094,7 +1095,9 @@ func parseSCIONServiceAddr(description string, port uint16) (ia addr.IA, hostAdd
 		return 0, netip.AddrPort{}, fmt.Errorf("parsing SCION IA %q: %w", parts[0], err)
 	}
 
-	hostIP, err := netip.ParseAddr(parts[1])
+	// Strip brackets if present (e.g., "[192.0.2.1]" or "[2001:db8::1]").
+	ipStr := strings.TrimPrefix(strings.TrimSuffix(parts[1], "]"), "[")
+	hostIP, err := netip.ParseAddr(ipStr)
 	if err != nil {
 		return 0, netip.AddrPort{}, fmt.Errorf("parsing SCION host IP %q: %w", parts[1], err)
 	}
@@ -2509,17 +2512,25 @@ func scionServiceFromPeer(n tailcfg.NodeView) (ia addr.IA, hostAddr netip.AddrPo
 			return parsedIA, parsedAddr, true
 		}
 		// Piggyback: SCION info in peerapi4's Description field.
-		// Format: "scion=ISD-AS,host-IP:port"
+		// Format: "scion=ISD-AS,[host-IP]:port"
 		if svc.Proto == tailcfg.PeerAPI4 && strings.HasPrefix(svc.Description, "scion=") {
 			scionDesc := svc.Description[len("scion="):]
-			// Parse "ISD-AS,host-IP:port"
-			lastColon := strings.LastIndex(scionDesc, ":")
-			if lastColon < 0 {
-				continue
+			var addrPart, portStr string
+			// Try bracket notation first: "ISD-AS,[hostIP]:port"
+			if portSep := strings.LastIndex(scionDesc, "]:"); portSep >= 0 {
+				addrPart = scionDesc[:portSep+1]
+				portStr = scionDesc[portSep+2:]
+			} else {
+				// Backward compat: unbracketed "ISD-AS,hostIP:port"
+				lastColon := strings.LastIndex(scionDesc, ":")
+				if lastColon < 0 {
+					continue
+				}
+				addrPart = scionDesc[:lastColon]
+				portStr = scionDesc[lastColon+1:]
 			}
-			addrPart := scionDesc[:lastColon]
 			var port uint16
-			if _, err := fmt.Sscanf(scionDesc[lastColon+1:], "%d", &port); err != nil {
+			if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
 				continue
 			}
 			parsedIA, parsedAddr, err := parseSCIONServiceAddr(addrPart, port)
@@ -2552,7 +2563,7 @@ func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) {
 	return tailcfg.Service{
 		Proto:       tailcfg.SCION,
 		Port:        scionPort,
-		Description: fmt.Sprintf("%s,%s", sc.localIA, hostIP),
+		Description: fmt.Sprintf("%s,[%s]", sc.localIA, hostIP),
 	}, true
 }
 
