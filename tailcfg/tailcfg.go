@@ -180,7 +180,8 @@ type CapabilityVersion int
 //   - 131: 2025-11-25: client respects [NodeAttrDefaultAutoUpdate]
 //   - 132: 2026-02-13: client respects [NodeAttrDisableHostsFileUpdates]
 //   - 133: 2026-02-17: client understands [NodeAttrForceRegisterMagicDNSIPv4Only]; MagicDNS IPv6 registered w/ OS by default
-const CurrentCapabilityVersion CapabilityVersion = 133
+//   - 134: 2026-03-09: Client understands [NodeAttrDisableAndroidBindToActiveNetwork]
+const CurrentCapabilityVersion CapabilityVersion = 134
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -759,13 +760,14 @@ const (
 	PeerAPI4   = ServiceProto("peerapi4")
 	PeerAPI6   = ServiceProto("peerapi6")
 	PeerAPIDNS = ServiceProto("peerapi-dns-proxy")
+	SCION      = ServiceProto("scion")
 )
 
 // IsKnownServiceProto checks whether sp represents a known-valid value of
 // ServiceProto.
 func IsKnownServiceProto(sp ServiceProto) bool {
 	switch sp {
-	case TCP, UDP, PeerAPI4, PeerAPI6, PeerAPIDNS, ServiceProto("egg"):
+	case TCP, UDP, PeerAPI4, PeerAPI6, PeerAPIDNS, SCION, ServiceProto("egg"):
 		return true
 	}
 	return false
@@ -2463,6 +2465,12 @@ const (
 	// details on the behaviour of this capability.
 	CapabilityBindToInterfaceByRoute NodeCapability = "https://tailscale.com/cap/bind-to-interface-by-route"
 
+	// NodeAttrDisableAndroidBindToActiveNetwork disables binding sockets to the
+	// currently active network on Android, which is enabled by default.
+	// This allows the control plane to turn off the behavior if it causes
+	// problems.
+	NodeAttrDisableAndroidBindToActiveNetwork NodeCapability = "disable-android-bind-to-active-network"
+
 	// CapabilityDebugDisableAlternateDefaultRouteInterface changes how Darwin
 	// nodes get the default interface. There is an optional hook (used by the
 	// macOS and iOS clients) to override the default interface, this capability
@@ -2763,6 +2771,12 @@ const (
 	// See https://github.com/tailscale/tailscale/issues/15404.
 	// TODO(bradfitz): remove this a few releases after 2026-02-16.
 	NodeAttrForceRegisterMagicDNSIPv4Only NodeCapability = "force-register-magicdns-ipv4-only"
+
+	// NodeAttrSCIONPrefer indicates that the node should prefer SCION paths
+	// when communicating with other SCION-capable peers that also have this
+	// attribute. Both self and peer must have this attribute for SCION to be
+	// preferred over direct UDP.
+	NodeAttrSCIONPrefer NodeCapability = "scion-prefer"
 )
 
 // SetDNSRequest is a request to add a DNS record.

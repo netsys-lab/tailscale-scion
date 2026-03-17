@@ -87,7 +87,7 @@
     # you're an end user you should be prepared for this flake to not
     # build periodically.
     packages = eachSystem (pkgs: rec {
-      default = pkgs.buildGo125Module {
+      default = pkgs.buildGo126Module {
         name = "tailscale";
         pname = "tailscale";
         src = ./.;
@@ -151,4 +151,4 @@
     });
   };
 }
-# nix-direnv cache busting line: sha256-dx+SJyDx+eZptFaMatoyM6w1E3nJKY+hKs7nuR997bE=
+# nix-direnv cache busting line: sha256-V4vJ1MonIWbuL+R5fUiO7hV7f+k/Iqoz+EFWnOJwZAs=

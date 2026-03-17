@@ -4888,6 +4888,23 @@ func (b *LocalBackend) hostInfoWithServicesLocked() *tailcfg.Hostinfo {
 	// the slice with no free capacity.
 	c := len(hi.Services)
 	hi.Services = append(hi.Services[:c:c], peerAPIServices...)
+
+	// Advertise SCION service if available. Since the coord server only
+	// relays peerapi4/peerapi6 services to peers, we encode the SCION info
+	// directly into the peerapi4 service's Description field so it reaches
+	// peers without coord server changes.
+	if scionSvc, ok := b.MagicConn().SCIONService(); ok {
+		// Still include the standalone SCION service for the coord server.
+		hi.Services = append(hi.Services, scionSvc)
+		// Also piggyback on peerapi4's Description field.
+		for i := range hi.Services {
+			if hi.Services[i].Proto == tailcfg.PeerAPI4 {
+				hi.Services[i].Description = fmt.Sprintf("scion=%s:%d", scionSvc.Description, scionSvc.Port)
+				break
+			}
+		}
+	}
+
 	hi.PushDeviceToken = b.pushDeviceToken.Load()
 
 	// Compare the expected ports from peerAPIServices to the actual ports in hi.Services.
@@ -6299,6 +6316,9 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 
 	// See the netns package for documentation on what these capability do.
 	netns.SetBindToInterfaceByRoute(b.logf, nm.HasCap(tailcfg.CapabilityBindToInterfaceByRoute))
+	if runtime.GOOS == "android" {
+		netns.SetDisableAndroidBindToActiveNetwork(b.logf, nm.HasCap(tailcfg.NodeAttrDisableAndroidBindToActiveNetwork))
+	}
 	netns.SetDisableBindConnToInterface(b.logf, nm.HasCap(tailcfg.CapabilityDebugDisableBindConnToInterface))
 	netns.SetDisableBindConnToInterfaceAppleExt(b.logf, nm.HasCap(tailcfg.CapabilityDebugDisableBindConnToInterfaceAppleExt))
 

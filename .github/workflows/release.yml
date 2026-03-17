@@ -1,0 +1,117 @@
+name: Release
+on:
+  push:
+    tags: ['v*-scion.*']
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify version
+        run: |
+          eval $(go run ./cmd/mkversion)
+          echo "Version: $VERSION_LONG"
+      - name: Build packages
+        run: |
+          go run ./cmd/dist build \
+            "linux/${{ matrix.goarch }}/tgz" \
+            "linux/${{ matrix.goarch }}/deb" \
+            "linux/${{ matrix.goarch }}/rpm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.goarch }}
+          path: dist/
+
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build binaries
+        env:
+          GOOS: darwin
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          eval $(go run ./cmd/mkversion)
+          mkdir -p dist
+          ./build_dist.sh -o dist/tailscale ./cmd/tailscale
+          ./build_dist.sh -o dist/tailscaled ./cmd/tailscaled
+          cp LICENSE PATENTS NOTICE dist/ 2>/dev/null || true
+          tar czf "dist/tailscale-scion_${VERSION_SHORT}_macos_${{ matrix.goarch }}.tgz" \
+            -C dist tailscale tailscaled LICENSE PATENTS NOTICE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.goarch }}
+          path: dist/*.tgz
+
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build binaries
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          eval $(go run ./cmd/mkversion)
+          mkdir -p dist
+          ./build_dist.sh -o dist/tailscale.exe ./cmd/tailscale
+          ./build_dist.sh -o dist/tailscaled.exe ./cmd/tailscaled
+          cp LICENSE PATENTS NOTICE dist/ 2>/dev/null || true
+          cd dist && zip "tailscale-scion_${VERSION_SHORT}_windows_amd64.zip" \
+            tailscale.exe tailscaled.exe LICENSE PATENTS NOTICE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64
+          path: dist/*.zip
+
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          body: |
+            ## Tailscale (SCION) ${{ github.ref_name }}
+
+            Unofficial Tailscale client with SCION path-aware networking.
+            Based on Tailscale. Not affiliated with Tailscale Inc.
+
+            ### Install
+
+            **Linux (deb):** `sudo dpkg -i tailscale-scion_*.deb && sudo systemctl enable --now tailscaled`
+            **Linux (rpm):** `sudo rpm -i tailscale-scion_*.rpm && sudo systemctl enable --now tailscaled`
+            **Linux (tgz):** Extract and copy `tailscale`/`tailscaled` to PATH
+            **macOS:** Extract tgz, run `sudo ./tailscaled &` then `./tailscale up`
+            **Windows:** Extract zip, run `tailscaled.exe` then `tailscale.exe up`
+
+            ### Documentation
+
+            CLI reference: https://tailscale.com/docs/reference/tailscale-cli
+            SCION configuration: https://github.com/netsys-lab/tailscale-scion#configuration

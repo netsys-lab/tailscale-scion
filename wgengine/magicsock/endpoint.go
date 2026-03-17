@@ -99,6 +99,9 @@ type endpoint struct {
 	expired         bool // whether the node has expired
 	isWireguardOnly bool // whether the endpoint is WireGuard only
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
+
+	scionState     *scionEndpointState // nil if peer has no SCION address
+	scionPreferred bool                // true if both self and peer have NodeAttrSCIONPrefer
 }
 
 // udpRelayEndpointReady determines whether the given relay [addrQuality] should
@@ -124,7 +127,7 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 		//
 		// TODO(jwhited): add observability around !curBestAddrTrusted and sameRelayServer
 		// TODO(jwhited): collapse path change logging with endpoint.handlePongConnLocked()
-		de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v", de.publicKey.ShortString(), de.discoShort(), maybeBest.epAddr, maybeBest.wireMTU)
+		de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v", de.publicKey.ShortString(), de.discoShort(), de.scionAddrStr(maybeBest.epAddr), maybeBest.wireMTU)
 		de.setBestAddrLocked(maybeBest)
 		de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
 	}
@@ -516,7 +519,8 @@ func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) bool {
 		// kick off discovery disco pings every trustUDPAddrDuration and mirror
 		// to DERP.
 		de.mu.Lock()
-		if de.heartbeatDisabled && de.bestAddr.epAddr == src {
+		if de.heartbeatDisabled && (de.bestAddr.epAddr == src ||
+			(de.bestAddr.isSCION() && de.bestAddr.ap == src.ap)) {
 			de.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
 		}
 		de.mu.Unlock()
@@ -862,6 +866,8 @@ func (de *endpoint) heartbeat() {
 
 	if de.wantFullPingLocked(now) {
 		de.sendDiscoPingsLocked(now, true)
+	} else {
+		de.heartbeatSCIONLocked(now)
 	}
 
 	if de.wantUDPRelayPathDiscoveryLocked(now) {
@@ -933,7 +939,7 @@ func (de *endpoint) wantFullPingLocked(now mono.Time) bool {
 	if runtime.GOOS == "js" {
 		return false
 	}
-	if !de.bestAddr.isDirect() || de.lastFullPing.IsZero() {
+	if (!de.bestAddr.isDirect() && !de.bestAddr.isSCION()) || de.lastFullPing.IsZero() {
 		return true
 	}
 	if now.After(de.trustBestAddrUntil) {
@@ -1023,6 +1029,7 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
 		for ep := range de.endpointState {
 			de.startDiscoPingLocked(epAddr{ap: ep}, now, pingCLI, size, resCB)
 		}
+		de.cliPingSCIONLocked(now, size, resCB)
 		if de.wantUDPRelayPathDiscoveryLocked(now) {
 			de.discoverUDPRelayPathsLocked(now)
 		}
@@ -1049,7 +1056,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		if startWGPing {
 			de.sendWireGuardOnlyPingsLocked(now)
 		}
-	} else if !udpAddr.isDirect() || now.After(de.trustBestAddrUntil) {
+	} else if (!udpAddr.isDirect() && !udpAddr.isSCION()) || now.After(de.trustBestAddrUntil) {
 		de.sendDiscoPingsLocked(now, true)
 		if de.wantUDPRelayPathDiscoveryLocked(now) {
 			de.discoverUDPRelayPathsLocked(now)
@@ -1071,7 +1078,9 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		}
 	}
 	var err error
-	if udpAddr.ap.IsValid() {
+	if udpAddr.isSCION() {
+		err = de.sendSCIONData(udpAddr, buffs, offset)
+	} else if udpAddr.ap.IsValid() {
 		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
 
 		// If the error is known to indicate that the endpoint is no longer
@@ -1186,6 +1195,8 @@ func (de *endpoint) discoPingTimeout(txid stun.TxID) {
 		de.c.dlogf("[v1] magicsock: disco: timeout waiting for pong %x from %v (%v, %v)", txid[:6], sp.to, de.publicKey.ShortString(), de.discoShort())
 	}
 	de.removeSentDiscoPingLocked(txid, sp, discoPingTimedOut)
+
+	de.discoPingTimeoutSCIONLocked(sp)
 }
 
 // forgetDiscoPing is called when a ping fails to send.
@@ -1287,7 +1298,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if runtime.GOOS == "js" {
 		return
 	}
-	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
+	if debugNeverDirectUDP() && !ep.vni.IsSet() && !ep.scionKey.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
 		return
 	}
 	epDisco := de.disco.Load()
@@ -1295,7 +1306,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 		return
 	}
 	if purpose != pingCLI &&
-		!ep.vni.IsSet() { // de.endpointState is only relevant for direct/non-vni epAddr's
+		!ep.vni.IsSet() && !ep.scionKey.IsSet() { // de.endpointState is only relevant for direct/non-vni/non-SCION epAddr's
 		st, ok := de.endpointState[ep.ap]
 		if !ok {
 			// Shouldn't happen. But don't ping an endpoint that's
@@ -1314,7 +1325,9 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	sizes := []int{size}
 	if de.c.PeerMTUEnabled() {
 		isDerp := ep.ap.Addr() == tailcfg.DerpMagicIPAddr
-		if !isDerp && ((purpose == pingDiscovery) || (purpose == pingCLI && size == 0)) {
+		// Skip MTU probing for SCION paths — the SCION path MTU is known
+		// from metadata and oversized probes won't fit through the path.
+		if !isDerp && !ep.scionKey.IsSet() && ((purpose == pingDiscovery) || (purpose == pingCLI && size == 0)) {
 			de.c.dlogf("[v1] magicsock: starting MTU probe")
 			sizes = mtuProbePingSizesV4
 			if ep.ap.Addr().Is6() {
@@ -1374,6 +1387,10 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 
 		de.startDiscoPingLocked(epAddr{ap: ep}, now, pingDiscovery, 0, nil)
 	}
+	if de.sendDiscoPingsSCIONLocked(now) {
+		sentAny = true
+	}
+
 	derpAddr := de.derpAddr
 	if sentAny && sendCallMeMaybe && derpAddr.IsValid() {
 		// Have our magicsock.Conn figure out its STUN endpoint (if
@@ -1472,7 +1489,6 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 		panic("nil node when updating endpoint")
 	}
 	de.mu.Lock()
-	defer de.mu.Unlock()
 
 	de.heartbeatDisabled = heartbeatDisabled
 	if probeUDPLifetimeEnabled {
@@ -1525,6 +1541,16 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 	de.setEndpointsLocked(n.Endpoints())
 
 	de.relayCapable = capVerIsRelayCapable(n.Cap())
+
+	oldSCIONKeys := de.updateFromNodeSCIONLocked(n)
+
+	de.mu.Unlock()
+
+	// Clean up SCION paths outside de.mu. c.mu is held by caller (updateNodes),
+	// so call unregisterSCIONPath directly without re-locking.
+	for _, k := range oldSCIONKeys {
+		de.c.unregisterSCIONPath(k)
+	}
 }
 
 func (de *endpoint) setEndpointsLocked(eps interface {
@@ -1657,6 +1683,13 @@ func (de *endpoint) noteConnectivityChange() {
 // udpAddr. size is the length of the entire disco message including
 // disco headers. If size is zero, assume it is the safe wire MTU.
 func pingSizeToPktLen(size int, udpAddr epAddr) tstun.WireMTU {
+	if udpAddr.scionKey.IsSet() {
+		// SCION wire MTU is fixed regardless of ping size: the WireGuard
+		// packet must fit inside the SCION path's payload budget (path MTU
+		// minus variable SCION headers). We use a conservative value
+		// rather than computing per-path overhead from the hop count.
+		return scionWireMTU
+	}
 	if size == 0 {
 		return tstun.SafeWireMTU()
 	}
@@ -1720,9 +1753,10 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	now := mono.Now()
 	latency := now.Sub(sp.at)
 
-	if !isDerp && !src.vni.IsSet() {
-		// Note: we check vni.isSet() as relay [epAddr]'s are not stored in
-		// endpointState, they are either de.bestAddr or not.
+	if !isDerp && !src.vni.IsSet() && !src.scionKey.IsSet() {
+		// Note: we check vni.IsSet() and scionKey.IsSet() as relay and
+		// SCION epAddr's are not stored in endpointState; they are either
+		// de.bestAddr or not.
 		st, ok := de.endpointState[sp.to.ap]
 		if !ok {
 			// This is no longer an endpoint we care about.
@@ -1737,6 +1771,11 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 			from:    src.ap,
 			pongSrc: m.Src,
 		})
+	}
+
+	// Record latency for SCION paths in per-path probe state.
+	if !isDerp {
+		de.handlePongSCIONLocked(src, latency, now)
 	}
 
 	if sp.purpose != pingHeartbeat && sp.purpose != pingHeartbeatForUDPLifetime {
@@ -1759,24 +1798,39 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	// TODO(bradfitz): decide how latency vs. preference order affects decision
 	if !isDerp {
 		thisPong := addrQuality{
-			epAddr:  sp.to,
-			latency: latency,
-			wireMTU: pingSizeToPktLen(sp.size, sp.to),
+			epAddr:         sp.to,
+			latency:        latency,
+			wireMTU:        pingSizeToPktLen(sp.size, sp.to),
+			scionPreferred: de.scionPreferred,
 		}
-		// TODO(jwhited): consider checking de.trustBestAddrUntil as well. If
-		//  de.bestAddr is untrusted we may want to clear it, otherwise we could
-		//  get stuck with a forever untrusted bestAddr that blackholes, since
-		//  we don't clear direct UDP paths on disco ping timeout (see
-		//  discoPingTimeout).
-		if betterAddr(thisPong, de.bestAddr) {
-			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
-			de.debugUpdates.Add(EndpointChange{
-				When: time.Now(),
-				What: "handlePongConnLocked-bestAddr-update",
-				From: de.bestAddr,
-				To:   thisPong,
-			})
-			de.setBestAddrLocked(thisPong)
+		// If the current bestAddr is untrusted (no recent pong confirming
+		// it works), allow any fresh pong to replace it. This prevents
+		// getting stuck with a dead bestAddr that betterAddr() refuses to
+		// demote due to preference rules (e.g., TS_PREFER_SCION=1).
+		curBestUntrusted := de.bestAddr.ap.IsValid() && now.After(de.trustBestAddrUntil)
+
+		// When the current bestAddr is a trusted SCION path and this pong
+		// is from a different SCION path on the same host, skip generic
+		// betterAddr promotion. The SCION-aware reEvalSCIONPathsLocked
+		// (throttled to 2s) handles multi-path switching to avoid flapping
+		// between paths with similar latency.
+		scionToScion := thisPong.epAddr.isSCION() && de.bestAddr.isSCION() &&
+			thisPong.epAddr.ap == de.bestAddr.ap &&
+			thisPong.epAddr.scionKey != de.bestAddr.scionKey
+		skipPromotion := scionToScion && !curBestUntrusted
+
+		if !skipPromotion && (curBestUntrusted || betterAddr(thisPong, de.bestAddr)) {
+			if thisPong.epAddr != de.bestAddr.epAddr {
+				de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), de.scionAddrStr(sp.to), thisPong.wireMTU, m.TxID[:6])
+				de.debugUpdates.Add(EndpointChange{
+					When: time.Now(),
+					What: "handlePongConnLocked-bestAddr-update",
+					From: de.bestAddr,
+					To:   thisPong,
+				})
+				de.setBestAddrLocked(thisPong)
+				de.handlePongPromoteSCIONLocked(thisPong)
+			}
 		}
 		if de.bestAddr.epAddr == thisPong.epAddr {
 			de.debugUpdates.Add(EndpointChange{
@@ -1794,19 +1848,28 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 }
 
 // epAddr is a [netip.AddrPort] with an optional Geneve header (RFC8926)
-// [packet.VirtualNetworkID].
+// [packet.VirtualNetworkID] or SCION path key.
 type epAddr struct {
-	ap  netip.AddrPort          // if ap == tailcfg.DerpMagicIPAddr then vni is never set
-	vni packet.VirtualNetworkID // vni.IsSet() indicates if this [epAddr] involves a Geneve header
+	ap       netip.AddrPort          // if ap == tailcfg.DerpMagicIPAddr then vni is never set
+	vni      packet.VirtualNetworkID // vni.IsSet() indicates if this [epAddr] involves a Geneve header
+	scionKey scionPathKey            // non-zero if this is a SCION endpoint
 }
 
 // isDirect returns true if e.ap is valid and not tailcfg.DerpMagicIPAddr,
-// and a VNI is not set.
+// and neither a VNI nor a SCION key is set.
 func (e epAddr) isDirect() bool {
-	return e.ap.IsValid() && e.ap.Addr() != tailcfg.DerpMagicIPAddr && !e.vni.IsSet()
+	return e.ap.IsValid() && e.ap.Addr() != tailcfg.DerpMagicIPAddr && !e.vni.IsSet() && !e.scionKey.IsSet()
+}
+
+// isSCION reports whether this address represents a SCION path.
+func (e epAddr) isSCION() bool {
+	return e.scionKey.IsSet()
 }
 
 func (e epAddr) String() string {
+	if e.scionKey.IsSet() {
+		return fmt.Sprintf("%v:scion:%d", e.ap.String(), e.scionKey)
+	}
 	if !e.vni.IsSet() {
 		return e.ap.String()
 	}
@@ -1820,6 +1883,7 @@ type addrQuality struct {
 	relayServerDisco key.DiscoPublic // only relevant if epAddr.vni.isSet(), otherwise zero value
 	latency          time.Duration
 	wireMTU          tstun.WireMTU
+	scionPreferred   bool // true if both self and peer have NodeAttrSCIONPrefer
 }
 
 func (a addrQuality) String() string {
@@ -1854,6 +1918,24 @@ func betterAddr(a, b addrQuality) bool {
 	}
 	if a.vni.IsSet() && !b.vni.IsSet() {
 		return false
+	}
+
+	// SCION beats relay (Geneve) unconditionally.
+	if a.scionKey.IsSet() && !b.scionKey.IsSet() && b.vni.IsSet() {
+		return true
+	}
+	if b.scionKey.IsSet() && !a.scionKey.IsSet() && a.vni.IsSet() {
+		return false
+	}
+
+	// When TS_PREFER_SCION=1, SCION beats everything unconditionally.
+	if preferSCION() {
+		if a.scionKey.IsSet() && !b.scionKey.IsSet() {
+			return true
+		}
+		if b.scionKey.IsSet() && !a.scionKey.IsSet() {
+			return false
+		}
 	}
 
 	// Each address starts with a set of points (from 0 to 100) that
@@ -1898,6 +1980,22 @@ func betterAddr(a, b addrQuality) bool {
 	}
 	if b.ap.Addr().Is6() {
 		bPoints += 10
+	}
+
+	// SCION paths get a configurable bonus (default +15) so they win at
+	// similar latency. NodeAttrSCIONPrefer adds +25 more for a strong
+	// admin preference (total +40 at default).
+	if a.scionKey.IsSet() {
+		aPoints += scionPreferenceBonus()
+	}
+	if b.scionKey.IsSet() {
+		bPoints += scionPreferenceBonus()
+	}
+	if a.scionPreferred && a.scionKey.IsSet() {
+		aPoints += 25
+	}
+	if b.scionPreferred && b.scionKey.IsSet() {
+		bPoints += 25
 	}
 
 	// Don't change anything if the latency improvement is less than 1%; we
@@ -2016,22 +2114,35 @@ func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
 	ps.Active = now.Sub(de.lastSendExt) < sessionActiveTimeout
 
 	if udpAddr, derpAddr, _ := de.addrForSendLocked(now); udpAddr.ap.IsValid() && !derpAddr.IsValid() {
-		if udpAddr.vni.IsSet() {
+		if udpAddr.isSCION() {
+			// Access c.scionPaths directly — c.mu is already held by
+			// our caller (Conn.UpdateStatus).
+			if pi, ok := de.c.scionPaths[udpAddr.scionKey]; ok {
+				ps.CurAddr = pi.String()
+			} else {
+				ps.CurAddr = udpAddr.String()
+			}
+		} else if udpAddr.vni.IsSet() {
 			ps.PeerRelay = udpAddr.String()
 		} else {
 			ps.CurAddr = udpAddr.String()
 		}
 	}
+	de.populateSCIONPathsLocked(ps)
 }
 
 // stopAndReset stops timers associated with de and resets its state back to zero.
 // It's called when a discovery endpoint is no longer present in the
 // NetworkMap, or when magicsock is transitioning from running to
-// stopped state (via SetPrivateKey(zero))
+// stopped state (via SetPrivateKey(zero)).
+// c.mu must be held.
 func (de *endpoint) stopAndReset() {
 	atomic.AddInt64(&de.numStopAndResetAtomic, 1)
 	de.mu.Lock()
-	defer de.mu.Unlock()
+
+	// Extract scionPathKeys before releasing de.mu so we can clean them up
+	// under c.mu afterward (lock order: c.mu before de.mu).
+	scionKeys := de.stopAndResetSCIONLocked()
 
 	if closing := de.c.closing.Load(); !closing {
 		if de.isWireguardOnly {
@@ -2049,6 +2160,13 @@ func (de *endpoint) stopAndReset() {
 	if de.heartBeatTimer != nil {
 		de.heartBeatTimer.Stop()
 		de.heartBeatTimer = nil
+	}
+	de.mu.Unlock()
+
+	// Clean up SCION paths outside de.mu. c.mu is held by caller
+	// (updateNodes, SetPrivateKey, Close), so call directly.
+	for _, k := range scionKeys {
+		de.c.unregisterSCIONPath(k)
 	}
 }
 

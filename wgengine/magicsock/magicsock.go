@@ -96,7 +96,15 @@ const (
 	PathDERP          Path = "derp"
 	PathPeerRelayIPv4 Path = "peer_relay_ipv4"
 	PathPeerRelayIPv6 Path = "peer_relay_ipv6"
+	PathSCION         Path = "scion"
 )
+
+// SCIONConfig holds runtime-configurable SCION parameters.
+type SCIONConfig struct {
+	Enabled      bool
+	BootstrapURL string
+	Prefer       bool
+}
 
 type pathLabel struct {
 	// Path indicates the path that the packet took:
@@ -146,6 +154,12 @@ type metrics struct {
 	outboundBytesPeerRelayIPv4Total expvar.Int
 	outboundBytesPeerRelayIPv6Total expvar.Int
 
+	// SCION path counters.
+	inboundPacketsSCIONTotal  expvar.Int
+	inboundBytesSCIONTotal    expvar.Int
+	outboundPacketsSCIONTotal expvar.Int
+	outboundBytesSCIONTotal   expvar.Int
+
 	// outboundPacketsDroppedErrors is the total number of outbound packets
 	// dropped due to errors.
 	outboundPacketsDroppedErrors expvar.Int
@@ -163,10 +177,11 @@ type Conn struct {
 	derpActiveFunc         func()
 	idleFunc               func() time.Duration // nil means unknown
 	testOnlyPacketListener nettype.PacketListener
-	noteRecvActivity       func(key.NodePublic) // or nil, see Options.NoteRecvActivity
-	netMon                 *netmon.Monitor      // must be non-nil
-	health                 *health.Tracker      // or nil
-	controlKnobs           *controlknobs.Knobs  // or nil
+	noteRecvActivity       func(key.NodePublic)                   // or nil, see Options.NoteRecvActivity
+	onDERPRecv             func(int, key.NodePublic, []byte) bool // or nil, see Options.OnDERPRecv
+	netMon                 *netmon.Monitor                        // must be non-nil
+	health                 *health.Tracker                        // or nil
+	controlKnobs           *controlknobs.Knobs                    // or nil
 
 	// ================================================================
 	// No locking required to access these fields, either because
@@ -186,6 +201,11 @@ type Conn struct {
 	// protocols.
 	pconn4 RebindingUDPConn
 	pconn6 RebindingUDPConn
+
+	// pconnSCION is the SCION connection, nil if SCION is not available.
+	// Accessed atomically from hot-path send/receive goroutines;
+	// writes happen under c.mu for higher-level coordination.
+	pconnSCION atomic.Pointer[scionConn]
 
 	receiveBatchPool sync.Pool
 
@@ -408,6 +428,18 @@ type Conn struct {
 	// homeDERPGauge is the usermetric gauge for the home DERP region ID.
 	// This can be nil when [Options.Metrics] are not enabled.
 	homeDERPGauge *usermetric.Gauge
+
+	// scionPaths is the registry of SCION path information, keyed by
+	// scionPathKey. Each entry holds the full SCION address and path
+	// data for a peer.
+	scionPaths         map[scionPathKey]*scionPathInfo
+	scionPathsByAddr   map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
+	scionPathSeq       atomic.Uint32                 // monotonic key generator for scionPaths
+	scionSoftRefreshAt map[scionIAKey]time.Time       // last soft refresh per peer, guarded by c.mu; bounded by unique peer count
+
+	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
+	// Used by receiveSCION to detect a dead socket and trigger reconnection.
+	lastSCIONRecv mono.Time
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -502,6 +534,13 @@ type Options struct {
 	// leave it zero, in which case a new disco key is generated per
 	// Tailscale start and kept only in memory.
 	ForceDiscoKey key.DiscoPrivate
+
+	// OnDERPRecv, if non-nil, is called for every non-disco packet
+	// received from DERP before the peer map lookup. If it returns
+	// true, the packet is considered handled and is not passed to
+	// WireGuard. The pkt slice is borrowed and must be copied if
+	// the callee needs to retain it.
+	OnDERPRecv func(regionID int, src key.NodePublic, pkt []byte) bool
 }
 
 func (o *Options) logf() logger.Logf {
@@ -640,6 +679,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c.idleFunc = opts.IdleFunc
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
+	c.onDERPRecv = opts.OnDERPRecv
 
 	// Set up publishers and subscribers. Subscribe calls must return before
 	// NewConn otherwise published events can be missed.
@@ -723,6 +763,7 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 	pathDERP := pathLabel{Path: PathDERP}
 	pathPeerRelayV4 := pathLabel{Path: PathPeerRelayIPv4}
 	pathPeerRelayV6 := pathLabel{Path: PathPeerRelayIPv6}
+	pathSCION := pathLabel{Path: PathSCION}
 	inboundPacketsTotal := usermetric.NewMultiLabelMapWithRegistry[pathLabel](
 		reg,
 		"tailscaled_inbound_packets_total",
@@ -777,30 +818,38 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 	metricSendDERP.Register(&m.outboundPacketsDERPTotal)
 	metricSendPeerRelay.Register(&m.outboundPacketsPeerRelayIPv4Total)
 	metricSendPeerRelay.Register(&m.outboundPacketsPeerRelayIPv6Total)
+	metricRecvDataPacketsSCION.Register(&m.inboundPacketsSCIONTotal)
+	metricRecvDataBytesSCION.Register(&m.inboundBytesSCIONTotal)
+	metricSendDataPacketsSCION.Register(&m.outboundPacketsSCIONTotal)
+	metricSendDataBytesSCION.Register(&m.outboundBytesSCIONTotal)
 
 	inboundPacketsTotal.Set(pathDirectV4, &m.inboundPacketsIPv4Total)
 	inboundPacketsTotal.Set(pathDirectV6, &m.inboundPacketsIPv6Total)
 	inboundPacketsTotal.Set(pathDERP, &m.inboundPacketsDERPTotal)
 	inboundPacketsTotal.Set(pathPeerRelayV4, &m.inboundPacketsPeerRelayIPv4Total)
 	inboundPacketsTotal.Set(pathPeerRelayV6, &m.inboundPacketsPeerRelayIPv6Total)
+	inboundPacketsTotal.Set(pathSCION, &m.inboundPacketsSCIONTotal)
 
 	inboundBytesTotal.Set(pathDirectV4, &m.inboundBytesIPv4Total)
 	inboundBytesTotal.Set(pathDirectV6, &m.inboundBytesIPv6Total)
 	inboundBytesTotal.Set(pathDERP, &m.inboundBytesDERPTotal)
 	inboundBytesTotal.Set(pathPeerRelayV4, &m.inboundBytesPeerRelayIPv4Total)
 	inboundBytesTotal.Set(pathPeerRelayV6, &m.inboundBytesPeerRelayIPv6Total)
+	inboundBytesTotal.Set(pathSCION, &m.inboundBytesSCIONTotal)
 
 	outboundPacketsTotal.Set(pathDirectV4, &m.outboundPacketsIPv4Total)
 	outboundPacketsTotal.Set(pathDirectV6, &m.outboundPacketsIPv6Total)
 	outboundPacketsTotal.Set(pathDERP, &m.outboundPacketsDERPTotal)
 	outboundPacketsTotal.Set(pathPeerRelayV4, &m.outboundPacketsPeerRelayIPv4Total)
 	outboundPacketsTotal.Set(pathPeerRelayV6, &m.outboundPacketsPeerRelayIPv6Total)
+	outboundPacketsTotal.Set(pathSCION, &m.outboundPacketsSCIONTotal)
 
 	outboundBytesTotal.Set(pathDirectV4, &m.outboundBytesIPv4Total)
 	outboundBytesTotal.Set(pathDirectV6, &m.outboundBytesIPv6Total)
 	outboundBytesTotal.Set(pathDERP, &m.outboundBytesDERPTotal)
 	outboundBytesTotal.Set(pathPeerRelayV4, &m.outboundBytesPeerRelayIPv4Total)
 	outboundBytesTotal.Set(pathPeerRelayV6, &m.outboundBytesPeerRelayIPv6Total)
+	outboundBytesTotal.Set(pathSCION, &m.outboundBytesSCIONTotal)
 
 	outboundPacketsDroppedErrors.Set(usermetric.DropLabels{Reason: usermetric.ReasonError}, &m.outboundPacketsDroppedErrors)
 
@@ -833,6 +882,10 @@ func deregisterMetrics() {
 	metricSendUDP.UnregisterAll()
 	metricSendDERP.UnregisterAll()
 	metricSendPeerRelay.UnregisterAll()
+	metricRecvDataPacketsSCION.UnregisterAll()
+	metricRecvDataBytesSCION.UnregisterAll()
+	metricSendDataPacketsSCION.UnregisterAll()
+	metricSendDataBytesSCION.UnregisterAll()
 }
 
 // InstallCaptureHook installs a callback which is called to
@@ -1156,7 +1209,13 @@ func (c *Conn) Ping(peer tailcfg.NodeView, res *ipnstate.PingResult, size int, c
 func (c *Conn) populateCLIPingResponseLocked(res *ipnstate.PingResult, latency time.Duration, ep epAddr) {
 	res.LatencySeconds = latency.Seconds()
 	if ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
-		if ep.vni.IsSet() {
+		if ep.isSCION() {
+			if pi, ok := c.scionPaths[ep.scionKey]; ok {
+				res.Endpoint = pi.String()
+			} else {
+				res.Endpoint = ep.String()
+			}
+		} else if ep.vni.IsSet() {
 			res.PeerRelay = ep.String()
 		} else {
 			res.Endpoint = ep.String()
@@ -1964,6 +2023,8 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 
 	if isDERP {
 		metricSendDiscoDERP.Add(1)
+	} else if dst.scionKey.IsSet() {
+		metricSendDiscoSCION.Add(1)
 	} else {
 		metricSendDiscoUDP.Add(1)
 	}
@@ -1971,7 +2032,11 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 	box := di.sharedKey.Seal(m.AppendMarshal(nil))
 	pkt = append(pkt, box...)
 	const isDisco = true
-	sent, err = c.sendAddr(dst.ap, dstKey, pkt, isDisco, dst.vni.IsSet())
+	if dst.scionKey.IsSet() {
+		sent, err = c.sendSCION(dst.scionKey, pkt)
+	} else {
+		sent, err = c.sendAddr(dst.ap, dstKey, pkt, isDisco, dst.vni.IsSet())
+	}
 	if sent {
 		if logLevel == discoLog || (logLevel == discoVerboseLog && debugDisco()) {
 			node := "?"
@@ -1982,6 +2047,8 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 		}
 		if isDERP {
 			metricSentDiscoDERP.Add(1)
+		} else if dst.scionKey.IsSet() {
+			metricSentDiscoSCION.Add(1)
 		} else {
 			metricSentDiscoUDP.Add(1)
 		}
@@ -2511,6 +2578,12 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 	if nk, ok := c.unambiguousNodeKeyOfPingLocked(dm, di.discoKey, derpNodeSrc); ok {
 		if !isDerp {
 			c.peerMap.setNodeKeyForEpAddr(src, nk)
+			// For SCION sources, also register the plain host addr
+			// so WireGuard data packets (which don't carry a scionKey)
+			// can be looked up in the peerMap.
+			if src.scionKey.IsSet() {
+				c.peerMap.setNodeKeyForEpAddr(epAddr{ap: src.ap}, nk)
+			}
 		}
 	}
 
@@ -3271,6 +3344,10 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 	if runtime.GOOS == "js" {
 		fns = []conn.ReceiveFunc{c.receiveDERP}
 	}
+	// Always register SCION receive funcs so they're available when
+	// SCION connects mid-session (e.g. via ReconfigureSCION from Android).
+	// receiveSCION handles nil pconnSCION by waiting and retrying.
+	fns = append(fns, c.receiveSCION, c.receiveSCIONShim)
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
 	return fns, c.LocalPort(), nil
@@ -3303,6 +3380,7 @@ func (c *connBind) Close() error {
 	if c.closeDisco6 != nil {
 		c.closeDisco6.Close()
 	}
+	c.closeSCIONBindLocked()
 	// Send an empty read result to unblock receiveDERP,
 	// which will then check connBind.Closed.
 	// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
@@ -3353,6 +3431,7 @@ func (c *Conn) Close() error {
 	// They will frequently have been closed already by a call to connBind.Close.
 	c.pconn6.Close()
 	c.pconn4.Close()
+	c.closeSCIONLocked()
 	if c.closeDisco4 != nil {
 		c.closeDisco4.Close()
 	}
@@ -3600,6 +3679,9 @@ func (c *Conn) rebind(curPortFate currentPortFate) error {
 		c.portMapper.SetLocalPort(c.LocalPort())
 	}
 	c.UpdatePMTUD()
+
+	c.initSCIONLocked(c.connCtx)
+
 	return nil
 }
 
@@ -4003,11 +4085,19 @@ var (
 	metricSendDataBytesPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv4")
 	metricSendDataBytesPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv6")
 
+	// SCION data packets and bytes
+	metricRecvDataPacketsSCION = clientmetric.NewAggregateCounter("magicsock_recv_data_scion")
+	metricRecvDataBytesSCION  = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_scion")
+	metricSendDataPacketsSCION = clientmetric.NewAggregateCounter("magicsock_send_data_scion")
+	metricSendDataBytesSCION   = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_scion")
+
 	// Disco packets
 	metricSendDiscoUDP                           = clientmetric.NewCounter("magicsock_disco_send_udp")
 	metricSendDiscoDERP                          = clientmetric.NewCounter("magicsock_disco_send_derp")
+	metricSendDiscoSCION                         = clientmetric.NewCounter("magicsock_disco_send_scion")
 	metricSentDiscoUDP                           = clientmetric.NewCounter("magicsock_disco_sent_udp")
 	metricSentDiscoDERP                          = clientmetric.NewCounter("magicsock_disco_sent_derp")
+	metricSentDiscoSCION                         = clientmetric.NewCounter("magicsock_disco_sent_scion")
 	metricSentDiscoPing                          = clientmetric.NewCounter("magicsock_disco_sent_ping")
 	metricSentDiscoPong                          = clientmetric.NewCounter("magicsock_disco_sent_pong")
 	metricSentDiscoPeerMTUProbes                 = clientmetric.NewCounter("magicsock_disco_sent_peer_mtu_probes")

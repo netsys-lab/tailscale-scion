@@ -324,7 +324,10 @@ func (b *Build) Command(dir, cmd string, args ...string) *Command {
 		ret.Cmd.Stderr = &ret.Output
 	}
 	// dist always wants to use gocross if any Go is involved.
-	ret.Cmd.Env = append(os.Environ(), "TS_USE_GOCROSS=1")
+	// Suppress bash debug traces (set -x) from tool/go in CI, because
+	// GoPkg() uses CombinedOutput() and set -x pollutes stdout+stderr,
+	// causing "no matching files" errors when building deb/rpm packages.
+	ret.Cmd.Env = append(os.Environ(), "TS_USE_GOCROSS=1", "NOBASHDEBUG=true")
 	ret.Cmd.Dir = dir
 	return ret
 }

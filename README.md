@@ -1,87 +1,107 @@
-# Tailscale
+# Tailscale (SCION)
 
-https://tailscale.com
+Tailscale fork with SCION path-aware transport.
 
-Private WireGuard® networks made easy
+## What This Is
 
-## Overview
+A fork of [tailscale/tailscale](https://github.com/tailscale/tailscale) that adds [SCION](https://www.scion.org/) as a transport layer alongside WireGuard's existing UDP. Peers on SCION-enabled ASes gets path-aware routing with latency-based path selection.
 
-This repository contains the majority of Tailscale's open source code.
-Notably, it includes the `tailscaled` daemon and
-the `tailscale` CLI tool. The `tailscaled` daemon runs on Linux, Windows,
-[macOS](https://tailscale.com/kb/1065/macos-variants/), and to varying degrees
-on FreeBSD and OpenBSD. The Tailscale iOS and Android apps use this repo's
-code, but this repo doesn't contain the mobile GUI code.
+> **This project is not affiliated with or endorsed by Tailscale Inc.**
 
-Other [Tailscale repos](https://github.com/orgs/tailscale/repositories) of note:
+## Status
 
-* the Android app is at https://github.com/tailscale/tailscale-android
-* the Synology package is at https://github.com/tailscale/tailscale-synology
-* the QNAP package is at https://github.com/tailscale/tailscale-qpkg
-* the Chocolatey packaging is at https://github.com/tailscale/tailscale-chocolatey
+Experimental. Platforms: Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, Android (via [tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion)).
 
-For background on which parts of Tailscale are open source and why,
-see [https://tailscale.com/opensource/](https://tailscale.com/opensource/).
+## Releases
 
-## Using
+Pre-built binaries for Linux (amd64/arm64), macOS, and Windows are available on the [Releases](https://github.com/netsys-lab/tailscale-scion/releases) page. Android APK releases are available from [tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion/releases).
 
-We serve packages for a variety of distros and platforms at
-[https://pkgs.tailscale.com](https://pkgs.tailscale.com/).
+For CLI usage, see the [Tailscale CLI reference](https://tailscale.com/docs/reference/tailscale-cli) — all standard `tailscale` and `tailscaled` commands work the same.
 
-## Other clients
+## Quick Start (Linux)
 
-The [macOS, iOS, and Windows clients](https://tailscale.com/download)
-use the code in this repository but additionally include small GUI
-wrappers. The GUI wrappers on non-open source platforms are themselves
-not open source.
-
-## Building
-
-We always require the latest Go release, currently Go 1.25. (While we build
-releases with our [Go fork](https://github.com/tailscale/go/), its use is not
-required.)
-
-```
+```bash
+# Build
 go install tailscale.com/cmd/tailscale{,d}
+
+# Run with embedded SCION daemon + bootstrap
+TS_SCION_EMBEDDED=1 \
+TS_SCION_BOOTSTRAP_URL=http://your-bootstrap-server:8041 \
+  tailscaled
+
+# Verify SCION is connected
+curl -s --unix-socket /var/run/tailscale/tailscaled.sock \
+  http://local-tailscaled.sock/localapi/v0/scion-status
+# {"Connected":true,"LocalIA":"19-ffaa:1:eba"}
 ```
 
-If you're packaging Tailscale for distribution, use `build_dist.sh`
-instead, to burn commit IDs and version info into the binaries:
+If you have a local SCION daemon (sciond) running, no environment variables are needed -- Tailscale will connect to it automatically at `127.0.0.1:30255`.
 
+## Android
+
+See [netsys-lab/tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion) for the Android client with SCION settings UI and live path display.
+
+## Connection Flow
+
+SCION connects using a cascading fallback:
+
+1. **External daemon** -- connects to sciond at `SCION_DAEMON_ADDRESS`. *Skipped if `TS_SCION_EMBEDDED=1`.*
+2. **Embedded daemon** -- loads local topology file (`TS_SCION_TOPOLOGY` or `/etc/scion/topology.json`). *Skipped if `TS_SCION_FORCE_BOOTSTRAP=1`.*
+3. **Bootstrap** -- fetches topology from: explicit URL → DNS SRV discovery → hardcoded defaults. Then starts embedded daemon with the fetched topology.
+
+See [docs/architecture.md](docs/architecture.md) for details.
+
+## Configuration
+
+### Core
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SCION_DAEMON_ADDRESS` | `127.0.0.1:30255` | External SCION daemon gRPC address |
+| `TS_SCION_EMBEDDED` | `false` | Skip external daemon, use embedded connector only |
+| `TS_PREFER_SCION` | `false` | Unconditionally prefer SCION over all other paths |
+| `TS_SCION_PREFERENCE` | `15` | betterAddr points bonus for SCION (0 to disable) |
+| `TS_SCION_PORT` | (auto) | Local SCION/UDP listen port |
+| `TS_SCION_LISTEN_ADDR` | (auto) | Listen address override |
+
+### Bootstrap & Topology
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TS_SCION_TOPOLOGY` | (auto) | Path to `topology.json` (defaults to `/etc/scion/topology.json` on Linux) |
+| `TS_SCION_BOOTSTRAP_URL` | (unset) | Single bootstrap server URL |
+| `TS_SCION_BOOTSTRAP_URLS` | (unset) | Comma-separated bootstrap server URLs |
+| `TS_SCION_FORCE_BOOTSTRAP` | `false` | Skip local topology, go straight to bootstrap |
+| `TS_SCION_STATE_DIR` | (auto) | State directory for bootstrap data and PathDB |
+
+### Advanced
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TS_SCION_MAX_PROBE_PATHS` | `5` | Max SCION paths to probe per peer |
+| `TS_SCION_DIVERSITY_THRESHOLD` | `50` | Latency penalty threshold (ms) for path diversity |
+| `TS_SCION_NO_FAST_PATH` | `false` | Disable pre-serialized fast-path sends |
+| `TS_SCION_NO_DISPATCHER_SHIM` | `false` | Disable legacy dispatcher port 30041 shim |
+
+## Build Tags
+
+Build without SCION support using the `ts_omit_scion` tag:
+
+```bash
+go install -tags ts_omit_scion tailscale.com/cmd/tailscale{,d}
 ```
-./build_dist.sh tailscale.com/cmd/tailscale
-./build_dist.sh tailscale.com/cmd/tailscaled
-```
 
-If your distro has conventions that preclude the use of
-`build_dist.sh`, please do the equivalent of what it does in your
-distro's way, so that bug reports contain useful version information.
+This compiles out all SCION code, producing a smaller binary with no `scionproto/scion` dependency.
 
-## Bugs
 
-Please file any issues about this code or the hosted service on
-[the issue tracker](https://github.com/tailscale/tailscale/issues).
+## Architecture
 
-## Contributing
+See [docs/architecture.md](docs/architecture.md) for component overview, data flow, and design decisions.
 
-PRs welcome! But please file bugs. Commit messages should [reference
-bugs](https://docs.github.com/en/github/writing-on-github/autolinked-references-and-urls).
+## License
 
-We require [Developer Certificate of
-Origin](https://en.wikipedia.org/wiki/Developer_Certificate_of_Origin)
-`Signed-off-by` lines in commits.
+BSD-3-Clause. Based on [tailscale/tailscale](https://github.com/tailscale/tailscale).
+SCION networking provided by [scionproto/scion](https://github.com/scionproto/scion) (Apache-2.0).
 
-See [commit-messages.md](docs/commit-messages.md) (or skim `git log`) for our commit message style.
-
-## About Us
-
-[Tailscale](https://tailscale.com/) is primarily developed by the
-people at https://github.com/orgs/tailscale/people. For other contributors,
-see:
-
-* https://github.com/tailscale/tailscale/graphs/contributors
-* https://github.com/tailscale/tailscale-android/graphs/contributors
-
-## Legal
-
+This project is not affiliated with or endorsed by Tailscale Inc.
 WireGuard is a registered trademark of Jason A. Donenfeld.

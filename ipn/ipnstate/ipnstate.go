@@ -176,6 +176,16 @@ type TailnetStatus struct {
 	MagicDNSEnabled bool
 }
 
+// SCIONPathInfo describes a SCION path to a peer.
+type SCIONPathInfo struct {
+	Path      string  `json:"Path"`
+	Active    bool    `json:"Active"`
+	Healthy   bool    `json:"Healthy"`
+	LatencyMs float64 `json:"LatencyMs"`
+	ExpiresAt string  `json:"ExpiresAt,omitempty"`
+	MTU       int     `json:"MTU,omitempty"`
+}
+
 // ExitNodeStatus describes the current exit node.
 type ExitNodeStatus struct {
 	// ID is the exit node's ID.
@@ -255,6 +265,8 @@ type PeerStatus struct {
 	CurAddr   string // one of Addrs, or unique if roaming
 	Relay     string // DERP region
 	PeerRelay string // peer relay address (ip:port:vni)
+
+	SCIONPaths []SCIONPathInfo `json:"SCIONPaths,omitempty"`
 
 	RxBytes        int64
 	TxBytes        int64
@@ -544,6 +556,9 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	}
 	if v := st.TaildropTarget; v != TaildropTargetUnknown {
 		e.TaildropTarget = v
+	}
+	if v := st.SCIONPaths; v != nil {
+		e.SCIONPaths = v
 	}
 	e.Location = st.Location
 }

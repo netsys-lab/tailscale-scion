@@ -46,7 +46,7 @@ func (t *tgzTarget) Build(b *dist.Build) ([]string, error) {
 	if t.goEnv["GOOS"] == "linux" {
 		// Linux used to be the only tgz architecture, so we didn't put the OS
 		// name in the filename.
-		filename = fmt.Sprintf("tailscale_%s_%s.tgz", b.Version.Short, t.arch())
+		filename = fmt.Sprintf("tailscale-scion_%s_%s.tgz", b.Version.Short, t.arch())
 	} else {
 		filename = fmt.Sprintf("tailscale_%s_%s_%s.tgz", b.Version.Short, t.os(), t.arch())
 	}
@@ -233,14 +233,14 @@ func (t *debTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, err
 	}
 	info := nfpm.WithDefaults(&nfpm.Info{
-		Name:        "tailscale",
+		Name:        "tailscale-scion",
 		Arch:        arch,
 		Platform:    "linux",
 		Version:     b.Version.Short,
-		Maintainer:  "Tailscale Inc <info@tailscale.com>",
-		Description: "The easiest, most secure, cross platform way to use WireGuard + oauth2 + 2FA/SSO",
-		Homepage:    "https://www.tailscale.com",
-		License:     "MIT",
+		Maintainer:  "netsys-lab",
+		Description: "Tailscale with SCION path-aware networking support",
+		Homepage:    "https://github.com/netsys-lab/tailscale-scion",
+		License:     "BSD-3-Clause",
 		Section:     "net",
 		Priority:    "extra",
 		Overridables: nfpm.Overridables{
@@ -251,20 +251,9 @@ func (t *debTarget) Build(b *dist.Build) ([]string, error) {
 				PostRemove:  filepath.Join(repoDir, "release/deb/debian.postrm.sh"),
 			},
 			Depends: []string{
-				// iptables is almost always required but not strictly needed.
-				// Even if you can technically run Tailscale without it (by
-				// manually configuring nftables or userspace mode), we still
-				// mark this as "Depends" because our previous experiment in
-				// https://github.com/tailscale/tailscale/issues/9236 of making
-				// it only Recommends caused too many problems. Until our
-				// nftables table is more mature, we'd rather err on the side of
-				// wasting a little disk by including iptables for people who
-				// might not need it rather than handle reports of it being
-				// missing.
 				"iptables",
 			},
 			Recommends: []string{
-				"tailscale-archive-keyring (>= 1.35.181)",
 				// The "ip" command isn't needed since 2021-11-01 in
 				// 408b0923a61972ed but kept as an option as of
 				// 2021-11-18 in d24ed3f68e35e802d531371.  See
@@ -274,8 +263,8 @@ func (t *debTarget) Build(b *dist.Build) ([]string, error) {
 				// we can live without it, so it's not Depends.
 				"iproute2",
 			},
-			Replaces:  []string{"tailscale-relay"},
-			Conflicts: []string{"tailscale-relay"},
+			Replaces:  []string{"tailscale", "tailscale-relay"},
+			Conflicts: []string{"tailscale", "tailscale-relay"},
 		},
 	})
 	pkg, err := nfpm.Get("deb")
@@ -283,7 +272,7 @@ func (t *debTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, err
 	}
 
-	filename := fmt.Sprintf("tailscale_%s_%s.deb", b.Version.Short, arch)
+	filename := fmt.Sprintf("tailscale-scion_%s_%s.deb", b.Version.Short, arch)
 	log.Printf("Building %s", filename)
 	f, err := os.Create(filepath.Join(b.Out, filename))
 	if err != nil {
@@ -376,14 +365,14 @@ func (t *rpmTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, err
 	}
 	info := nfpm.WithDefaults(&nfpm.Info{
-		Name:        "tailscale",
+		Name:        "tailscale-scion",
 		Arch:        arch,
 		Platform:    "linux",
 		Version:     b.Version.Short,
-		Maintainer:  "Tailscale Inc <info@tailscale.com>",
-		Description: "The easiest, most secure, cross platform way to use WireGuard + oauth2 + 2FA/SSO",
-		Homepage:    "https://www.tailscale.com",
-		License:     "MIT",
+		Maintainer:  "netsys-lab",
+		Description: "Tailscale with SCION path-aware networking support",
+		Homepage:    "https://github.com/netsys-lab/tailscale-scion",
+		License:     "BSD-3-Clause",
 		Overridables: nfpm.Overridables{
 			Contents: contents,
 			Scripts: nfpm.Scripts{
@@ -392,8 +381,8 @@ func (t *rpmTarget) Build(b *dist.Build) ([]string, error) {
 				PostRemove:  filepath.Join(repoDir, "release/rpm/rpm.postrm.sh"),
 			},
 			Depends:   []string{"iptables", "iproute"},
-			Replaces:  []string{"tailscale-relay"},
-			Conflicts: []string{"tailscale-relay"},
+			Replaces:  []string{"tailscale", "tailscale-relay"},
+			Conflicts: []string{"tailscale", "tailscale-relay"},
 			RPM: nfpm.RPM{
 				Group: "Network",
 				Signature: nfpm.RPMSignature{
@@ -409,7 +398,7 @@ func (t *rpmTarget) Build(b *dist.Build) ([]string, error) {
 		return nil, err
 	}
 
-	filename := fmt.Sprintf("tailscale_%s_%s.rpm", b.Version.Short, arch)
+	filename := fmt.Sprintf("tailscale-scion_%s_%s.rpm", b.Version.Short, arch)
 	log.Printf("Building %s", filename)
 
 	f, err := os.Create(filepath.Join(b.Out, filename))
