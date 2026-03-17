@@ -12,6 +12,12 @@ A fork of [tailscale/tailscale](https://github.com/tailscale/tailscale) that add
 
 Experimental. Platforms: Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, Android (via [tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion)).
 
+## Releases
+
+Pre-built binaries for Linux (amd64/arm64), macOS, and Windows are available on the [Releases](https://github.com/netsys-lab/tailscale-scion/releases) page. Android APK releases are available from [tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion/releases).
+
+For CLI usage, see the [Tailscale CLI reference](https://tailscale.com/docs/reference/tailscale-cli) — all standard `tailscale` and `tailscaled` commands work the same.
+
 ## Quick Start (Linux)
 
 ```bash

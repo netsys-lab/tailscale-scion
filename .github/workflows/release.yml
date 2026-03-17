@@ -110,3 +110,8 @@ jobs:
             **Linux (tgz):** Extract and copy `tailscale`/`tailscaled` to PATH
             **macOS:** Extract tgz, run `sudo ./tailscaled &` then `./tailscale up`
             **Windows:** Extract zip, run `tailscaled.exe` then `tailscale.exe up`
+
+            ### Documentation
+
+            CLI reference: https://tailscale.com/docs/reference/tailscale-cli
+            SCION configuration: https://github.com/netsys-lab/tailscale-scion#configuration
