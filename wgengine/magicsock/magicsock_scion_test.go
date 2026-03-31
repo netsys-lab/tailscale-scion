@@ -1004,7 +1004,11 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 	})
 
 	t.Run("skips non-expiring path", func(t *testing.T) {
-		// No daemon calls expected — the path doesn't need refresh.
+		// Hard refresh skipped (path far from expiry), but soft refresh
+		// queries the daemon with Refresh: false to discover new paths.
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: false}).
+			Return(nil, nil)
+
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
@@ -1022,7 +1026,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 		}
 		c.registerSCIONPathLocking(pi)
 
-		// Should not call daemon.Paths since path doesn't need refresh.
+		// Hard refresh should not call daemon.Paths with Refresh: true.
 		c.refreshSCIONPathsOnce()
 	})
 
