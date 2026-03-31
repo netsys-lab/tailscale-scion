@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -584,10 +585,11 @@ func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes
 }
 
 // scionBatchRW abstracts ipv4.PacketConn and ipv6.PacketConn for
-// batch I/O. Both have identical ReadBatch/WriteBatch signatures
-// since ipv4.Message and ipv6.Message are the same type (socket.Message).
-// On non-Linux platforms, ReadBatch/WriteBatch fall back to per-message
-// sendto/recvfrom (golang.org/x/net handles this internally).
+// batch I/O (recvmmsg/sendmmsg). Both have identical ReadBatch/WriteBatch
+// signatures since ipv4.Message and ipv6.Message are the same type
+// (socket.Message). Only used on Linux; on other platforms underlayXPC
+// and shimXPC are nil, and the receive/send loops fall back to
+// single-packet snet.Conn.ReadFrom/WriteTo.
 type scionBatchRW interface {
 	ReadBatch([]ipv4.Message, int) (int, error)
 	WriteBatch([]ipv4.Message, int) (int, error)
@@ -1003,10 +1005,11 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		localPort = uint16(sa.Host.Port)
 	}
 
-	// Wrap underlay conn for sendmmsg batching, selecting the correct
-	// address family based on the local address.
+	// Wrap underlay conn for recvmmsg/sendmmsg batching (Linux only).
+	// On non-Linux platforms, batch I/O is not available and the receive/send
+	// loops fall back to single-packet snet.Conn.ReadFrom/WriteTo.
 	var underlayXPC scionBatchRW
-	if underlayConn != nil {
+	if underlayConn != nil && runtime.GOOS == "linux" {
 		local, ok := underlayConn.LocalAddr().(*net.UDPAddr)
 		if !ok {
 			return nil, fmt.Errorf("unexpected underlay local address type %T", underlayConn.LocalAddr())
@@ -1078,18 +1081,21 @@ func openDispatcherShim(sc *scionConn, logf logger.Logf, netMon *netmon.Monitor)
 		}
 	}
 
-	// Wrap for batch I/O, selecting address family based on local address.
+	// Wrap for batch I/O (Linux only). On non-Linux, shimXPC stays nil
+	// and receiveSCIONShim polls infrequently without reading.
 	var xpc scionBatchRW
-	local, ok := shimConn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		shimConn.Close()
-		logf("magicsock: SCION shim: unexpected local address type %T", shimConn.LocalAddr())
-		return
-	}
-	if local.IP.To4() != nil {
-		xpc = ipv4.NewPacketConn(shimConn)
-	} else {
-		xpc = ipv6.NewPacketConn(shimConn)
+	if runtime.GOOS == "linux" {
+		local, ok := shimConn.LocalAddr().(*net.UDPAddr)
+		if !ok {
+			shimConn.Close()
+			logf("magicsock: SCION shim: unexpected local address type %T", shimConn.LocalAddr())
+			return
+		}
+		if local.IP.To4() != nil {
+			xpc = ipv4.NewPacketConn(shimConn)
+		} else {
+			xpc = ipv6.NewPacketConn(shimConn)
+		}
 	}
 
 	sc.shimConn = shimConn
