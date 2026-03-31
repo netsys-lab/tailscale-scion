@@ -901,6 +901,55 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 			t.Errorf("expiry should be zero for nil metadata, got %v", pi.expiry)
 		}
 	})
+
+	t.Run("same AS uses empty path without daemon query", func(t *testing.T) {
+		// When peerIA == localIA, discoverSCIONPaths should NOT query the
+		// daemon and should return a single path with scionSameASFingerprint.
+		// No mockDaemon.EXPECT() call here — gomock will fail if Paths is called.
+		c := &Conn{}
+		c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
+
+		keys, err := c.discoverSCIONPaths(context.Background(), localIA, hostAddr)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(keys) != 1 {
+			t.Fatalf("expected 1 key for same-AS, got %d", len(keys))
+		}
+
+		pi := c.lookupSCIONPathLocking(keys[0])
+		if pi == nil {
+			t.Fatal("path info not found in registry")
+		}
+		if pi.fingerprint != scionSameASFingerprint {
+			t.Errorf("fingerprint = %q, want %q", pi.fingerprint, scionSameASFingerprint)
+		}
+		if pi.path != nil {
+			t.Error("same-AS path should have nil snet.Path")
+		}
+		if !pi.expiry.IsZero() {
+			t.Errorf("same-AS path should never expire, got %v", pi.expiry)
+		}
+		if pi.cachedDst == nil {
+			t.Fatal("cachedDst should be set")
+		}
+		if pi.cachedDst.IA != localIA {
+			t.Errorf("cachedDst.IA = %v, want %v", pi.cachedDst.IA, localIA)
+		}
+		if _, ok := pi.cachedDst.Path.(snetpath.Empty); !ok {
+			t.Errorf("cachedDst.Path = %T, want snetpath.Empty", pi.cachedDst.Path)
+		}
+		if pi.cachedDst.NextHop == nil {
+			t.Fatal("cachedDst.NextHop should be set for same-AS")
+		}
+		wantNextHop := netip.MustParseAddrPort(pi.cachedDst.NextHop.String())
+		if wantNextHop != hostAddr {
+			t.Errorf("NextHop = %v, want %v", wantNextHop, hostAddr)
+		}
+		if !strings.Contains(pi.displayStr, "local") {
+			t.Errorf("displayStr = %q, want it to contain 'local'", pi.displayStr)
+		}
+	})
 }
 
 func TestRefreshSCIONPathsOnce(t *testing.T) {
@@ -1373,6 +1422,30 @@ func TestSCIONFinishChecksumOddPayload(t *testing.T) {
 
 	if fastChecksum != refChecksum {
 		t.Errorf("fast-path checksum (odd) = 0x%04x, reference = 0x%04x", fastChecksum, refChecksum)
+	}
+}
+
+func TestBuildSCIONReplyAddrEmptyPath(t *testing.T) {
+	srcIA := addr.MustParseIA("1-ff00:0:110")
+	srcHostAddr := netip.MustParseAddrPort("10.0.0.2:32766")
+	nextHop := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 32766}
+
+	// Same-AS: rawPathBytes is empty.
+	reply := buildSCIONReplyAddr(srcIA, srcHostAddr, nil, nextHop)
+	if reply == nil {
+		t.Fatal("expected non-nil reply for empty path (same-AS)")
+	}
+	if reply.IA != srcIA {
+		t.Errorf("IA = %v, want %v", reply.IA, srcIA)
+	}
+	if _, ok := reply.Path.(snetpath.Empty); !ok {
+		t.Errorf("Path = %T, want snetpath.Empty", reply.Path)
+	}
+	if reply.NextHop == nil {
+		t.Fatal("NextHop should be set")
+	}
+	if reply.NextHop.String() != nextHop.String() {
+		t.Errorf("NextHop = %v, want %v", reply.NextHop, nextHop)
 	}
 }
 

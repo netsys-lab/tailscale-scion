@@ -130,6 +130,8 @@ func (pi *scionPathInfo) buildDisplayStr() {
 		if md := pi.path.Metadata(); md != nil && len(md.Interfaces) > 0 {
 			hops = formatSCIONHops(md.Interfaces)
 		}
+	} else if pi.fingerprint == scionSameASFingerprint {
+		hops = "local"
 	}
 	pi.displayStr = fmt.Sprintf("scion:[%s]:[%s]:%d",
 		hops, pi.hostAddr.Addr(), pi.hostAddr.Port())
@@ -207,6 +209,12 @@ const defaultSCIONProbePaths = 5
 // fingerprint must be absent from daemon results before the path is removed.
 // At the default 30s refresh interval, this is ~90s.
 const scionStalePathThreshold = 3
+
+// scionSameASFingerprint is a sentinel fingerprint for same-AS (intra-AS)
+// paths. These paths use an empty SCION path (PathType=0, 0 wire bytes)
+// and communicate directly via UDP without border routers. The sentinel
+// prevents the refresh logic from garbage-collecting same-AS path entries.
+const scionSameASFingerprint snet.PathFingerprint = "same-as"
 
 // scionPongHistoryCount is the ring buffer size for per-path pong latency tracking.
 const scionPongHistoryCount = 8
@@ -534,7 +542,16 @@ func parseSCIONPacket(data []byte, scn *slayers.SCION) (
 // recvmmsg); it is required for the reply to be routable.
 func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes []byte, nextHop *net.UDPAddr) *snet.UDPAddr {
 	if len(rawPathBytes) == 0 {
-		return nil
+		// Same-AS: empty path, reply directly to source.
+		return &snet.UDPAddr{
+			IA: srcIA,
+			Host: &net.UDPAddr{
+				IP:   srcHostAddr.Addr().AsSlice(),
+				Port: int(srcHostAddr.Port()),
+			},
+			Path:    snetpath.Empty{},
+			NextHop: nextHop,
+		}
 	}
 	// Copy path bytes since DecodeFromBytes references the slice.
 	pathCopy := make([]byte, len(rawPathBytes))
@@ -1885,6 +1902,11 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		return nil, errNoSCION
 	}
 
+	// Same-AS: no inter-AS path needed, use empty SCION path (direct UDP).
+	if peerIA == sc.localIA {
+		return c.registerSameASSCIONPath(sc, peerIA, hostAddr)
+	}
+
 	paths, err := sc.daemon.Paths(ctx, peerIA, sc.localIA, daemon.PathReqFlags{Refresh: false})
 	if err != nil {
 		return nil, fmt.Errorf("querying SCION paths to %s: %w", peerIA, err)
@@ -1949,6 +1971,37 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		c.setActiveSCIONPath(peerIA, hostAddr, keys[0])
 	}
 	return keys, nil
+}
+
+// registerSameASSCIONPath creates a synthetic SCION path entry for a peer in
+// the same AS. Same-AS communication uses an empty SCION path (PathType=0,
+// 0 wire bytes) with direct UDP to the peer — no border routers are involved.
+func (c *Conn) registerSameASSCIONPath(sc *scionConn, peerIA addr.IA, hostAddr netip.AddrPort) ([]scionPathKey, error) {
+	pi := &scionPathInfo{
+		peerIA:      peerIA,
+		hostAddr:    hostAddr,
+		fingerprint: scionSameASFingerprint,
+		// path is nil: no snet.Path needed for same-AS.
+		// expiry is zero: same-AS paths never expire.
+	}
+	// Build cachedDst with empty SCION path and direct NextHop.
+	pi.cachedDst = &snet.UDPAddr{
+		IA:   peerIA,
+		Host: &net.UDPAddr{IP: hostAddr.Addr().AsSlice(), Port: int(hostAddr.Port())},
+		Path: snetpath.Empty{},
+		NextHop: &net.UDPAddr{
+			IP:   hostAddr.Addr().AsSlice(),
+			Port: int(hostAddr.Port()),
+		},
+	}
+	pi.buildDisplayStr()
+	pi.fastPath = buildSCIONFastPath(sc, pi)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := c.registerSCIONPath(pi)
+	c.setActiveSCIONPath(peerIA, hostAddr, k)
+	return []scionPathKey{k}, nil
 }
 
 // totalPathLatency returns the sum of all hop latencies for a SCION path.
@@ -2186,6 +2239,10 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		if !g.needRefresh {
 			continue
 		}
+		// Same-AS paths use an empty SCION path and never need daemon refresh.
+		if g.peerIA == sc.localIA {
+			continue
+		}
 
 		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemon.PathReqFlags{Refresh: true})
 		if err != nil || len(daemonPaths) == 0 {
@@ -2298,6 +2355,10 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 	for _, g := range groups {
 		if g.needRefresh {
 			continue // already refreshed above
+		}
+		// Same-AS paths don't change; skip daemon query.
+		if g.peerIA == sc.localIA {
+			continue
 		}
 		c.mu.Lock()
 		lastSoft := c.scionSoftRefreshAt[g.peerIA]
