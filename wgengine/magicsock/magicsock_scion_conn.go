@@ -24,6 +24,7 @@ func (c *Conn) initSCIONLocked(ctx context.Context) {
 	}
 	c.logf("magicsock: SCION available, local IA: %s", sc.localIA)
 	c.pconnSCION.Store(sc)
+	c.signalSCIONConnReady()
 	go c.refreshSCIONPaths()
 }
 

@@ -59,7 +59,7 @@ func (de *endpoint) discoPingTimeoutSCIONLocked(_ sentPing)                     
 func (de *endpoint) handlePongSCIONLocked(_ epAddr, _ time.Duration, _ mono.Time)        {}
 func (de *endpoint) handlePongPromoteSCIONLocked(_ addrQuality)                          {}
 func (de *endpoint) updateFromNodeSCIONLocked(_ tailcfg.NodeView) []scionPathKey         { return nil }
-func (de *endpoint) stopAndResetSCIONLocked() []scionPathKey                             { return nil }
+func (de *endpoint) stopAndResetSCIONLocked() ([]scionPathKey, scionIAKey)               { return nil, 0 }
 func (de *endpoint) sendSCIONData(_ epAddr, _ [][]byte, _ int) error                     { return nil }
 func (de *endpoint) scionAddrStr(e epAddr) string                                       { return e.String() }
 func (de *endpoint) populateSCIONPathsLocked(_ *ipnstate.PeerStatus)                    {}

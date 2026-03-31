@@ -171,19 +171,21 @@ func (de *endpoint) updateFromNodeSCIONLocked(n tailcfg.NodeView) []scionPathKey
 	return oldSCIONKeys
 }
 
-// stopAndResetSCIONLocked extracts SCION path keys for cleanup before the
-// endpoint state is cleared. Returns keys that need cleanup outside de.mu.
+// stopAndResetSCIONLocked extracts SCION path keys and peerIA for cleanup
+// before the endpoint state is cleared. Returns keys and peerIA that need
+// cleanup outside de.mu.
 // de.mu must be held.
-func (de *endpoint) stopAndResetSCIONLocked() []scionPathKey {
+func (de *endpoint) stopAndResetSCIONLocked() ([]scionPathKey, scionIAKey) {
 	if de.scionState == nil {
-		return nil
+		return nil, 0
 	}
+	peerIA := de.scionState.peerIA
 	var keys []scionPathKey
 	for k := range de.scionState.paths {
 		keys = append(keys, k)
 	}
 	de.scionState = nil
-	return keys
+	return keys, peerIA
 }
 
 // sendSCIONData sends WireGuard data over a SCION path, handling error
@@ -284,21 +286,30 @@ func (de *endpoint) demoteSCIONPathLocked(demotedKey scionPathKey) {
 
 	if bestKey.IsSet() {
 		de.scionState.activePath = bestKey
+		bestPS := de.scionState.paths[bestKey]
+		wmtu := scionWireMTU
+		if bestPS != nil && bestPS.wireMTU > 0 {
+			wmtu = bestPS.wireMTU
+		}
 		newAddr := addrQuality{
 			epAddr:         epAddr{ap: de.scionState.hostAddr, scionKey: bestKey},
 			latency:        bestLatency,
-			wireMTU:        scionWireMTU,
+			wireMTU:        wmtu,
 			scionPreferred: de.scionPreferred,
 		}
+		metricSCIONPathSwitch.Add(1)
 		de.c.logf("magicsock: SCION path demoted, switching to %s for %v", de.scionAddrStr(newAddr.epAddr), de.publicKey.ShortString())
 		de.setBestAddrLocked(newAddr)
 		go de.c.updateActiveSCIONPathLocking(de.scionState.peerIA, de.scionState.hostAddr, bestKey)
 	} else {
-		// No healthy SCION paths remain. Clear SCION bestAddr to fall back.
+		// No healthy SCION paths remain. Clear SCION bestAddr to fall back
+		// and proactively trigger a full ping round to quickly find direct
+		// UDP paths rather than waiting for the next natural cycle.
 		de.scionState.activePath = 0
 		if de.bestAddr.isSCION() {
-			de.c.logf("magicsock: no healthy SCION paths for %v, clearing bestAddr", de.publicKey.ShortString())
+			de.c.logf("magicsock: no healthy SCION paths for %v, clearing bestAddr and triggering full ping", de.publicKey.ShortString())
 			de.clearBestAddrLocked()
+			de.sendDiscoPingsLocked(mono.Now(), true)
 		}
 	}
 }
@@ -359,14 +370,20 @@ func (de *endpoint) reEvalSCIONPathsLocked(now mono.Time) {
 		}
 	}
 
+	bestPS := de.scionState.paths[bestKey]
+	wmtu := scionWireMTU
+	if bestPS != nil && bestPS.wireMTU > 0 {
+		wmtu = bestPS.wireMTU
+	}
 	candidate := addrQuality{
 		epAddr:         epAddr{ap: de.scionState.hostAddr, scionKey: bestKey},
 		latency:        bestLatency,
-		wireMTU:        scionWireMTU,
+		wireMTU:        wmtu,
 		scionPreferred: de.scionPreferred,
 	}
 
 	if betterAddr(candidate, de.bestAddr) {
+		metricSCIONPathSwitch.Add(1)
 		de.c.logf("magicsock: SCION re-eval: switching to %s (latency %v) for %v",
 			de.scionAddrStr(candidate.epAddr), bestLatency.Round(time.Millisecond), de.publicKey.ShortString())
 		de.debugUpdates.Add(EndpointChange{

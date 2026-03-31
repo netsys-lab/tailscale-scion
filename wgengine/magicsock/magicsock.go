@@ -440,6 +440,16 @@ type Conn struct {
 	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
 	// Used by receiveSCION to detect a dead socket and trigger reconnection.
 	lastSCIONRecv mono.Time
+
+	// scionReconnecting is an atomic flag to prevent multiple concurrent
+	// reconnectSCION goroutines. Set via CAS(false,true) before reconnecting,
+	// reset to false after completion or failure.
+	scionReconnecting atomic.Bool
+
+	// scionConnReady is closed when pconnSCION transitions from nil to non-nil,
+	// enabling instant wake-up for receiveSCION/receiveSCIONShim instead of
+	// polling with time.After. Reset to a new channel on each reconnection.
+	scionConnReady chan struct{}
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -693,6 +703,7 @@ func NewConn(opts Options) (*Conn, error) {
 
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
 	c.donec = c.connCtx.Done()
+	c.scionConnReady = make(chan struct{})
 
 	// Don't log the same log messages possibly every few seconds in our
 	// portmapper.
@@ -4086,10 +4097,15 @@ var (
 	metricSendDataBytesPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv6")
 
 	// SCION data packets and bytes
-	metricRecvDataPacketsSCION = clientmetric.NewAggregateCounter("magicsock_recv_data_scion")
-	metricRecvDataBytesSCION  = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_scion")
+	metricRecvDataPacketsSCION  = clientmetric.NewAggregateCounter("magicsock_recv_data_scion")
+	metricRecvDataBytesSCION   = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_scion")
 	metricSendDataPacketsSCION = clientmetric.NewAggregateCounter("magicsock_send_data_scion")
 	metricSendDataBytesSCION   = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_scion")
+
+	// SCION operational counters
+	metricSCIONPathSwitch  = clientmetric.NewCounter("magicsock_scion_path_switch")
+	metricSCIONReconnect   = clientmetric.NewCounter("magicsock_scion_reconnect")
+	metricSCIONParseError  = clientmetric.NewCounter("magicsock_scion_parse_error")
 
 	// Disco packets
 	metricSendDiscoUDP                           = clientmetric.NewCounter("magicsock_disco_send_udp")

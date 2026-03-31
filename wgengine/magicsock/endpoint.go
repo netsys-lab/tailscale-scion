@@ -100,8 +100,9 @@ type endpoint struct {
 	isWireguardOnly bool // whether the endpoint is WireGuard only
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
 
-	scionState     *scionEndpointState // nil if peer has no SCION address
-	scionPreferred bool                // true if both self and peer have NodeAttrSCIONPrefer
+	scionState       *scionEndpointState // nil if peer has no SCION address
+	scionPreferred   bool                // true if both self and peer have NodeAttrSCIONPrefer
+	scionDiscovering atomic.Bool          // CAS guard to prevent concurrent discoverSCIONPathAsync calls
 }
 
 // udpRelayEndpointReady determines whether the given relay [addrQuality] should
@@ -2140,9 +2141,9 @@ func (de *endpoint) stopAndReset() {
 	atomic.AddInt64(&de.numStopAndResetAtomic, 1)
 	de.mu.Lock()
 
-	// Extract scionPathKeys before releasing de.mu so we can clean them up
-	// under c.mu afterward (lock order: c.mu before de.mu).
-	scionKeys := de.stopAndResetSCIONLocked()
+	// Extract scionPathKeys and peerIA before releasing de.mu so we can
+	// clean them up under c.mu afterward (lock order: c.mu before de.mu).
+	scionKeys, scionPeerIA := de.stopAndResetSCIONLocked()
 
 	if closing := de.c.closing.Load(); !closing {
 		if de.isWireguardOnly {
@@ -2167,6 +2168,10 @@ func (de *endpoint) stopAndReset() {
 	// (updateNodes, SetPrivateKey, Close), so call directly.
 	for _, k := range scionKeys {
 		de.c.unregisterSCIONPath(k)
+	}
+	// Clean up soft refresh timestamp to prevent minor memory leak.
+	if scionPeerIA != 0 {
+		delete(de.c.scionSoftRefreshAt, scionPeerIA)
 	}
 }
 
