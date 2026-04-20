@@ -137,8 +137,26 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 func (de *endpoint) setBestAddrLocked(v addrQuality) {
 	if v.epAddr != de.bestAddr.epAddr {
 		de.probeUDPLifetime.resetCycleEndpointLocked()
+		recordBetterAddrCategory(v.epAddr)
 	}
 	de.bestAddr = v
+}
+
+// recordBetterAddrCategory increments the clientmetric counter corresponding
+// to the transport class of a promoted bestAddr. Intentionally ignores
+// comparisons that do not result in an actual change (callers only invoke
+// this when the address truly transitioned).
+func recordBetterAddrCategory(ea epAddr) {
+	switch {
+	case ea.ap.Addr() == tailcfg.DerpMagicIPAddr:
+		metricBetterAddrChoseDERP.Add(1)
+	case ea.scionKey.IsSet():
+		metricBetterAddrChoseSCION.Add(1)
+	case ea.vni.IsSet():
+		metricBetterAddrChoseRelay.Add(1)
+	default:
+		metricBetterAddrChoseDirect.Add(1)
+	}
 }
 
 const (
@@ -1850,6 +1868,16 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 
 // epAddr is a [netip.AddrPort] with an optional Geneve header (RFC8926)
 // [packet.VirtualNetworkID] or SCION path key.
+//
+// Refactor flag (see P3-26 in review): epAddr is currently a flat struct
+// whose optional fields (vni, scionKey) expand every time a new transport
+// is added. Each addition duplicates work across isDirect/isSCION/betterAddr/
+// String and grows the test matrix quadratically. Before adding a third
+// transport-specific discriminator, convert this to a tagged-union style:
+// the addrPort stays as the common identity, but the transport-specific
+// data (Geneve VNI, SCION key, hypothetical future transport) moves behind
+// a single typed field. That keeps the comparable/map-key properties of
+// epAddr while stopping further accretion.
 type epAddr struct {
 	ap       netip.AddrPort          // if ap == tailcfg.DerpMagicIPAddr then vni is never set
 	vni      packet.VirtualNetworkID // vni.IsSet() indicates if this [epAddr] involves a Geneve header
@@ -1893,6 +1921,32 @@ func (a addrQuality) String() string {
 }
 
 // betterAddr reports whether a is a better addr to use than b.
+//
+// Preference hierarchy (in the order the checks below appear), confirmed
+// as the intended production policy: SCION > Direct > Relay (Geneve) > DERP.
+//
+// Mechanisms, grouped by strength:
+//
+//  1. Relay paths (VNI set) lose to non-relay paths unconditionally.
+//  2. When one side is SCION and the other is a relay path, SCION wins
+//     unconditionally (so a working SCION path always beats Geneve relay).
+//  3. When TS_PREFER_SCION=1 is set, SCION wins over any non-SCION path
+//     unconditionally, regardless of latency. This is the "hard override"
+//     for deployments that must pin traffic to SCION.
+//  4. Otherwise, a points system: each side earns points for being lower
+//     latency (1 point per % faster than the other), private/loopback/IPv6,
+//     plus +scionPreferenceBonus() (default 15) if it is a SCION path,
+//     plus +25 extra if NodeAttrSCIONPrefer is set on both sides.
+//
+// The default +15 bias means SCION wins at equal latency and only loses to
+// a direct path that is more than ~15% faster. That matches "SCION > Direct"
+// for similar-latency paths, with a bounded handover threshold when direct
+// is clearly better. Operators who want strict SCION-always-wins should set
+// TS_PREFER_SCION=1 (mechanism 3).
+//
+// Observability: metricBetterAddrChose{SCION,Direct,Relay,DERP} records the
+// category of the winner so operators can debug path-selection churn without
+// reading per-packet logs.
 func betterAddr(a, b addrQuality) bool {
 	if a.epAddr == b.epAddr {
 		if a.wireMTU > b.wireMTU {

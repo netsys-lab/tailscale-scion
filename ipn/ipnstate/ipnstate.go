@@ -184,6 +184,17 @@ type SCIONPathInfo struct {
 	LatencyMs float64 `json:"LatencyMs"`
 	ExpiresAt string  `json:"ExpiresAt,omitempty"`
 	MTU       int     `json:"MTU,omitempty"`
+	// Hops is the number of SCION interfaces in this path (2 × AS hops).
+	// Zero for same-AS paths.
+	Hops int `json:"Hops,omitempty"`
+	// LossPercent is 100 × (pingsSent - pongsReceived) / pingsSent, in [0,100].
+	// -1 when no pings have been sent yet. Useful for diagnosing which path
+	// is flaky before it gets demoted.
+	LossPercent float64 `json:"LossPercent"`
+	// LastPongSecondsAgo reports how stale this path's last successful
+	// probe is. Zero means fresh; large values mean the path may be dying.
+	// -1 when no pongs have been received.
+	LastPongSecondsAgo float64 `json:"LastPongSecondsAgo"`
 }
 
 // ExitNodeStatus describes the current exit node.

@@ -178,3 +178,61 @@ func TestLocalSearchDomainFromHostname(t *testing.T) {
 	// the function doesn't panic and returns without error on this host.
 	_, _ = localSearchDomainFromHostname()
 }
+
+// TestHttpGetEnforcesSizeCap verifies httpGet refuses responses that reach
+// the supplied size cap. A malicious server must not be able to fill memory
+// or disk by returning an oversized topology/TRC.
+func TestHttpGetEnforcesSizeCap(t *testing.T) {
+	// Server that streams a 4 KiB response.
+	payload := make([]byte, 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(payload)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{}
+
+	// Cap smaller than payload → should error.
+	if _, err := httpGet(context.Background(), client, srv.URL, 1024); err == nil {
+		t.Error("expected size-cap error, got nil")
+	}
+	// Cap larger than payload → should succeed.
+	if _, err := httpGet(context.Background(), client, srv.URL, 1<<20); err != nil {
+		t.Errorf("expected success, got %v", err)
+	}
+}
+
+// TestBootstrapSCIONCapsTRCCount verifies that a malicious server
+// advertising many TRC entries cannot cause the client to fetch more than
+// bootstrapMaxTRCEntries blobs. Pre-fix, the loop walked every entry.
+func TestBootstrapSCIONCapsTRCCount(t *testing.T) {
+	const advertised = bootstrapMaxTRCEntries * 2
+
+	// Build a TRC index with way more entries than we should fetch.
+	indexEntries := make([]trcEntry, advertised)
+	for i := range indexEntries {
+		indexEntries[i].ID = trcID{ISD: i + 1, BaseNumber: 1, SerialNumber: 1}
+	}
+	idxBytes, err := json.Marshal(indexEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var blobFetches int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/topology", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) })
+	mux.HandleFunc("/trcs", func(w http.ResponseWriter, r *http.Request) { w.Write(idxBytes) })
+	mux.HandleFunc("/trcs/", func(w http.ResponseWriter, r *http.Request) {
+		blobFetches++
+		w.Write([]byte("fake-trc"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	if err := bootstrapSCION(context.Background(), logger.WithPrefix(t.Logf, "test: "), srv.URL, t.TempDir()); err != nil {
+		t.Fatalf("bootstrapSCION: %v", err)
+	}
+	if blobFetches > bootstrapMaxTRCEntries {
+		t.Errorf("fetched %d blobs; bootstrapMaxTRCEntries cap is %d", blobFetches, bootstrapMaxTRCEntries)
+	}
+}

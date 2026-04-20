@@ -28,6 +28,7 @@ import (
 	"github.com/tailscale/wireguard-go/device"
 	"go4.org/mem"
 	"golang.org/x/net/ipv6"
+	"golang.org/x/time/rate"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
@@ -434,7 +435,7 @@ type Conn struct {
 	// data for a peer.
 	scionPaths         map[scionPathKey]*scionPathInfo
 	scionPathsByAddr   map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
-	scionPathSeq       atomic.Uint32                 // monotonic key generator for scionPaths
+	scionPathSeq       atomic.Uint64                 // monotonic key generator for scionPaths (never wraps in practice)
 	scionSoftRefreshAt map[scionIAKey]time.Time       // last soft refresh per peer, guarded by c.mu; bounded by unique peer count
 
 	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
@@ -446,10 +447,38 @@ type Conn struct {
 	// reset to false after completion or failure.
 	scionReconnecting atomic.Bool
 
-	// scionConnReady is closed when pconnSCION transitions from nil to non-nil,
-	// enabling instant wake-up for receiveSCION/receiveSCIONShim instead of
-	// polling with time.After. Reset to a new channel on each reconnection.
-	scionConnReady chan struct{}
+	// scionConnReady holds a channel that is closed when pconnSCION
+	// transitions from nil to non-nil, giving receiveSCION/receiveSCIONShim
+	// instant wake-up instead of polling with time.After. On each
+	// reconnection a fresh channel replaces the closed one (see
+	// signalSCIONConnReady). The pointer is accessed via atomic.Pointer so
+	// that concurrent readers (receive loops) and signalers (reconnect
+	// paths) don't race on the field or double-close the channel.
+	scionConnReady atomic.Pointer[chan struct{}]
+
+	// scionLazyEndpointLimiter bounds the rate at which SCION receive paths
+	// create lazyEndpoint objects for unknown source addresses. See
+	// initSCIONLazyEndpointLimiter / allowSCIONLazyEndpoint. nil under
+	// ts_omit_scion.
+	scionLazyEndpointLimiter *rate.Limiter
+
+	// scionHotLogf is a rate-limited logger used by SCION receive/send paths
+	// for errors that can flood (per-packet read errors during a
+	// disconnect, per-send reconnect triggers, etc.). Built in
+	// initSCIONLazyEndpointLimiter.
+	scionHotLogf logger.Logf
+
+	// scionLastConnectErr records the most recent trySCIONConnect failure
+	// so operators can query /scion-status instead of digging through logs.
+	// Written only when a connect attempt fails; the field is cleared by
+	// storing nil after a successful connect.
+	scionLastConnectErr atomic.Pointer[scionLastErrInfo]
+}
+
+// scionLastErrInfo is the payload stored in Conn.scionLastConnectErr.
+type scionLastErrInfo struct {
+	Err  string
+	When time.Time
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -703,7 +732,8 @@ func NewConn(opts Options) (*Conn, error) {
 
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
 	c.donec = c.connCtx.Done()
-	c.scionConnReady = make(chan struct{})
+	c.initSCIONConnReady()
+	c.initSCIONLazyEndpointLimiter()
 
 	// Don't log the same log messages possibly every few seconds in our
 	// portmapper.
@@ -2589,11 +2619,14 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 	if nk, ok := c.unambiguousNodeKeyOfPingLocked(dm, di.discoKey, derpNodeSrc); ok {
 		if !isDerp {
 			c.peerMap.setNodeKeyForEpAddr(src, nk)
-			// For SCION sources, also register the plain host addr
-			// so WireGuard data packets (which don't carry a scionKey)
-			// can be looked up in the peerMap.
+			// For SCION sources, also register the plain host addr so
+			// WireGuard data packets (which don't carry a scionKey) can
+			// be looked up in the peerMap. Use the no-clobber variant so
+			// two SCION peers sharing an underlay IP:port don't
+			// overwrite each other's plain-addr mapping — a silent
+			// data-misrouting bug.
 			if src.scionKey.IsSet() {
-				c.peerMap.setNodeKeyForEpAddr(epAddr{ap: src.ap}, nk)
+				c.peerMap.setNodeKeyForEpAddrIfAbsent(epAddr{ap: src.ap}, nk)
 			}
 		}
 	}
@@ -4103,9 +4136,65 @@ var (
 	metricSendDataBytesSCION   = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_scion")
 
 	// SCION operational counters
-	metricSCIONPathSwitch  = clientmetric.NewCounter("magicsock_scion_path_switch")
-	metricSCIONReconnect   = clientmetric.NewCounter("magicsock_scion_reconnect")
-	metricSCIONParseError  = clientmetric.NewCounter("magicsock_scion_parse_error")
+	metricSCIONPathSwitch        = clientmetric.NewCounter("magicsock_scion_path_switch")
+	metricSCIONReconnect         = clientmetric.NewCounter("magicsock_scion_reconnect")
+	metricSCIONParseError        = clientmetric.NewCounter("magicsock_scion_parse_error")
+	metricSCIONPathsRegistered   = clientmetric.NewCounter("magicsock_scion_paths_registered_total")
+	metricSCIONPathsUnregistered = clientmetric.NewCounter("magicsock_scion_paths_unregistered_total")
+	metricSCIONPathsLive         = clientmetric.NewGauge("magicsock_scion_paths_live")
+	metricSCIONLazyEndpointDropped = clientmetric.NewCounter("magicsock_scion_lazy_endpoint_dropped")
+
+	// Path-selection observability. Every time betterAddr decides to
+	// promote a candidate address over the current bestAddr, one of these
+	// counters ticks based on the winner's transport type. Useful for
+	// debugging "why is my peer on DERP/direct/SCION?" without reading
+	// per-packet logs.
+	metricBetterAddrChoseSCION  = clientmetric.NewCounter("magicsock_better_addr_chose_scion")
+	metricBetterAddrChoseDirect = clientmetric.NewCounter("magicsock_better_addr_chose_direct")
+	metricBetterAddrChoseRelay  = clientmetric.NewCounter("magicsock_better_addr_chose_relay")
+	metricBetterAddrChoseDERP   = clientmetric.NewCounter("magicsock_better_addr_chose_derp")
+
+	// metricPeerMapAddrCollision counts attempts to reuse an epAddr that
+	// already maps to a different node (a signal of the SCION plain-addr
+	// dual-registration collision — see setNodeKeyForEpAddrIfAbsent).
+	metricPeerMapAddrCollision = clientmetric.NewCounter("magicsock_peermap_addr_collision")
+
+	// metricSCIONFastPathGeometryErr counts send attempts that were aborted
+	// because the fastPath header template had inconsistent offsets (a stale
+	// template that outlived a path refresh, or a templating bug). Non-zero
+	// indicates the template/path-generation invariant is broken.
+	metricSCIONFastPathGeometryErr = clientmetric.NewCounter("magicsock_scion_fastpath_geometry_err")
+
+	// metricSCIONFastPathStale counts sends that captured a fastPath whose
+	// generation was behind the current scionPathInfo — the send falls
+	// through to the slow (snet.Conn) path. Frequent increments indicate
+	// fastPath is being invalidated more often than expected, which can
+	// point at path refresh racing with send.
+	metricSCIONFastPathStale = clientmetric.NewCounter("magicsock_scion_fastpath_stale")
+
+	// metricSCIONConnectFailure counts each trySCIONConnect call that
+	// exhausted all fallback paths (external daemon + embedded + bootstrap)
+	// without success. See Conn.scionLastConnectErr for the latest reason.
+	metricSCIONConnectFailure = clientmetric.NewCounter("magicsock_scion_connect_failure")
+
+	// metricSCIONFingerprintCollision fires when a refresh observes a
+	// fingerprint that matches a stored probe state but with a different
+	// hop count — strong evidence of a truncated-hash collision. The new
+	// path is treated as distinct (probe history is not preserved).
+	metricSCIONFingerprintCollision = clientmetric.NewCounter("magicsock_scion_fingerprint_collision")
+
+	// metricSCIONPathRefresh counts successful SCION path refresh cycles
+	// (one Conn.refreshSCIONPathsOnce call that returned without error).
+	metricSCIONPathRefresh = clientmetric.NewCounter("magicsock_scion_path_refresh")
+	// metricSCIONPathRefreshError counts refresh cycles that encountered a
+	// daemon error, useful for correlating outages with path staleness.
+	metricSCIONPathRefreshError = clientmetric.NewCounter("magicsock_scion_path_refresh_error")
+	// metricSCIONPathDiscoveryError counts failures of per-peer path
+	// discovery (discoverSCIONPathAsync).
+	metricSCIONPathDiscoveryError = clientmetric.NewCounter("magicsock_scion_path_discovery_error")
+	// metricSCIONPathSoftRefreshAdded counts the number of new SCION paths
+	// introduced for an existing peer by the soft-refresh mechanism.
+	metricSCIONPathSoftRefreshAdded = clientmetric.NewCounter("magicsock_scion_path_soft_refresh_added")
 
 	// Disco packets
 	metricSendDiscoUDP                           = clientmetric.NewCounter("magicsock_disco_send_udp")

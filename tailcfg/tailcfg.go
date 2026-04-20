@@ -760,7 +760,16 @@ const (
 	PeerAPI4   = ServiceProto("peerapi4")
 	PeerAPI6   = ServiceProto("peerapi6")
 	PeerAPIDNS = ServiceProto("peerapi-dns-proxy")
-	SCION      = ServiceProto("scion")
+	// SCION advertises a peer's SCION endpoint information (local IA and
+	// SCION host IP:port) so other peers can discover SCION connectivity.
+	// Forward compatibility: older clients (without SCION support) see
+	// IsKnownServiceProto(SCION) return false and silently drop the
+	// advertisement, degrading to non-SCION transport — this is the
+	// desired behaviour. New clients attached to an old control plane
+	// should not break; control servers that strictly validate proto
+	// values would reject the Service, in which case the client simply
+	// does not advertise SCION but keeps other paths functional.
+	SCION = ServiceProto("scion")
 )
 
 // IsKnownServiceProto checks whether sp represents a known-valid value of

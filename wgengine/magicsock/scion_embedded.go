@@ -3,6 +3,22 @@
 
 //go:build !ts_omit_scion
 
+// The embedded SCION connector deliberately uses a no-op segment verifier
+// (acceptAllVerifier) in this fork. This is a known Phase 1 limitation: path
+// segments returned by the SCION control plane are accepted without
+// cryptographic validation against TRCs. A hostile control server or on-path
+// attacker (given the current plaintext bootstrap) can inject fabricated
+// segments, effectively controlling path routing for SCION traffic.
+//
+// Operators must acknowledge this explicitly: the embedded connector refuses
+// to start unless TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS=1 is set. When the
+// knob is set, the connector logs a one-time warning at startup so the risk
+// is visible in the process's log stream. Removing the knob (leaving it
+// unset) is the path forward for operators who cannot accept this posture.
+//
+// Phase 2 will replace acceptAllVerifier with a real trust-engine-backed
+// verifier that validates segments against the bootstrapped TRCs.
+
 package magicsock
 
 import (
@@ -13,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/scionproto/scion/daemon/config"
 	"github.com/scionproto/scion/daemon/fetcher"
@@ -45,9 +62,29 @@ import (
 )
 
 var (
-	scionTopology = envknob.RegisterString("TS_SCION_TOPOLOGY")
+	scionTopology    = envknob.RegisterString("TS_SCION_TOPOLOGY")
 	scionStateDirEnv = envknob.RegisterString("TS_SCION_STATE_DIR")
+
+	// scionAcceptInsecureSegments gates the Phase 1 accept-all verifier.
+	// When unset, the embedded connector refuses to start so that a
+	// security-conscious operator isn't surprised by the insecure posture.
+	// When set, a one-time startup warning is emitted.
+	scionAcceptInsecureSegments = envknob.RegisterBool("TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS")
 )
+
+// scionInsecureWarnOnce ensures the Phase 1 verifier warning is logged at most
+// once per process, even if the embedded connector is constructed multiple times
+// (e.g., across SCION reconnects).
+var scionInsecureWarnOnce sync.Once
+
+func warnSCIONInsecureSegments(logf logger.Logf) {
+	scionInsecureWarnOnce.Do(func() {
+		logf("magicsock: SCION PHASE 1 WARNING: path segments are accepted without " +
+			"cryptographic verification (acceptAllVerifier). A compromised SCION control " +
+			"plane or on-path attacker can inject arbitrary path segments. This knob " +
+			"(TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS=1) must be explicitly set to opt in.")
+	})
+}
 
 // embeddedConnector implements daemon.Connector using an embedded topology
 // loader and path fetcher, eliminating the need for an external SCION daemon
@@ -158,6 +195,15 @@ func (ec *embeddedConnector) Close() error {
 // It wires up the path fetcher pipeline following the daemon's own assembly
 // (daemon/cmd/daemon/main.go), but without trust verification (Phase 1).
 func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf logger.Logf, netMon *netmon.Monitor) (*embeddedConnector, error) {
+	// Enforce explicit operator acknowledgement of the Phase 1 accept-all
+	// verifier. See the top-of-file comment for the threat model.
+	if !scionAcceptInsecureSegments() {
+		return nil, fmt.Errorf("embedded SCION connector requires " +
+			"TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS=1 (Phase 1 limitation — " +
+			"segments are not cryptographically verified)")
+	}
+	warnSCIONInsecureSegments(logf)
+
 	// 1. Load topology.
 	topo, err := topology.NewLoader(topology.LoaderCfg{
 		File:      topoPath,
@@ -172,17 +218,25 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf l
 	go func() {
 		_ = topo.Run(topoCtx)
 	}()
+	// Cancel topoCtx (and thus tear down the goroutine above) unless we
+	// return a fully-constructed connector. Any future error path added
+	// below is automatically covered; prior to this, specific error sites
+	// had to remember to call topoCancel manually.
+	success := false
+	defer func() {
+		if !success {
+			topoCancel()
+		}
+	}()
 
 	// 2. Create storage backends.
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		topoCancel()
 		return nil, fmt.Errorf("creating state directory %s: %w", stateDir, err)
 	}
 
 	dbPath := filepath.Join(stateDir, "scion-pathdb.sqlite")
 	pathDB, err := storage.NewPathStorage(storage.DBConfig{Connection: dbPath})
 	if err != nil {
-		topoCancel()
 		return nil, fmt.Errorf("creating path storage at %s: %w", dbPath, err)
 	}
 
@@ -224,13 +278,15 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf l
 		Cfg:        sdCfg,
 	})
 
-	return &embeddedConnector{
+	ec := &embeddedConnector{
 		topo:     topo,
 		fetcher:  f,
 		pathDB:   pathDB,
 		revCache: revCache,
 		cancel:   topoCancel,
-	}, nil
+	}
+	success = true
+	return ec, nil
 }
 
 // acceptAllVerifier skips segment verification. This matches the daemon's own

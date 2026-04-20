@@ -12,13 +12,16 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/golang/mock/gomock"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/daemon/mock_daemon"
+	"github.com/scionproto/scion/pkg/slayers"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/mock_snet"
 	snetpath "github.com/scionproto/scion/pkg/snet/path"
@@ -42,6 +45,23 @@ func TestScionPathKeyIsSet(t *testing.T) {
 	k = scionPathKey(42)
 	if !k.IsSet() {
 		t.Error("scionPathKey(42) should be set")
+	}
+}
+
+// TestScionPathKeyWidth guards against a silent narrowing regression.
+// scionPathKey must be wide enough that sequential assignment cannot realistically
+// wrap on a long-running daemon (the previous uint32 wrapped after ~4·10⁹ paths
+// and would alias stale registry entries onto new peers). uint64 gives headroom
+// of ~1.8·10¹⁹ registrations — effectively unbounded for this use.
+func TestScionPathKeyWidth(t *testing.T) {
+	var k scionPathKey
+	if got, want := unsafe.Sizeof(k), uintptr(8); got != want {
+		t.Fatalf("scionPathKey size = %d, want %d (uint64)", got, want)
+	}
+	// Round-trip a value that would not fit in uint32.
+	big := scionPathKey(1 << 40)
+	if uint64(big) != 1<<40 {
+		t.Fatalf("scionPathKey cannot hold values beyond uint32 range")
 	}
 }
 
@@ -2366,5 +2386,319 @@ func TestScionAddNewPathsRecovery(t *testing.T) {
 		if !ps.healthy {
 			t.Errorf("probe state for key %d should be healthy", k)
 		}
+	}
+}
+
+// TestSignalSCIONConnReadyConcurrent exercises signalSCIONConnReady from
+// multiple goroutines concurrently with readers. Before the fix, the method
+// read+replaced+closed c.scionConnReady without synchronization, which
+// (a) races the field access with concurrent readers, and (b) can panic
+// with "close of closed channel" when two signalers both captured the same
+// old channel. Run with -race to see the data race even if no panic occurs.
+func TestSignalSCIONConnReadyConcurrent(t *testing.T) {
+	c := &Conn{}
+	c.initSCIONConnReady()
+
+	const (
+		signalers = 8
+		readers   = 8
+		iters     = 200
+	)
+
+	stop := make(chan struct{})
+	var readersDone sync.WaitGroup
+	for range readers {
+		readersDone.Add(1)
+		go func() {
+			defer readersDone.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-c.scionConnReadyCh():
+					// Re-read the current channel on each wake-up, exactly
+					// as the production receive loops do.
+				}
+			}
+		}()
+	}
+
+	var signalersDone sync.WaitGroup
+	for range signalers {
+		signalersDone.Add(1)
+		go func() {
+			defer signalersDone.Done()
+			for range iters {
+				c.signalSCIONConnReady()
+			}
+		}()
+	}
+	signalersDone.Wait()
+	close(stop)
+	// Wake the readers one last time so they observe stop.
+	c.signalSCIONConnReady()
+	readersDone.Wait()
+}
+
+// TestSCIONHotLogfRateLimits verifies the rate-limited logger installed by
+// initSCIONLazyEndpointLimiter drops bursts of identical messages. Without
+// this, a socket disconnection would emit one log line per packet read error.
+func TestSCIONHotLogfRateLimits(t *testing.T) {
+	var logged int
+	c := &Conn{logf: func(format string, args ...any) { logged++ }}
+	c.initSCIONLazyEndpointLimiter()
+
+	// Burst 100 identical messages; rate limiter should drop all but a handful.
+	for range 100 {
+		c.scionHotLogf("magicsock: SCION read error: %v", fmt.Errorf("closed"))
+	}
+	if logged > 5 {
+		t.Errorf("rate limiter failed to drop repeated messages; got %d lines", logged)
+	}
+	if logged == 0 {
+		t.Errorf("rate limiter should have emitted at least one line; got 0")
+	}
+}
+
+// TestScionPathInfoGenerationBumps verifies that buildCachedDst bumps the
+// generation counter, so previously-built fastPath templates are flagged
+// stale. The generation invariant prevents a refresh from leaving a
+// send path using a stale underlay next-hop for a new path.
+func TestScionPathInfoGenerationBumps(t *testing.T) {
+	pi := &scionPathInfo{
+		peerIA:   0, // same-AS (empty path path)
+		hostAddr: netip.MustParseAddrPort("127.0.0.1:32766"),
+	}
+	gen0 := pi.generation
+	pi.buildCachedDst()
+	if pi.generation == gen0 {
+		t.Fatal("buildCachedDst should bump generation")
+	}
+	gen1 := pi.generation
+	pi.buildCachedDst()
+	if pi.generation == gen1 {
+		t.Fatal("second buildCachedDst should bump generation again")
+	}
+}
+
+// TestSendSCIONBatchFastGeometryInvariant verifies that sendSCIONBatchFast
+// rejects a fastPath template with inconsistent geometry rather than
+// panicking on out-of-bounds buffer access. Prior to the guard a stale
+// template (outliving a path refresh) could cause silent memory corruption
+// at send time.
+func TestSendSCIONBatchFastGeometryInvariant(t *testing.T) {
+	c := &Conn{}
+	// Construct an obviously-invalid fastPath: udpOffset beyond hdrLen.
+	badFP := &scionFastPath{
+		hdr:       make([]byte, 10),
+		udpOffset: 100, // far beyond hdrLen
+	}
+	err := c.sendSCIONBatchFast(&scionConn{}, badFP, [][]byte{{0x00}}, 0)
+	if err == nil {
+		t.Fatal("expected error for invalid geometry, got nil")
+	}
+	if !strings.Contains(err.Error(), "geometry") {
+		t.Errorf("error should mention geometry, got: %v", err)
+	}
+
+	// Short header (less than a UDP header) must also be rejected.
+	short := &scionFastPath{hdr: make([]byte, 3), udpOffset: 0}
+	err = c.sendSCIONBatchFast(&scionConn{}, short, [][]byte{{0x00}}, 0)
+	if err == nil {
+		t.Fatal("expected error for short header, got nil")
+	}
+}
+
+// TestRecordBetterAddrCategory exercises the transport classifier used by
+// setBestAddrLocked to tick the correct clientmetric on each new bestAddr.
+func TestRecordBetterAddrCategory(t *testing.T) {
+	before := [4]int64{
+		metricBetterAddrChoseSCION.Value(),
+		metricBetterAddrChoseDirect.Value(),
+		metricBetterAddrChoseRelay.Value(),
+		metricBetterAddrChoseDERP.Value(),
+	}
+
+	scionAddr := epAddr{ap: netip.MustParseAddrPort("192.0.2.1:1"), scionKey: 7}
+	recordBetterAddrCategory(scionAddr)
+
+	directAddr := epAddr{ap: netip.MustParseAddrPort("192.0.2.2:2")}
+	recordBetterAddrCategory(directAddr)
+
+	relayAddr := epAddr{ap: netip.MustParseAddrPort("192.0.2.3:3")}
+	relayAddr.vni.Set(99)
+	recordBetterAddrCategory(relayAddr)
+
+	derpAddr := epAddr{ap: netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 4)}
+	recordBetterAddrCategory(derpAddr)
+
+	after := [4]int64{
+		metricBetterAddrChoseSCION.Value(),
+		metricBetterAddrChoseDirect.Value(),
+		metricBetterAddrChoseRelay.Value(),
+		metricBetterAddrChoseDERP.Value(),
+	}
+	for i, label := range []string{"SCION", "Direct", "Relay", "DERP"} {
+		if after[i]-before[i] != 1 {
+			t.Errorf("%s counter delta = %d; want 1", label, after[i]-before[i])
+		}
+	}
+}
+
+// TestEmbeddedConnectorRequiresInsecureAck verifies that the embedded SCION
+// connector refuses to start unless the operator has explicitly acknowledged
+// the Phase 1 accept-all verifier. This prevents silent deployment of a
+// connector that accepts unverified path segments.
+func TestEmbeddedConnectorRequiresInsecureAck(t *testing.T) {
+	t.Setenv("TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS", "")
+	_, err := newEmbeddedConnector(context.Background(), "/tmp/nonexistent-topology.json", t.TempDir(), t.Logf, nil)
+	if err == nil {
+		t.Fatal("expected error when TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS is unset")
+	}
+	if !strings.Contains(err.Error(), "ACKNOWLEDGE_INSECURE_SEGMENTS") {
+		t.Errorf("error should mention the envknob, got: %v", err)
+	}
+}
+
+// FuzzParseSCIONPacket throws random bytes at the SCION wire parser that
+// receiveSCION/receiveSCIONShim rely on. The parser must never panic on
+// adversarial input — it must either decode cleanly or return !ok.
+func FuzzParseSCIONPacket(f *testing.F) {
+	// Seed corpus: a few obviously-invalid frames plus a short valid-ish
+	// prefix. The goal is coverage of parse paths, not semantic validity.
+	f.Add([]byte{})
+	f.Add([]byte{0x00})
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff})
+	f.Add(make([]byte, 512))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("parseSCIONPacket panicked on input of length %d: %v", len(data), r)
+			}
+		}()
+		// Use a fresh decoder for each call to match production usage.
+		scn := &slayers.SCION{}
+		_, _, _, _, _ = parseSCIONPacket(data, scn)
+	})
+}
+
+// TestSCIONLastConnectError verifies the connect-error observability
+// surface: failures are recorded (message + timestamp + counter), and a
+// successful connect clears the stored error.
+func TestSCIONLastConnectError(t *testing.T) {
+	c := &Conn{}
+	// Baseline.
+	msg, when := c.SCIONLastConnectError()
+	if msg != "" || !when.IsZero() {
+		t.Fatalf("baseline SCIONLastConnectError = (%q, %v); want empty", msg, when)
+	}
+	before := metricSCIONConnectFailure.Value()
+
+	c.recordSCIONConnectError(fmt.Errorf("bootstrap unreachable"))
+
+	msg, when = c.SCIONLastConnectError()
+	if msg != "bootstrap unreachable" {
+		t.Errorf("stored message = %q, want %q", msg, "bootstrap unreachable")
+	}
+	if when.IsZero() {
+		t.Error("timestamp should be non-zero after failure")
+	}
+	if metricSCIONConnectFailure.Value()-before != 1 {
+		t.Error("connect-failure counter did not increment")
+	}
+
+	// Successful connect clears the error.
+	c.recordSCIONConnectError(nil)
+	msg, when = c.SCIONLastConnectError()
+	if msg != "" || !when.IsZero() {
+		t.Errorf("after success: (%q, %v); want cleared", msg, when)
+	}
+}
+
+// TestSCIONReconnectStorm exercises the reconnect-path bookkeeping under
+// concurrent pressure: many goroutines simultaneously (a) wake readers via
+// signalSCIONConnReady, (b) flip the scionReconnecting CAS, and (c) swap
+// pconnSCION. The test asserts only that nothing panics and the race
+// detector stays quiet. Covers the P0 channel race and exercises the CAS
+// guards around reconnect.
+func TestSCIONReconnectStorm(t *testing.T) {
+	c := &Conn{}
+	c.initSCIONConnReady()
+	c.initSCIONLazyEndpointLimiter()
+
+	const (
+		workers = 16
+		iters   = 300
+	)
+
+	stop := make(chan struct{})
+	var readersDone, workersDone sync.WaitGroup
+
+	for range 4 {
+		readersDone.Add(1)
+		go func() {
+			defer readersDone.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-c.scionConnReadyCh():
+				}
+			}
+		}()
+	}
+
+	// Workers: simulate concurrent reconnect paths racing on the CAS guard
+	// plus signalSCIONConnReady.
+	for range workers {
+		workersDone.Add(1)
+		go func() {
+			defer workersDone.Done()
+			for range iters {
+				if c.scionReconnecting.CompareAndSwap(false, true) {
+					c.signalSCIONConnReady()
+					c.scionReconnecting.Store(false)
+				} else {
+					c.signalSCIONConnReady()
+				}
+			}
+		}()
+	}
+
+	workersDone.Wait()
+	close(stop)
+	// Ensure each reader observes one more signal after stop is closed, so
+	// it unblocks from the current ready channel, loops, and selects stop.
+	for range 4 {
+		c.signalSCIONConnReady()
+	}
+	readersDone.Wait()
+}
+
+// TestSCIONLazyEndpointRateLimit checks that the lazyEndpoint admission rate
+// limiter drops once the bucket is exhausted. A flood of packets from unknown
+// sources must not be allowed to allocate a lazyEndpoint per packet — that
+// turns spoofed traffic into unbounded allocation.
+func TestSCIONLazyEndpointRateLimit(t *testing.T) {
+	c := &Conn{}
+	c.initSCIONLazyEndpointLimiter()
+
+	// First `scionLazyEndpointBurst` calls pass immediately, then we
+	// should see drops (the bucket is exhausted and no time has elapsed
+	// to refill tokens).
+	allowed, dropped := 0, 0
+	for range scionLazyEndpointBurst * 4 {
+		if c.allowSCIONLazyEndpoint() {
+			allowed++
+		} else {
+			dropped++
+		}
+	}
+	if allowed > scionLazyEndpointBurst+2 { // allow small slop for refill during loop
+		t.Errorf("allowed=%d, expected ≈ %d (burst)", allowed, scionLazyEndpointBurst)
+	}
+	if dropped == 0 {
+		t.Errorf("no drops observed after bucket exhaustion; limiter not active")
 	}
 }

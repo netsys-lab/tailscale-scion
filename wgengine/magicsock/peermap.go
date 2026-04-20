@@ -174,6 +174,31 @@ func (m *peerMap) upsertEndpoint(ep *endpoint, oldDiscoKey key.DiscoPublic) {
 	discoSet.Add(ep.publicKey)
 }
 
+// setNodeKeyForEpAddrIfAbsent is a conflict-free variant of
+// setNodeKeyForEpAddr. It writes the (addr -> nk) mapping only if either
+// (a) no mapping currently exists, or (b) the existing mapping already
+// points at nk. On conflict, it increments metricPeerMapAddrCollision and
+// returns false without modifying the map.
+//
+// Intended for SCION's plain-addr dual-registration path: when a peer sends
+// a disco ping over SCION, we want subsequent WireGuard data packets from
+// the same plain underlay addr to route to that peer — but only if no other
+// peer has already claimed the plain addr. Two peers sharing an underlay
+// IP:port (NAT collocation, or the as1/as2 testbed where both listen on
+// 127.0.0.1:32766) would otherwise clobber each other's entries and cause
+// data-packet mis-delivery.
+func (m *peerMap) setNodeKeyForEpAddrIfAbsent(addr epAddr, nk key.NodePublic) bool {
+	if pi, ok := m.byEpAddr[addr]; ok && pi != nil {
+		if pi.ep != nil && pi.ep.publicKey == nk {
+			return true // already points at nk; idempotent
+		}
+		metricPeerMapAddrCollision.Add(1)
+		return false
+	}
+	m.setNodeKeyForEpAddr(addr, nk)
+	return true
+}
+
 // setNodeKeyForEpAddr makes future peer lookups by addr return the
 // same endpoint as a lookup by nk.
 //

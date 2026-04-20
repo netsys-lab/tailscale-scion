@@ -20,21 +20,46 @@ func (c *Conn) initSCIONLocked(ctx context.Context) {
 	sc, err := trySCIONConnect(ctx, c.logf, c.netMon)
 	if err != nil {
 		c.logf("magicsock: SCION not available: %v", err)
+		c.recordSCIONConnectError(err)
 		return
 	}
 	c.logf("magicsock: SCION available, local IA: %s", sc.localIA)
 	c.pconnSCION.Store(sc)
+	c.recordSCIONConnectError(nil)
 	c.signalSCIONConnReady()
 	go c.refreshSCIONPaths()
 }
 
 // closeSCIONLocked closes the SCION connection if open and sets pconnSCION
 // to nil so that receiveSCION and retrySCIONConnect see it as disconnected.
-// c.mu must be held.
+// Also purges per-endpoint scionState so that status queries do not return
+// stale paths tied to the now-closed connection. c.mu must be held.
 func (c *Conn) closeSCIONLocked() {
 	if sc := c.pconnSCION.Load(); sc != nil {
 		sc.close()
 		c.pconnSCION.Store(nil)
+	}
+	c.clearAllSCIONEndpointStateLocked()
+}
+
+// clearAllSCIONEndpointStateLocked walks the peerMap and drops every
+// endpoint's scionState + path registrations. Safe to call when the SCION
+// socket is torn down (so future connects start from a clean slate) and
+// when a reconfigure deliberately disables SCION. c.mu must be held.
+func (c *Conn) clearAllSCIONEndpointStateLocked() {
+	var toUnregister []scionPathKey
+	c.peerMap.forEachEndpoint(func(ep *endpoint) {
+		ep.mu.Lock()
+		if ep.scionState != nil {
+			for k := range ep.scionState.paths {
+				toUnregister = append(toUnregister, k)
+			}
+			ep.scionState = nil
+		}
+		ep.mu.Unlock()
+	})
+	for _, k := range toUnregister {
+		c.unregisterSCIONPath(k)
 	}
 }
 
