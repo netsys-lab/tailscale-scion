@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"tailscale.com/envknob"
@@ -113,8 +114,11 @@ func TestBootstrapSCION(t *testing.T) {
 	}
 }
 
-func TestBootstrapSCIONTopologyOnly(t *testing.T) {
-	// Server that returns topology but 404 on TRCs — should succeed.
+func TestBootstrapSCIONRequiresTRCs(t *testing.T) {
+	// Server that returns topology but 404 on /trcs. With real segment
+	// verification in place, TRCs are required: bootstrap must return an
+	// error so the caller tries the next URL instead of leaving the state
+	// directory half-populated.
 	topoJSON := `{"isd_as":"19-ffaa:1:eba"}`
 
 	mux := http.NewServeMux()
@@ -127,16 +131,41 @@ func TestBootstrapSCIONTopologyOnly(t *testing.T) {
 	destDir := t.TempDir()
 	logf := logger.WithPrefix(t.Logf, "test: ")
 
-	if err := bootstrapSCION(context.Background(), logf, srv.URL, destDir); err != nil {
-		t.Fatalf("bootstrapSCION: %v", err)
+	err := bootstrapSCION(context.Background(), logf, srv.URL, destDir)
+	if err == nil {
+		t.Fatal("expected bootstrapSCION to fail when /trcs is 404")
 	}
+	if !strings.Contains(err.Error(), "TRC") {
+		t.Errorf("error should mention TRCs, got: %v", err)
+	}
+}
 
-	data, err := os.ReadFile(filepath.Join(destDir, "topology.json"))
-	if err != nil {
-		t.Fatalf("reading topology: %v", err)
+func TestBootstrapSCIONNoTRCsFetched(t *testing.T) {
+	// Server that serves topology and a valid TRC index but 404s every
+	// per-blob fetch. Bootstrap must fail so the caller moves on.
+	topoJSON := `{"isd_as":"19-ffaa:1:eba"}`
+	trcIndex := `[{"id":{"isd":19,"base_number":1,"serial_number":1}}]`
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/topology", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(topoJSON))
+	})
+	mux.HandleFunc("/trcs", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(trcIndex))
+	})
+	// No /trcs/.../blob handler — default mux returns 404.
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	destDir := t.TempDir()
+	logf := logger.WithPrefix(t.Logf, "test: ")
+
+	err := bootstrapSCION(context.Background(), logf, srv.URL, destDir)
+	if err == nil {
+		t.Fatal("expected bootstrapSCION to fail when no TRC blobs can be fetched")
 	}
-	if string(data) != topoJSON {
-		t.Errorf("topology content = %q, want %q", data, topoJSON)
+	if !strings.Contains(err.Error(), "no TRCs") {
+		t.Errorf("error should mention no TRCs, got: %v", err)
 	}
 }
 
@@ -177,4 +206,62 @@ func TestLocalSearchDomainFromHostname(t *testing.T) {
 	// We can't easily override os.Hostname() in tests, so just verify
 	// the function doesn't panic and returns without error on this host.
 	_, _ = localSearchDomainFromHostname()
+}
+
+// TestHttpGetEnforcesSizeCap verifies httpGet refuses responses that reach
+// the supplied size cap. A malicious server must not be able to fill memory
+// or disk by returning an oversized topology/TRC.
+func TestHttpGetEnforcesSizeCap(t *testing.T) {
+	// Server that streams a 4 KiB response.
+	payload := make([]byte, 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(payload)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{}
+
+	// Cap smaller than payload → should error.
+	if _, err := httpGet(context.Background(), client, srv.URL, 1024); err == nil {
+		t.Error("expected size-cap error, got nil")
+	}
+	// Cap larger than payload → should succeed.
+	if _, err := httpGet(context.Background(), client, srv.URL, 1<<20); err != nil {
+		t.Errorf("expected success, got %v", err)
+	}
+}
+
+// TestBootstrapSCIONCapsTRCCount verifies that a malicious server
+// advertising many TRC entries cannot cause the client to fetch more than
+// bootstrapMaxTRCEntries blobs. Pre-fix, the loop walked every entry.
+func TestBootstrapSCIONCapsTRCCount(t *testing.T) {
+	const advertised = bootstrapMaxTRCEntries * 2
+
+	// Build a TRC index with way more entries than we should fetch.
+	indexEntries := make([]trcEntry, advertised)
+	for i := range indexEntries {
+		indexEntries[i].ID = trcID{ISD: i + 1, BaseNumber: 1, SerialNumber: 1}
+	}
+	idxBytes, err := json.Marshal(indexEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var blobFetches int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/topology", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) })
+	mux.HandleFunc("/trcs", func(w http.ResponseWriter, r *http.Request) { w.Write(idxBytes) })
+	mux.HandleFunc("/trcs/", func(w http.ResponseWriter, r *http.Request) {
+		blobFetches++
+		w.Write([]byte("fake-trc"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	if err := bootstrapSCION(context.Background(), logger.WithPrefix(t.Logf, "test: "), srv.URL, t.TempDir()); err != nil {
+		t.Fatalf("bootstrapSCION: %v", err)
+	}
+	if blobFetches > bootstrapMaxTRCEntries {
+		t.Errorf("fetched %d blobs; bootstrapMaxTRCEntries cap is %d", blobFetches, bootstrapMaxTRCEntries)
+	}
 }

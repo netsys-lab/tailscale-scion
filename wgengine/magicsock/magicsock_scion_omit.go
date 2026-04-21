@@ -3,6 +3,25 @@
 
 //go:build ts_omit_scion
 
+// This file is the stub counterpart to the SCION transport code in
+// wgengine/magicsock. When the ts_omit_scion build tag is active, the real
+// SCION implementation is compiled out and every SCION type referenced from
+// non-gated code (endpoint.go, magicsock.go) must have a stub here.
+//
+// Invariants this file must uphold, checked on every change:
+//   - Every SCION-named type referenced outside //go:build !ts_omit_scion has
+//     a stub here with the same kind (struct, alias, integer type).
+//   - `scionPathKey` must be uint64 so its zero value / arithmetic semantics
+//     match the production type (see TestScionPathKeyWidth).
+//   - Every method on *Conn or *endpoint declared in a SCION-gated file must
+//     have a no-op stub here returning zero values of the same type.
+//
+// Regressions will typically surface as compile errors when tailscaled is
+// built with `-tags ts_omit_scion`. The CI matrix is expected to cover both
+// build variants (task P3-25). When adding a new SCION field, method, or
+// type in a gated file, grep non-gated files for any cross-reference and
+// add the corresponding stub here before merging.
+
 package magicsock
 
 import (
@@ -18,7 +37,7 @@ import (
 
 // Stub types for ts_omit_scion builds.
 
-type scionPathKey uint32
+type scionPathKey uint64
 
 func (k scionPathKey) IsSet() bool { return false }
 
@@ -43,6 +62,10 @@ const scionWireMTU = tstun.WireMTU(1280)
 // Stub Conn methods.
 
 func (c *Conn) initSCIONLocked(_ context.Context)                                       {}
+func (c *Conn) initSCIONConnReady()                                                      {}
+func (c *Conn) signalSCIONConnReady()                                                    {}
+func (c *Conn) initSCIONLazyEndpointLimiter()                                            {}
+func (c *Conn) allowSCIONLazyEndpoint() bool                                             { return true }
 func (c *Conn) closeSCIONLocked()                                                        {}
 func (c *Conn) closeSCIONBindLocked()                                                    {}
 func (c *Conn) receiveSCION(_ [][]byte, _ []int, _ []wgconn.Endpoint) (int, error)       { return 0, nil }
@@ -59,7 +82,7 @@ func (de *endpoint) discoPingTimeoutSCIONLocked(_ sentPing)                     
 func (de *endpoint) handlePongSCIONLocked(_ epAddr, _ time.Duration, _ mono.Time)        {}
 func (de *endpoint) handlePongPromoteSCIONLocked(_ addrQuality)                          {}
 func (de *endpoint) updateFromNodeSCIONLocked(_ tailcfg.NodeView) []scionPathKey         { return nil }
-func (de *endpoint) stopAndResetSCIONLocked() []scionPathKey                             { return nil }
+func (de *endpoint) stopAndResetSCIONLocked() ([]scionPathKey, scionIAKey)               { return nil, 0 }
 func (de *endpoint) sendSCIONData(_ epAddr, _ [][]byte, _ int) error                     { return nil }
 func (de *endpoint) scionAddrStr(e epAddr) string                                       { return e.String() }
 func (de *endpoint) populateSCIONPathsLocked(_ *ipnstate.PeerStatus)                    {}
@@ -67,8 +90,9 @@ func (de *endpoint) populateSCIONPathsLocked(_ *ipnstate.PeerStatus)            
 // SCIONService returns false when SCION is omitted.
 func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) { return tailcfg.Service{}, false }
 
-func (c *Conn) ReconfigureSCION(_ SCIONConfig)                          {}
-func (c *Conn) SCIONStatus() (connected bool, localIA string)           { return false, "" }
+func (c *Conn) ReconfigureSCION(_ SCIONConfig)                             {}
+func (c *Conn) SCIONStatus() (connected bool, localIA string)              { return false, "" }
+func (c *Conn) SCIONLastConnectError() (msg string, when time.Time)        { return "", time.Time{} }
 
 // Stub standalone functions used by betterAddr in endpoint.go.
 

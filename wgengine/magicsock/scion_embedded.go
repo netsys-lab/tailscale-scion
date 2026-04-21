@@ -7,32 +7,38 @@ package magicsock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"time"
 
-	"github.com/scionproto/scion/daemon/config"
-	"github.com/scionproto/scion/daemon/fetcher"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
+	"github.com/scionproto/scion/pkg/daemon/fetcher"
+	daemontrust "github.com/scionproto/scion/pkg/daemon/private/trust"
+	daemontypes "github.com/scionproto/scion/pkg/daemon/types"
 	"github.com/scionproto/scion/pkg/drkey"
 	libgrpc "github.com/scionproto/scion/pkg/grpc"
+	scionlog "github.com/scionproto/scion/pkg/log"
 	"github.com/scionproto/scion/pkg/private/ctrl/path_mgmt"
 	"github.com/scionproto/scion/pkg/private/serrors"
-	cryptopb "github.com/scionproto/scion/pkg/proto/crypto"
+	cppb "github.com/scionproto/scion/pkg/proto/control_plane"
+	"github.com/scionproto/scion/pkg/scrypto"
 	"github.com/scionproto/scion/pkg/scrypto/cppki"
-	"github.com/scionproto/scion/pkg/scrypto/signed"
 	"github.com/scionproto/scion/pkg/segment/iface"
 	"github.com/scionproto/scion/pkg/snet"
-	segfetchergrpc "github.com/scionproto/scion/private/segment/segfetcher/grpc"
-	infra "github.com/scionproto/scion/private/segment/verifier"
 	"github.com/scionproto/scion/private/revcache"
+	segfetchergrpc "github.com/scionproto/scion/private/segment/segfetcher/grpc"
 	"github.com/scionproto/scion/private/storage"
+	truststorage "github.com/scionproto/scion/private/storage/trust"
 	"github.com/scionproto/scion/private/topology"
 	"github.com/scionproto/scion/private/trust"
+	"github.com/scionproto/scion/private/trust/compat"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/resolver"
@@ -45,9 +51,30 @@ import (
 )
 
 var (
-	scionTopology = envknob.RegisterString("TS_SCION_TOPOLOGY")
+	scionTopology    = envknob.RegisterString("TS_SCION_TOPOLOGY")
 	scionStateDirEnv = envknob.RegisterString("TS_SCION_STATE_DIR")
+
+	// scionCertsDirEnv overrides the directory that TRC blobs are loaded
+	// from. If unset, the directory is derived from the loaded topology
+	// file's parent (i.e. /etc/scion/certs when TS_SCION_TOPOLOGY is
+	// /etc/scion/topology.json), falling back to $stateDir/certs for
+	// bootstrapped topologies.
+	scionCertsDirEnv = envknob.RegisterString("TS_SCION_CERTS_DIR")
 )
+
+// errNoTRCs is returned by newEmbeddedConnector when no TRC blobs are
+// available in the state directory. With real segment verification in place
+// the connector cannot usefully start without at least one TRC.
+var errNoTRCs = errors.New("no TRCs available; run bootstrap or set TS_SCION_BOOTSTRAP_URL")
+
+// scionLogDiscardOnce silences scionproto's package-global zap logger on
+// first embedded-connector construction. Without this, daemontrust.NewEngine
+// and friends log directly to stderr via an uninitialized logger.
+var scionLogDiscardOnce sync.Once
+
+func silenceSCIONLog() {
+	scionLogDiscardOnce.Do(scionlog.Discard)
+}
 
 // embeddedConnector implements daemon.Connector using an embedded topology
 // loader and path fetcher, eliminating the need for an external SCION daemon
@@ -57,7 +84,15 @@ type embeddedConnector struct {
 	fetcher  fetcher.Fetcher
 	pathDB   storage.PathDB
 	revCache revcache.RevCache
+	trustDB  storage.TrustDB
+	dialer   libgrpc.Dialer // used to lazily fetch remote-ISD TRCs from the local CS
+	logf     logger.Logf
 	cancel   context.CancelFunc // cancels the topology loader goroutine
+
+	// ensureTRCMu serializes per-ISD TRC fetches so concurrent Paths() calls
+	// don't hammer the CS with duplicate requests.
+	ensureTRCMu    sync.Mutex
+	ensureTRCTried map[addr.ISD]time.Time
 }
 
 // Compile-time interface check.
@@ -105,13 +140,18 @@ func (ec *embeddedConnector) snetTopology() snet.Topology {
 }
 
 // Paths resolves end-to-end paths using the embedded fetcher (segment fetch + combination).
-func (ec *embeddedConnector) Paths(ctx context.Context, dst, src addr.IA, f daemon.PathReqFlags) ([]snet.Path, error) {
+func (ec *embeddedConnector) Paths(ctx context.Context, dst, src addr.IA, f daemontypes.PathReqFlags) ([]snet.Path, error) {
+	// The MultiSegmentSplitter reads Inspector.ByAttributes / HasAttributes
+	// for dst.ISD() before any segment is fetched. When that ISD's TRC is
+	// not in the local DB this errors out as "TRC not found", so fetch it
+	// from the local CS first (best-effort; cached per ISD to avoid churn).
+	ec.ensureTRCForISD(ctx, dst.ISD())
 	return ec.fetcher.GetPaths(ctx, src, dst, f.Refresh)
 }
 
 // ASInfo is not supported by the embedded connector.
-func (ec *embeddedConnector) ASInfo(_ context.Context, _ addr.IA) (daemon.ASInfo, error) {
-	return daemon.ASInfo{}, serrors.New("not supported by embedded connector")
+func (ec *embeddedConnector) ASInfo(_ context.Context, _ addr.IA) (daemontypes.ASInfo, error) {
+	return daemontypes.ASInfo{}, serrors.New("not supported by embedded connector")
 }
 
 // SVCInfo is not supported by the embedded connector.
@@ -151,13 +191,21 @@ func (ec *embeddedConnector) Close() error {
 	if ec.revCache != nil {
 		ec.revCache.Close()
 	}
+	if ec.trustDB != nil {
+		ec.trustDB.Close()
+	}
 	return nil
 }
 
 // newEmbeddedConnector creates a new embeddedConnector from a topology file.
 // It wires up the path fetcher pipeline following the daemon's own assembly
-// (daemon/cmd/daemon/main.go), but without trust verification (Phase 1).
+// (daemon/cmd/daemon/main.go), including TRC-backed segment verification via
+// daemontrust.NewEngine. The connector requires at least one TRC blob under
+// stateDir/certs/ to start; callers should bootstrap first when the state
+// directory is empty.
 func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf logger.Logf, netMon *netmon.Monitor) (*embeddedConnector, error) {
+	silenceSCIONLog()
+
 	// 1. Load topology.
 	topo, err := topology.NewLoader(topology.LoaderCfg{
 		File:      topoPath,
@@ -172,17 +220,25 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf l
 	go func() {
 		_ = topo.Run(topoCtx)
 	}()
+	// Cancel topoCtx (and thus tear down the goroutine above) unless we
+	// return a fully-constructed connector. Any future error path added
+	// below is automatically covered; prior to this, specific error sites
+	// had to remember to call topoCancel manually.
+	success := false
+	defer func() {
+		if !success {
+			topoCancel()
+		}
+	}()
 
 	// 2. Create storage backends.
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		topoCancel()
 		return nil, fmt.Errorf("creating state directory %s: %w", stateDir, err)
 	}
 
 	dbPath := filepath.Join(stateDir, "scion-pathdb.sqlite")
 	pathDB, err := storage.NewPathStorage(storage.DBConfig{Connection: dbPath})
 	if err != nil {
-		topoCancel()
 		return nil, fmt.Errorf("creating path storage at %s: %w", dbPath, err)
 	}
 
@@ -202,68 +258,171 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf l
 		NetDialer: netns.NewDialer(logf, netMon).DialContext,
 	}
 
-	// 4. Create the segment fetcher requester (gRPC to local CS).
+	// 4. Build the trust engine backed by the on-disk TRC/chain store. The
+	// engine supplies both the verifier (which checks each segment against a
+	// TRC) and the inspector (which reports AS attributes from the trust DB).
+	//
+	// TRC location: prefer TS_SCION_CERTS_DIR if set; otherwise use the
+	// topology file's sibling "certs" directory (matches the stock SCION
+	// daemon's /etc/scion layout). This keeps hosts that already have TRCs
+	// under /etc/scion/certs/ from needing to copy them into stateDir.
+	certsDir := resolveSCIONCertsDir(topoPath)
+	if !certsDirHasTRC(certsDir) {
+		pathDB.Close()
+		revCache.Close()
+		return nil, fmt.Errorf("%s: %w", certsDir, errNoTRCs)
+	}
+	trustDBPath := filepath.Join(stateDir, "scion-trustdb.sqlite")
+	trustDB, err := storage.NewTrustStorage(storage.DBConfig{Connection: trustDBPath})
+	if err != nil {
+		pathDB.Close()
+		revCache.Close()
+		return nil, fmt.Errorf("creating trust storage at %s: %w", trustDBPath, err)
+	}
+	engine, err := daemontrust.NewEngine(topoCtx, certsDir, topo.IA(), trustDB, dialer)
+	if err != nil {
+		trustDB.Close()
+		pathDB.Close()
+		revCache.Close()
+		return nil, fmt.Errorf("building trust engine: %w", err)
+	}
+
+	// 5. Create the segment fetcher requester (gRPC to local CS) and the path
+	// fetcher with real TRC-based segment verification.
 	requester := &segfetchergrpc.Requester{
 		Dialer: dialer,
 	}
 
-	// 5. Create the path fetcher with accept-all verification (Phase 1).
-	sdCfg := config.SDConfig{}
-	sdCfg.InitDefaults()
-
 	f := fetcher.NewFetcher(fetcher.FetcherConfig{
-		IA:         topo.IA(),
-		MTU:        topo.MTU(),
-		Core:       topo.Core(),
-		NextHopper: topo,
-		RPC:        requester,
-		PathDB:     pathDB,
-		Inspector:  endHostInspector{},
-		Verifier:   acceptAllVerifier{},
-		RevCache:   revCache,
-		Cfg:        sdCfg,
+		IA:            topo.IA(),
+		MTU:           topo.MTU(),
+		Core:          topo.Core(),
+		NextHopper:    topo,
+		RPC:           requester,
+		PathDB:        pathDB,
+		Inspector:     engine,
+		Verifier:      compat.Verifier{Verifier: trust.Verifier{Engine: engine}},
+		RevCache:      revCache,
+		QueryInterval: 5 * time.Minute,
 	})
 
-	return &embeddedConnector{
-		topo:     topo,
-		fetcher:  f,
-		pathDB:   pathDB,
-		revCache: revCache,
-		cancel:   topoCancel,
-	}, nil
+	ec := &embeddedConnector{
+		topo:           topo,
+		fetcher:        f,
+		pathDB:         pathDB,
+		revCache:       revCache,
+		trustDB:        trustDB,
+		dialer:         dialer,
+		logf:           logf,
+		cancel:         topoCancel,
+		ensureTRCTried: make(map[addr.ISD]time.Time),
+	}
+	ec.logTRCInventory(topoCtx, certsDir)
+	success = true
+	return ec, nil
 }
 
-// acceptAllVerifier skips segment verification. This matches the daemon's own
-// behavior when DisableSegVerification is set (daemon/cmd/daemon/main.go:359-377).
-type acceptAllVerifier struct{}
-
-func (acceptAllVerifier) Verify(_ context.Context, _ *cryptopb.SignedMessage,
-	_ ...[]byte) (*signed.Message, error) {
-	return nil, nil
+// logTRCInventory reports which ISDs have a TRC loaded in the trust DB.
+// Without this the operator has no way to tell whether daemontrust.NewEngine
+// found any TRC files (scionproto's own log output is discarded).
+func (ec *embeddedConnector) logTRCInventory(ctx context.Context, certsDir string) {
+	trcs, err := ec.trustDB.SignedTRCs(ctx, truststorage.TRCsQuery{Latest: true})
+	if err != nil {
+		ec.logf("magicsock: SCION trust DB query failed: %v", err)
+		return
+	}
+	if len(trcs) == 0 {
+		ec.logf("magicsock: SCION trust DB has no TRCs after loading %s (cross-ISD path discovery will fail until TRCs are fetched)", certsDir)
+		return
+	}
+	isds := make([]addr.ISD, 0, len(trcs))
+	for _, t := range trcs {
+		isds = append(isds, t.TRC.ID.ISD)
+	}
+	ec.logf("magicsock: SCION trust DB loaded TRCs for ISDs %v from %s", isds, certsDir)
 }
 
-func (v acceptAllVerifier) WithServer(_ net.Addr) infra.Verifier {
-	return v
+// ensureTRCForISD fetches the latest TRC for the given ISD from the local
+// control service if the trust database doesn't already have one. Called by
+// Paths() before each segment fetch so that the MultiSegmentSplitter's
+// attribute lookups don't fail with "TRC not found" for a remote ISD.
+//
+// This is best-effort: failures are logged but not propagated, since the
+// fetcher call that follows will surface its own error when the TRC really
+// is missing. Per-ISD results are cached for a short window to avoid
+// hammering the CS when the remote ISD is unreachable.
+func (ec *embeddedConnector) ensureTRCForISD(ctx context.Context, isd addr.ISD) {
+	if isd == 0 {
+		return
+	}
+	existing, err := ec.trustDB.SignedTRC(ctx, cppki.TRCID{
+		ISD:    isd,
+		Base:   scrypto.LatestVer,
+		Serial: scrypto.LatestVer,
+	})
+	if err == nil && !existing.IsZero() {
+		return
+	}
+
+	ec.ensureTRCMu.Lock()
+	if last, ok := ec.ensureTRCTried[isd]; ok && time.Since(last) < 30*time.Second {
+		ec.ensureTRCMu.Unlock()
+		return
+	}
+	ec.ensureTRCTried[isd] = time.Now()
+	ec.ensureTRCMu.Unlock()
+
+	conn, err := ec.dialer.Dial(ctx, &snet.SVCAddr{SVC: addr.SvcCS})
+	if err != nil {
+		ec.logf("magicsock: SCION: dialing CS to fetch ISD %d TRC failed: %v", isd, err)
+		return
+	}
+	defer conn.Close()
+	client := cppb.NewTrustMaterialServiceClient(conn)
+	resp, err := client.TRC(ctx, &cppb.TRCRequest{
+		Isd:    uint32(isd),
+		Base:   uint64(scrypto.LatestVer),
+		Serial: uint64(scrypto.LatestVer),
+	})
+	if err != nil {
+		ec.logf("magicsock: SCION: CS TRC fetch for ISD %d failed: %v", isd, err)
+		return
+	}
+	trc, err := cppki.DecodeSignedTRC(resp.Trc)
+	if err != nil {
+		ec.logf("magicsock: SCION: CS returned undecodable TRC for ISD %d: %v", isd, err)
+		return
+	}
+	if trc.TRC.ID.ISD != isd {
+		ec.logf("magicsock: SCION: CS returned wrong-ISD TRC (want %d got %d)", isd, trc.TRC.ID.ISD)
+		return
+	}
+	if _, err := ec.trustDB.InsertTRC(ctx, trc); err != nil {
+		ec.logf("magicsock: SCION: inserting ISD %d TRC into DB failed: %v", isd, err)
+		return
+	}
+	ec.logf("magicsock: SCION: fetched TRC for ISD %d (base=%d serial=%d) from CS", isd, trc.TRC.ID.Base, trc.TRC.ID.Serial)
 }
 
-func (v acceptAllVerifier) WithIA(_ addr.IA) infra.Verifier {
-	return v
+// certsDirHasTRC reports whether the given directory contains at least one
+// *.trc blob. Bootstrap writes TRCs under stateDir/certs/ using ID-based
+// filenames (e.g. isd19-b1-s1.trc); the real scionproto loader globs *.trc.
+func certsDirHasTRC(dir string) bool {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.trc"))
+	return err == nil && len(matches) > 0
 }
 
-func (v acceptAllVerifier) WithValidity(_ cppki.Validity) infra.Verifier {
-	return v
-}
-
-// endHostInspector is a minimal trust.Inspector for non-core endhosts.
-// It always reports no attributes, which is correct for endhost path resolution.
-type endHostInspector struct{}
-
-func (endHostInspector) ByAttributes(_ context.Context, _ addr.ISD, _ trust.Attribute) ([]addr.IA, error) {
-	return nil, nil
-}
-
-func (endHostInspector) HasAttributes(_ context.Context, _ addr.IA, _ trust.Attribute) (bool, error) {
-	return false, nil
+// resolveSCIONCertsDir returns the directory to load TRC blobs from. The
+// explicit TS_SCION_CERTS_DIR envknob wins when set; otherwise the directory
+// is derived from the topology file's parent (so /etc/scion/topology.json
+// resolves to /etc/scion/certs, matching the stock SCION daemon layout, and
+// $stateDir/topology.json resolves to $stateDir/certs, matching what
+// bootstrap writes).
+func resolveSCIONCertsDir(topoPath string) string {
+	if d := scionCertsDirEnv(); d != "" {
+		return d
+	}
+	return filepath.Join(filepath.Dir(topoPath), "certs")
 }
 
 // netnsTCPDialer implements libgrpc.Dialer with netns-aware TCP connections

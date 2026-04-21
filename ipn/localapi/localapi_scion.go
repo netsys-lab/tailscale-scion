@@ -9,6 +9,7 @@ package localapi
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 )
 
 func init() {
@@ -19,6 +20,14 @@ func init() {
 type SCIONStatusResponse struct {
 	Connected bool   `json:"Connected"`
 	LocalIA   string `json:"LocalIA,omitempty"`
+	// LastConnectError is the most recent SCION connect-attempt failure
+	// message (empty if SCION is connected or has never failed). Operators
+	// use this field to diagnose "why is SCION down?" without reading the
+	// raw log stream.
+	LastConnectError string `json:"LastConnectError,omitempty"`
+	// LastConnectErrorAt is the wall-clock time of the failure recorded in
+	// LastConnectError, encoded as RFC3339 when non-zero.
+	LastConnectErrorAt string `json:"LastConnectErrorAt,omitempty"`
 }
 
 func (h *Handler) serveSCIONStatus(w http.ResponseWriter, r *http.Request) {
@@ -32,9 +41,15 @@ func (h *Handler) serveSCIONStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	connected, localIA := mc.SCIONStatus()
+	lastErr, lastErrAt := mc.SCIONLastConnectError()
+	resp := SCIONStatusResponse{
+		Connected:        connected,
+		LocalIA:          localIA,
+		LastConnectError: lastErr,
+	}
+	if !lastErrAt.IsZero() {
+		resp.LastConnectErrorAt = lastErrAt.UTC().Format(time.RFC3339)
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(SCIONStatusResponse{
-		Connected: connected,
-		LocalIA:   localIA,
-	})
+	json.NewEncoder(w).Encode(resp)
 }

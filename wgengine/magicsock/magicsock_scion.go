@@ -8,22 +8,25 @@ package magicsock
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/gopacket/gopacket"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
+	daemontypes "github.com/scionproto/scion/pkg/daemon/types"
 	"github.com/scionproto/scion/pkg/slayers"
 	scionpath "github.com/scionproto/scion/pkg/slayers/path/scion"
 	"github.com/scionproto/scion/pkg/snet"
@@ -32,6 +35,7 @@ import (
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+	"golang.org/x/time/rate"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netmon"
@@ -59,7 +63,6 @@ var preferSCION = envknob.RegisterBool("TS_PREFER_SCION")
 const scionDispatcherPort = 30041
 
 var (
-	scionDaemonAddress = envknob.RegisterString("SCION_DAEMON_ADDRESS")
 	scionPort          = envknob.RegisterString("TS_SCION_PORT")
 	scionListenAddrEnv = envknob.RegisterString("TS_SCION_LISTEN_ADDR")
 	noDispatcherShim   = envknob.RegisterBool("TS_SCION_NO_DISPATCHER_SHIM")
@@ -82,10 +85,54 @@ func scionPreferenceBonus() int {
 // the ts_omit_scion omit file (which defines scionIAKey = uint64).
 type scionIAKey = addr.IA
 
+// scionLazyEndpointRate and scionLazyEndpointBurst bound the rate at which
+// receiveSCION/receiveSCIONShim may create new lazyEndpoint objects for
+// unknown source addresses. A spoofed flood from many source addresses would
+// otherwise allocate one lazyEndpoint per packet until WireGuard fails
+// authentication and drops them — significant GC pressure under attack.
+//
+// The chosen values (500/sec sustained, 200 burst) are generous enough that
+// legitimate first-contact bursts (netmap updates, re-discovery) never hit
+// the limit; they are meant as a ceiling, not a shaping mechanism. Drops
+// are observable via metricSCIONLazyEndpointDropped.
+const (
+	scionLazyEndpointRate  = 500
+	scionLazyEndpointBurst = 200
+)
+
+// initSCIONLazyEndpointLimiter initialises c.scionLazyEndpointLimiter and
+// c.scionHotLogf. Called from newConn before any SCION receive path runs.
+func (c *Conn) initSCIONLazyEndpointLimiter() {
+	c.scionLazyEndpointLimiter = rate.NewLimiter(rate.Limit(scionLazyEndpointRate), scionLazyEndpointBurst)
+	// 1 message burst per 5s window, cache up to 32 distinct formats. Used
+	// by SCION hot paths where a single incident (e.g. socket close) would
+	// otherwise emit thousands of identical log lines.
+	c.scionHotLogf = logger.RateLimitedFn(c.logf, 5*time.Second, 1, 32)
+}
+
+// allowSCIONLazyEndpoint reports whether receive code may create a new
+// lazyEndpoint right now. Returns false when the limiter bucket is empty;
+// callers should drop the offending packet (or skip emitting the endpoint
+// to WireGuard) and bump metricSCIONLazyEndpointDropped.
+func (c *Conn) allowSCIONLazyEndpoint() bool {
+	if c.scionLazyEndpointLimiter == nil {
+		return true // not initialised — behave as if unlimited
+	}
+	if c.scionLazyEndpointLimiter.Allow() {
+		return true
+	}
+	metricSCIONLazyEndpointDropped.Add(1)
+	return false
+}
+
 // scionPathKey is a compact index into the Conn-level scionPaths registry.
 // This keeps epAddr small and comparable (snet.UDPAddr contains slices).
 // A zero value means "not a SCION path."
-type scionPathKey uint32
+// scionPathKey is a monotonically increasing index into the Conn.scionPaths
+// registry. Kept wide (uint64) so that a long-running daemon with frequent
+// path churn cannot wrap the counter and alias stale registry entries onto
+// new peers. Zero is reserved as "unset" — see IsSet.
+type scionPathKey uint64
 
 // IsSet reports whether k refers to a valid SCION path entry.
 func (k scionPathKey) IsSet() bool { return k != 0 }
@@ -112,7 +159,12 @@ type scionPathInfo struct {
 	mtu              uint16               // SCION payload MTU from path metadata
 	refreshMissCount int                  // consecutive refresh cycles fingerprint absent from daemon
 	displayStr       string               // pre-computed human-readable path string
-	mu               sync.Mutex
+	// generation increments each time path/nextHop/fastPath is mutated.
+	// scionFastPath.gen is snapshot at build time; senders that observe a
+	// fastPath whose gen is behind the current pi.generation treat the
+	// template as stale and fall through to the slow path.
+	generation uint64
+	mu         sync.Mutex
 }
 
 // String returns the pre-computed human-readable display string for this path.
@@ -130,6 +182,8 @@ func (pi *scionPathInfo) buildDisplayStr() {
 		if md := pi.path.Metadata(); md != nil && len(md.Interfaces) > 0 {
 			hops = formatSCIONHops(md.Interfaces)
 		}
+	} else if pi.fingerprint == scionSameASFingerprint {
+		hops = "local"
 	}
 	pi.displayStr = fmt.Sprintf("scion:[%s]:[%s]:%d",
 		hops, pi.hostAddr.Addr(), pi.hostAddr.Port())
@@ -175,6 +229,9 @@ func (pi *scionPathInfo) buildCachedDst() {
 		dst.NextHop = pi.path.UnderlayNextHop()
 	}
 	pi.cachedDst = dst
+	// Bump generation so any previously-built fastPath snapshot is flagged
+	// as stale by the send path's staleness check.
+	pi.generation++
 }
 
 // The SCION path metadata MTU is the maximum SCION packet size that can
@@ -208,6 +265,12 @@ const defaultSCIONProbePaths = 5
 // At the default 30s refresh interval, this is ~90s.
 const scionStalePathThreshold = 3
 
+// scionSameASFingerprint is a sentinel fingerprint for same-AS (intra-AS)
+// paths. These paths use an empty SCION path (PathType=0, 0 wire bytes)
+// and communicate directly via UDP without border routers. The sentinel
+// prevents the refresh logic from garbage-collecting same-AS path entries.
+const scionSameASFingerprint snet.PathFingerprint = "same-as"
+
 // scionPongHistoryCount is the ring buffer size for per-path pong latency tracking.
 const scionPongHistoryCount = 8
 
@@ -233,8 +296,16 @@ type scionEndpointState struct {
 
 // scionPathProbeState tracks disco probing state for one SCION path.
 type scionPathProbeState struct {
-	fingerprint     snet.PathFingerprint
-	displayStr      string // cached from scionPathInfo.displayStr for lock-safe logging
+	fingerprint snet.PathFingerprint
+	// ifCount is the number of SCION interfaces (path hops × 2) captured
+	// when this probe state was created. Used together with fingerprint as
+	// a collision-hardening check: fingerprint alone is a truncated hash
+	// and two topologically distinct paths could in theory share the same
+	// value. Preserving probe history across a refresh requires BOTH to
+	// match, so latency/health data from an unrelated path cannot leak in.
+	ifCount         int
+	displayStr      string        // cached from scionPathInfo.displayStr for lock-safe logging
+	wireMTU         tstun.WireMTU // path-specific wireMTU (pathMTU - SCION headers), or scionWireMTU if unknown
 	lastPing        mono.Time
 	recentPongs     [scionPongHistoryCount]scionPongReply // ring buffer
 	recentPong      uint16                                // index of most recent entry
@@ -290,16 +361,36 @@ type scionFastPath struct {
 	udpOffset  int          // byte offset of UDP header within hdr
 	nextHop    *net.UDPAddr // underlay next-hop for this path
 	pseudoCsum uint32       // constant part of SCION pseudo-header checksum
+	gen        uint64       // scionPathInfo.generation at build time (for staleness check)
 }
 
-// scionMaxBatchSize is the max number of packets in a single sendmmsg call.
-const scionMaxBatchSize = 64
+// scionMaxBatchSize is the max number of packets in a single sendmmsg/recvmmsg
+// call. Matches conn.IdealBatchSize (128) to avoid silently truncating batches
+// from WireGuard on Linux.
+const scionMaxBatchSize = 128
+
+// scionExpiryGuard is the safety margin applied when checking path expiry
+// at send time: a path is considered expired if it would expire within this
+// window. Absorbs the small gap between the check and the underlying
+// send syscall, preventing packets being handed to a path that expires
+// mid-flight. 500ms is comfortably larger than worst-case batch-build +
+// sendmmsg latency and negligible relative to typical SCION path lifetimes
+// (minutes to hours).
+const scionExpiryGuard = 500 * time.Millisecond
 
 // scionSendBatch is a reusable set of buffers for sendSCIONBatchFast.
 type scionSendBatch struct {
 	bufs [][]byte
 	msgs []ipv4.Message
 }
+
+// scionSendBatchInitBufSize is the initial capacity of each per-packet send
+// buffer. Sized so typical SCION+UDP+WireGuard packets (up to ~60 bytes
+// SCION header + 8 UDP + ~1472 SCION payload MTU on common testbeds) fit
+// without the hot-path grow branch in sendSCIONBatchFast firing on a fresh
+// batch. Larger-MTU paths still grow lazily; the grown buffer sticks with
+// the batch via sync.Pool reuse, so subsequent batches skip the realloc.
+const scionSendBatchInitBufSize = 2048
 
 var scionSendBatchPool = sync.Pool{
 	New: func() any {
@@ -308,7 +399,7 @@ var scionSendBatchPool = sync.Pool{
 			msgs: make([]ipv4.Message, scionMaxBatchSize),
 		}
 		for i := range b.bufs {
-			b.bufs[i] = make([]byte, 1500)
+			b.bufs[i] = make([]byte, scionSendBatchInitBufSize)
 		}
 		for i := range b.msgs {
 			b.msgs[i].Buffers = make([][]byte, 1)
@@ -332,7 +423,7 @@ var scionRecvBatchPool = sync.Pool{
 		}
 		b.scn.RecyclePaths()
 		for i := range b.bufs {
-			b.bufs[i] = make([]byte, 1500)
+			b.bufs[i] = make([]byte, scionSendBatchInitBufSize)
 		}
 		for i := range b.msgs {
 			b.msgs[i].Buffers = [][]byte{b.bufs[i]}
@@ -477,6 +568,7 @@ func buildSCIONFastPath(sc *scionConn, pi *scionPathInfo) *scionFastPath {
 		udpOffset:  udpOffset,
 		nextHop:    dst.NextHop,
 		pseudoCsum: pseudoCsum,
+		gen:        pi.generation,
 	}
 }
 
@@ -534,7 +626,16 @@ func parseSCIONPacket(data []byte, scn *slayers.SCION) (
 // recvmmsg); it is required for the reply to be routable.
 func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes []byte, nextHop *net.UDPAddr) *snet.UDPAddr {
 	if len(rawPathBytes) == 0 {
-		return nil
+		// Same-AS: empty path, reply directly to source.
+		return &snet.UDPAddr{
+			IA: srcIA,
+			Host: &net.UDPAddr{
+				IP:   srcHostAddr.Addr().AsSlice(),
+				Port: int(srcHostAddr.Port()),
+			},
+			Path:    snetpath.Empty{},
+			NextHop: nextHop,
+		}
 	}
 	// Copy path bytes since DecodeFromBytes references the slice.
 	pathCopy := make([]byte, len(rawPathBytes))
@@ -567,10 +668,11 @@ func buildSCIONReplyAddr(srcIA addr.IA, srcHostAddr netip.AddrPort, rawPathBytes
 }
 
 // scionBatchRW abstracts ipv4.PacketConn and ipv6.PacketConn for
-// batch I/O. Both have identical ReadBatch/WriteBatch signatures
-// since ipv4.Message and ipv6.Message are the same type (socket.Message).
-// On non-Linux platforms, ReadBatch/WriteBatch fall back to per-message
-// sendto/recvfrom (golang.org/x/net handles this internally).
+// batch I/O (recvmmsg/sendmmsg). Both have identical ReadBatch/WriteBatch
+// signatures since ipv4.Message and ipv6.Message are the same type
+// (socket.Message). Only used on Linux; on other platforms underlayXPC
+// and shimXPC are nil, and the receive/send loops fall back to
+// single-packet snet.Conn.ReadFrom/WriteTo.
 type scionBatchRW interface {
 	ReadBatch([]ipv4.Message, int) (int, error)
 	WriteBatch([]ipv4.Message, int) (int, error)
@@ -588,37 +690,43 @@ type scionConn struct {
 	topo         snet.Topology    // local topology
 	shimConn     *net.UDPConn     // receive-only socket on port 30041; nil if unavailable
 	shimXPC      scionBatchRW     // batch reader for shim socket
+	closeOnce    sync.Once        // ensures close/closeSocket are safe against concurrent calls
 }
 
 // close shuts down the SCION connection and daemon connector.
+// Safe to call concurrently from multiple goroutines.
 func (sc *scionConn) close() error {
-	if sc.shimConn != nil {
-		sc.shimConn.Close()
-	}
-	if sc.conn != nil {
-		sc.conn.Close()
-	}
-	if sc.daemon != nil {
-		sc.daemon.Close()
-	}
+	sc.closeOnce.Do(func() {
+		if sc.shimConn != nil {
+			sc.shimConn.Close()
+		}
+		if sc.conn != nil {
+			sc.conn.Close()
+		}
+		if sc.daemon != nil {
+			sc.daemon.Close()
+		}
+	})
 	return nil
 }
 
 // closeSocket closes only the SCION socket (conn, underlayConn, underlayXPC)
 // and the dispatcher shim, preserving the daemon connector and topology for
-// socket-only reconnection.
+// socket-only reconnection. Uses closeOnce to prevent concurrent close races.
 func (sc *scionConn) closeSocket() {
-	if sc.shimConn != nil {
-		sc.shimConn.Close()
-	}
-	sc.shimConn = nil
-	sc.shimXPC = nil
-	if sc.conn != nil {
-		sc.conn.Close()
-	}
-	sc.conn = nil
-	sc.underlayConn = nil
-	sc.underlayXPC = nil
+	sc.closeOnce.Do(func() {
+		if sc.shimConn != nil {
+			sc.shimConn.Close()
+		}
+		sc.shimConn = nil
+		sc.shimXPC = nil
+		if sc.conn != nil {
+			sc.conn.Close()
+		}
+		sc.conn = nil
+		sc.underlayConn = nil
+		sc.underlayXPC = nil
+	})
 }
 
 // writeTo sends b to a peer identified by the given scionPathInfo.
@@ -652,15 +760,6 @@ func (sc *scionConn) readFrom(b []byte) (int, *snet.UDPAddr, error) {
 	return n, src, nil
 }
 
-// scionDaemonAddr returns the SCION daemon address to use, checking the
-// environment variable first, then falling back to the default socket.
-func scionDaemonAddr() string {
-	if a := scionDaemonAddress(); a != "" {
-		return a
-	}
-	return daemon.DefaultAPIAddress
-}
-
 // scionListenPort returns the SCION port to use, checking the TS_SCION_PORT
 // environment variable first, then falling back to 0 (auto-select from the
 // topology's dispatched port range).
@@ -672,6 +771,22 @@ func scionListenPort() uint16 {
 		}
 	}
 	return 0 // let snet auto-select from topology port range
+}
+
+// extractSCIONUnderlayUDPConn returns the *net.UDPConn underlying an
+// snet.SCIONPacketConn, or nil if it could not be accessed. scionproto v0.15
+// made the field unexported; we read it reflectively because the fast-path
+// sendmmsg/recvmmsg helpers and the netns control hook both need the raw
+// *net.UDPConn. If scionproto later reshapes the struct this returns nil, the
+// fast path is skipped, and magicsock falls back to pc.WriteTo / pc.ReadFrom.
+func extractSCIONUnderlayUDPConn(pc *snet.SCIONPacketConn) *net.UDPConn {
+	v := reflect.ValueOf(pc).Elem().FieldByName("conn")
+	if !v.IsValid() {
+		return nil
+	}
+	iface := reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Interface()
+	udp, _ := iface.(*net.UDPConn)
+	return udp
 }
 
 // scionResolveLocalIP determines the local IP for the SCION underlay socket
@@ -733,56 +848,35 @@ func scionListenAddr(ctx context.Context, connector daemon.Connector, logf logge
 	return &net.UDPAddr{IP: ip.AsSlice(), Port: int(port)}
 }
 
-// forceEmbeddedSCION is the TS_SCION_EMBEDDED envknob. When set to "1",
-// the external daemon attempt is skipped and only the embedded connector is tried.
-var forceEmbeddedSCION = envknob.RegisterBool("TS_SCION_EMBEDDED")
-
-// forceBootstrapSCION is the TS_SCION_FORCE_BOOTSTRAP envknob. When set to "1",
-// the local topology file attempt is skipped and only the bootstrap attempt is tried.
-var forceBootstrapSCION = envknob.RegisterBool("TS_SCION_FORCE_BOOTSTRAP")
-
-// trySCIONConnect attempts to set up a SCION connection using a cascading
-// fallback strategy:
-//  1. External daemon (existing behavior, quick check) — skipped if TS_SCION_EMBEDDED=1
-//  2. Embedded with existing local topology file (TS_SCION_TOPOLOGY or /etc/scion/topology.json)
-//  3. Bootstrap from configured URL (TS_SCION_BOOTSTRAP_URL / TS_SCION_BOOTSTRAP_URLS)
-//  4. DNS-based discovery (SRV for _sciondiscovery._tcp)
-//  5. Hardcoded bootstrap URLs (if any)
+// trySCIONConnect attempts to set up a SCION connection via the embedded
+// connector. It first tries a local topology file (TS_SCION_TOPOLOGY or
+// /etc/scion/topology.json); if that fails or is absent, it walks the
+// configured bootstrap URLs (explicit env → DNS SRV → hardcoded defaults),
+// fetches a topology and TRCs, and retries against the bootstrapped topology.
 //
-// Returns nil if SCION is not available via any method.
+// Returns an error that names the remedies (TS_SCION_TOPOLOGY,
+// TS_SCION_BOOTSTRAP_URL) when no path to a usable topology succeeds.
 func trySCIONConnect(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor) (*scionConn, error) {
-	var externalErr error
-
-	// Step 1: Try external daemon (unless forced embedded).
-	if !forceEmbeddedSCION() {
-		sc, err := tryExternalDaemon(ctx, logf, netMon)
+	// Step 1: Try embedded with existing local topology file.
+	topoPath := scionTopologyPath()
+	if _, statErr := os.Stat(topoPath); statErr == nil {
+		sc, err := tryEmbeddedDaemon(ctx, topoPath, logf, netMon)
 		if err == nil {
 			return sc, nil
 		}
-		externalErr = err
+		logf("scion: embedded from %s failed: %v", topoPath, err)
 	}
 
-	// Step 2: Try embedded with existing local topology file.
-	if !forceBootstrapSCION() {
-		topoPath := scionTopologyPath()
-		if _, err := os.Stat(topoPath); err == nil {
-			sc, err := tryEmbeddedDaemon(ctx, topoPath, logf, netMon)
-			if err == nil {
-				return sc, nil
-			}
-			// Fall through to bootstrap attempts.
-		}
-	}
-
-	// Steps 3-5: Try bootstrap from URLs (explicit, DNS-discovered, hardcoded).
+	// Step 2: Bootstrap from URLs (explicit env, DNS-discovered, hardcoded defaults).
 	stateDir := scionStateDir()
 	if stateDir == "" {
-		if externalErr != nil {
-			return nil, fmt.Errorf("external daemon: %w; embedded: no state directory available", externalErr)
-		}
-		return nil, fmt.Errorf("SCION not available: no external daemon, no topology file, no state directory for bootstrap")
+		return nil, fmt.Errorf("SCION not available: no topology file at %s and no state directory (set TS_SCION_STATE_DIR) for bootstrap", topoPath)
 	}
-	for _, url := range bootstrapURLs(ctx, logf) {
+	urls := bootstrapURLs(ctx, logf)
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("SCION not available: no topology file at %s and no bootstrap URL (set TS_SCION_TOPOLOGY or TS_SCION_BOOTSTRAP_URL)", topoPath)
+	}
+	for _, url := range urls {
 		if err := bootstrapSCION(ctx, logf, url, stateDir); err != nil {
 			logf("scion: bootstrap from %s failed: %v", url, err)
 			continue
@@ -795,105 +889,10 @@ func trySCIONConnect(ctx context.Context, logf logger.Logf, netMon *netmon.Monit
 		if err == nil {
 			return sc, nil
 		}
+		logf("scion: embedded from bootstrapped %s failed: %v", bootstrappedTopo, err)
 	}
 
-	if externalErr != nil {
-		return nil, fmt.Errorf("external daemon: %w; embedded: no topology available", externalErr)
-	}
-	return nil, fmt.Errorf("SCION not available: no external daemon, no topology file, no bootstrap server")
-}
-
-// tryExternalDaemon attempts to connect to an external SCION daemon and set up
-// a SCION listener. This is the original trySCIONConnect behavior.
-func tryExternalDaemon(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor) (*scionConn, error) {
-	daemonAddr := scionDaemonAddr()
-	svc := daemon.Service{Address: daemonAddr}
-	conn, err := svc.Connect(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to SCION daemon at %s: %w", daemonAddr, err)
-	}
-
-	topo, err := snetTopologyFromConnector(ctx, conn)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("building topology from daemon: %w", err)
-	}
-
-	// Probe Paths() to detect wire-format incompatibility with older
-	// daemons (e.g. v0.12 daemon vs v0.14 client). Simple RPCs like
-	// LocalIA/Interfaces/ASInfo use compatible proto types, but Paths
-	// responses with real hop data trigger unmarshal failures.
-	// We need a reachable remote IA to get a non-empty response;
-	// parse the topology file for a neighbor AS.
-	if neighborIA, ok := neighborIAFromTopology(scionTopologyPath()); ok {
-		localIA, _ := conn.LocalIA(ctx)
-		if _, err := conn.Paths(ctx, neighborIA, localIA, daemon.PathReqFlags{}); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("daemon path probe failed (version mismatch?): %w", err)
-		}
-	}
-
-	sc, err := finishSCIONConnect(ctx, conn, topo, logf, netMon)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return sc, nil
-}
-
-// snetTopologyFromConnector builds an snet.Topology struct by querying
-// a daemon.Connector for local topology information.
-func snetTopologyFromConnector(ctx context.Context, conn daemon.Connector) (snet.Topology, error) {
-	localIA, err := conn.LocalIA(ctx)
-	if err != nil {
-		return snet.Topology{}, fmt.Errorf("querying local IA: %w", err)
-	}
-	portStart, portEnd, err := conn.PortRange(ctx)
-	if err != nil {
-		return snet.Topology{}, fmt.Errorf("querying port range: %w", err)
-	}
-	ifMap, err := conn.Interfaces(ctx)
-	if err != nil {
-		return snet.Topology{}, fmt.Errorf("querying interfaces: %w", err)
-	}
-	return snet.Topology{
-		LocalIA:   localIA,
-		PortRange: snet.TopologyPortRange{Start: portStart, End: portEnd},
-		Interface: func(id uint16) (netip.AddrPort, bool) {
-			ap, ok := ifMap[id]
-			return ap, ok
-		},
-	}, nil
-}
-
-// neighborIAFromTopology parses the SCION topology JSON file and returns
-// the IA of the first neighbor AS found in the border router interfaces.
-// This is used to probe the daemon with a Paths() call that returns real
-// path data, detecting proto wire-format incompatibilities.
-func neighborIAFromTopology(topoPath string) (addr.IA, bool) {
-	data, err := os.ReadFile(topoPath)
-	if err != nil {
-		return 0, false
-	}
-	var topo struct {
-		BorderRouters map[string]struct {
-			Interfaces map[string]struct {
-				ISDAS string `json:"isd_as"`
-			} `json:"interfaces"`
-		} `json:"border_routers"`
-	}
-	if err := json.Unmarshal(data, &topo); err != nil {
-		return 0, false
-	}
-	for _, br := range topo.BorderRouters {
-		for _, iface := range br.Interfaces {
-			ia, err := addr.ParseIA(iface.ISDAS)
-			if err == nil {
-				return ia, true
-			}
-		}
-	}
-	return 0, false
+	return nil, fmt.Errorf("SCION not available: no topology file at %s and no bootstrap server succeeded (set TS_SCION_TOPOLOGY or TS_SCION_BOOTSTRAP_URL)", topoPath)
 }
 
 // finishSCIONConnect completes the SCION connection setup given a
@@ -933,8 +932,12 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 	// snet.Conn serialization. Also increase socket buffer sizes.
 	var underlayConn *net.UDPConn
 	if pc, ok := pconn.(*snet.SCIONPacketConn); ok {
-		underlayConn = pc.Conn
-		logf("magicsock: SCION: extracted underlay conn, local=%v", underlayConn.LocalAddr())
+		underlayConn = extractSCIONUnderlayUDPConn(pc)
+		if underlayConn != nil {
+			logf("magicsock: SCION: extracted underlay conn, local=%v", underlayConn.LocalAddr())
+		} else {
+			logf("magicsock: SCION: WARNING: could not extract underlay *net.UDPConn from SCIONPacketConn; fast-path disabled")
+		}
 		if err := pc.SetReadBuffer(socketBufferSize); err != nil {
 			logf("magicsock: SCION: failed to set read buffer to %d: %v", socketBufferSize, err)
 		}
@@ -986,10 +989,11 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 		localPort = uint16(sa.Host.Port)
 	}
 
-	// Wrap underlay conn for sendmmsg batching, selecting the correct
-	// address family based on the local address.
+	// Wrap underlay conn for recvmmsg/sendmmsg batching (Linux only).
+	// On non-Linux platforms, batch I/O is not available and the receive/send
+	// loops fall back to single-packet snet.Conn.ReadFrom/WriteTo.
 	var underlayXPC scionBatchRW
-	if underlayConn != nil {
+	if underlayConn != nil && runtime.GOOS == "linux" {
 		local, ok := underlayConn.LocalAddr().(*net.UDPAddr)
 		if !ok {
 			return nil, fmt.Errorf("unexpected underlay local address type %T", underlayConn.LocalAddr())
@@ -1031,6 +1035,14 @@ func openDispatcherShim(sc *scionConn, logf logger.Logf, netMon *netmon.Monitor)
 		return
 	}
 
+	// The shim binds to the same local IP as the SCION main socket (see
+	// sc.localHostIP), not a wildcard. This is deliberate: if the operator
+	// has chosen a specific local IP via TS_SCION_LISTEN_ADDR, the shim
+	// must listen only on that address. If localHostIP is a wildcard
+	// (0.0.0.0 or ::), the shim inherits the same exposure as the main
+	// socket — operators who want the dispatcher to be localhost-only
+	// should either (a) set TS_SCION_LISTEN_ADDR=127.0.0.1, or
+	// (b) disable the shim entirely with TS_SCION_NO_DISPATCHER_SHIM=1.
 	shimAddr := &net.UDPAddr{
 		IP:   sc.localHostIP.AsSlice(),
 		Port: scionDispatcherPort,
@@ -1061,18 +1073,21 @@ func openDispatcherShim(sc *scionConn, logf logger.Logf, netMon *netmon.Monitor)
 		}
 	}
 
-	// Wrap for batch I/O, selecting address family based on local address.
+	// Wrap for batch I/O (Linux only). On non-Linux, shimXPC stays nil
+	// and receiveSCIONShim polls infrequently without reading.
 	var xpc scionBatchRW
-	local, ok := shimConn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		shimConn.Close()
-		logf("magicsock: SCION shim: unexpected local address type %T", shimConn.LocalAddr())
-		return
-	}
-	if local.IP.To4() != nil {
-		xpc = ipv4.NewPacketConn(shimConn)
-	} else {
-		xpc = ipv6.NewPacketConn(shimConn)
+	if runtime.GOOS == "linux" {
+		local, ok := shimConn.LocalAddr().(*net.UDPAddr)
+		if !ok {
+			shimConn.Close()
+			logf("magicsock: SCION shim: unexpected local address type %T", shimConn.LocalAddr())
+			return
+		}
+		if local.IP.To4() != nil {
+			xpc = ipv4.NewPacketConn(shimConn)
+		} else {
+			xpc = ipv6.NewPacketConn(shimConn)
+		}
 	}
 
 	sc.shimConn = shimConn
@@ -1129,10 +1144,24 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 	replyPath := pi.replyPath
 	cachedDst := pi.cachedDst
 	fastPath := pi.fastPath
-	expired := !pi.expiry.IsZero() && time.Now().After(pi.expiry)
+	piGen := pi.generation
+	// Apply a small safety margin so we don't hand off a packet on a path
+	// that expires mid-flight. The window between this check and the
+	// underlying send syscall is small but nonzero (template patching,
+	// sendmmsg); on a path expiring inside that window, a border router
+	// upstream would reject the packet with no error signal back to us.
+	now := time.Now()
+	expired := !pi.expiry.IsZero() && now.Add(scionExpiryGuard).After(pi.expiry)
 	pi.mu.Unlock()
 	if expired {
 		return false, fmt.Errorf("SCION path expired for key %d", addr.scionKey)
+	}
+	// If the captured fastPath predates the current pi.generation (a path
+	// refresh interleaved with our capture), treat it as stale and fall
+	// through to the slow path. The next send will see the fresh template.
+	if fastPath != nil && fastPath.gen != piGen {
+		metricSCIONFastPathStale.Add(1)
+		fastPath = nil
 	}
 
 	// Fast path: pre-serialized headers + sendmmsg.
@@ -1172,6 +1201,17 @@ func (c *Conn) sendSCIONBatchFast(sc *scionConn, fp *scionFastPath, buffs [][]by
 	defer scionSendBatchPool.Put(batch)
 
 	hdrLen := len(fp.hdr)
+	// Validate fastPath geometry up front. A stale or corrupted template
+	// (e.g. captured before a path refresh that changed the hop count)
+	// could otherwise cause buf[fp.udpOffset+…] to panic or corrupt
+	// adjacent memory at send time. Fail the whole batch so the caller
+	// can discard the template and rebuild it.
+	const scionUDPHdrLen = 8
+	if hdrLen < scionUDPHdrLen || fp.udpOffset < 0 || fp.udpOffset+scionUDPHdrLen > hdrLen {
+		metricSCIONFastPathGeometryErr.Add(1)
+		return fmt.Errorf("invalid SCION fastPath geometry: udpOffset=%d hdrLen=%d", fp.udpOffset, hdrLen)
+	}
+
 	n := len(buffs)
 	if n > scionMaxBatchSize {
 		n = scionMaxBatchSize
@@ -1215,7 +1255,7 @@ func (c *Conn) sendSCIONBatchFast(sc *scionConn, fp *scionFastPath, buffs [][]by
 	// WriteBatch uses sendmmsg on Linux for batched sends.
 	msgs := batch.msgs[:n]
 	var head int
-	for {
+	for retries := 0; ; retries++ {
 		written, err := sc.underlayXPC.WriteBatch(msgs[head:], 0)
 		if err != nil {
 			return err
@@ -1223,6 +1263,15 @@ func (c *Conn) sendSCIONBatchFast(sc *scionConn, fp *scionFastPath, buffs [][]by
 		head += written
 		if head >= n {
 			return nil
+		}
+		if written == 0 {
+			if retries >= 3 {
+				return fmt.Errorf("sendmmsg made no progress after %d retries (%d/%d sent)", retries, head, n)
+			}
+			// Brief backoff instead of tight-spin on transient socket
+			// buffer pressure / EAGAIN. Scales from 10µs to 40µs across
+			// the three allowed retries.
+			time.Sleep(time.Duration(10<<retries) * time.Microsecond)
 		}
 	}
 }
@@ -1238,7 +1287,7 @@ func (c *Conn) sendSCION(sk scionPathKey, b []byte) (bool, error) {
 		return false, fmt.Errorf("no SCION path info for key %d", sk)
 	}
 	pi.mu.Lock()
-	expired := !pi.expiry.IsZero() && time.Now().After(pi.expiry)
+	expired := !pi.expiry.IsZero() && time.Now().Add(scionExpiryGuard).After(pi.expiry)
 	pi.mu.Unlock()
 	if expired {
 		return false, fmt.Errorf("SCION path expired for key %d", sk)
@@ -1264,8 +1313,51 @@ func (c *Conn) handleSCIONSendError(err error) {
 	if errors.Is(err, errNoSCION) {
 		return
 	}
+	// CAS guard: only one goroutine reconnects at a time. Others skip
+	// silently — when the reconnect completes they'll use the new socket.
+	if !c.scionReconnecting.CompareAndSwap(false, true) {
+		return
+	}
 	c.logf("magicsock: SCION send failed: %v, triggering reconnect", err)
-	go c.reconnectSCION()
+	go func() {
+		defer c.scionReconnecting.Store(false)
+		c.reconnectSCION()
+	}()
+}
+
+// initSCIONConnReady initializes c.scionConnReady. Must be called before any
+// use of signalSCIONConnReady or scionConnReadyCh.
+func (c *Conn) initSCIONConnReady() {
+	ch := make(chan struct{})
+	c.scionConnReady.Store(&ch)
+}
+
+// scionConnReadyCh returns the current scionConnReady channel. Callers use it
+// as `case <-c.scionConnReadyCh():` inside a select — the select evaluates
+// the expression once at entry, so each wait cycle sees a stable channel.
+// On the next call (after a wake-up) a fresh channel is observed.
+func (c *Conn) scionConnReadyCh() <-chan struct{} {
+	return *c.scionConnReady.Load()
+}
+
+// signalSCIONConnReady closes the current scionConnReady channel to wake up
+// receiveSCION and receiveSCIONShim goroutines waiting for a SCION connection,
+// and installs a new channel for the next wait cycle.
+//
+// Concurrent callers are safe: the CAS loop ensures each channel value is
+// closed exactly once (the goroutine that successfully swaps in the new
+// channel is the one that closes the old one). This prevents the
+// close-of-closed-channel panic that a naïve read-store-close would hit
+// under concurrent reconnection paths.
+func (c *Conn) signalSCIONConnReady() {
+	for {
+		oldPtr := c.scionConnReady.Load()
+		newCh := make(chan struct{})
+		if c.scionConnReady.CompareAndSwap(oldPtr, &newCh) {
+			close(*oldPtr)
+			return
+		}
+	}
 }
 
 // lookupSCIONPath returns the scionPathInfo for the given key, or nil if not found.
@@ -1289,6 +1381,8 @@ func (c *Conn) registerSCIONPath(pi *scionPathInfo) scionPathKey {
 		c.scionPaths = make(map[scionPathKey]*scionPathInfo)
 	}
 	c.scionPaths[k] = pi
+	metricSCIONPathsRegistered.Add(1)
+	metricSCIONPathsLive.Set(int64(len(c.scionPaths)))
 	// Don't unconditionally overwrite scionPathsByAddr here — with multi-path,
 	// multiple keys share the same (IA, hostAddr). The caller is responsible
 	// for setting the active path via setActiveSCIONPath.
@@ -1305,21 +1399,36 @@ func (c *Conn) registerSCIONPathLocking(pi *scionPathInfo) scionPathKey {
 
 // unregisterSCIONPath removes a SCION path entry and its peerMap entry.
 // c.mu must be held.
+//
+// Race model: all three maps (scionPaths, scionPathsByAddr,
+// peerMap.byEpAddr) are protected by c.mu. A concurrent sender or receiver
+// holding c.mu sees either the pre- or post-delete state atomically, not
+// a torn view. If a receive loop observes the post-delete state for an
+// epAddr that just got unregistered, it falls through to the
+// rate-limited lazyEndpoint path (allowSCIONLazyEndpoint), so a burst of
+// in-flight packets cannot spawn unbounded lazy endpoints. This is the
+// current "mark-stale" equivalent: delete is atomic under c.mu, and the
+// downstream behaviour is bounded by the P0-3 rate limiter rather than a
+// separate stale-GC epoch.
 func (c *Conn) unregisterSCIONPath(k scionPathKey) {
-	if pi, ok := c.scionPaths[k]; ok {
-		// Only remove reverse index if it points to this key.
-		ak := scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr}
-		if c.scionPathsByAddr[ak] == k {
-			delete(c.scionPathsByAddr, ak)
-		}
-		// Remove stale peerMap entry for this scionKey.
-		scionEp := epAddr{ap: pi.hostAddr, scionKey: k}
-		if peerInf := c.peerMap.byEpAddr[scionEp]; peerInf != nil {
-			delete(peerInf.epAddrs, scionEp)
-			delete(c.peerMap.byEpAddr, scionEp)
-		}
+	pi, ok := c.scionPaths[k]
+	if !ok {
+		return
+	}
+	// Only remove reverse index if it points to this key.
+	ak := scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr}
+	if c.scionPathsByAddr[ak] == k {
+		delete(c.scionPathsByAddr, ak)
+	}
+	// Remove stale peerMap entry for this scionKey.
+	scionEp := epAddr{ap: pi.hostAddr, scionKey: k}
+	if peerInf := c.peerMap.byEpAddr[scionEp]; peerInf != nil {
+		delete(peerInf.epAddrs, scionEp)
+		delete(c.peerMap.byEpAddr, scionEp)
 	}
 	delete(c.scionPaths, k)
+	metricSCIONPathsUnregistered.Add(1)
+	metricSCIONPathsLive.Set(int64(len(c.scionPaths)))
 }
 
 // setActiveSCIONPath updates the reverse index to point to the given key.
@@ -1373,12 +1482,12 @@ func (c *Conn) scionPathString(key scionPathKey) string {
 func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
 	sc := c.pconnSCION.Load()
 	if sc == nil {
-		// SCION not connected yet. Wait and retry instead of blocking
-		// forever, so that mid-session SCION connections (e.g. from
-		// ReconfigureSCION on Android) can start receiving.
+		// SCION not connected yet. Wait for scionConnReady signal
+		// or timeout, so mid-session connects get instant wake-up.
 		select {
 		case <-c.donec:
 			return 0, net.ErrClosed
+		case <-c.scionConnReadyCh():
 		case <-time.After(5 * time.Second):
 		}
 		sc = c.pconnSCION.Load()
@@ -1386,6 +1495,12 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 			return 0, nil // return zero to let WireGuard call us again
 		}
 	}
+
+	// Single-entry endpoint cache shared across loop iterations: repeated
+	// packets from the same source in this slow path avoid c.mu.
+	var slowCachedAddr epAddr
+	var slowCachedEP *endpoint
+	var slowCachedGen int64
 
 	for {
 		// Check for graceful shutdown.
@@ -1398,10 +1513,12 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		// Re-read pconnSCION — it may have been swapped by reconnectSCION.
 		sc = c.pconnSCION.Load()
 		if sc == nil {
-			// Socket was closed and reconnection failed. Retry.
+			// Socket was closed and reconnection failed. Wait for
+			// signal or retry after timeout.
 			select {
 			case <-c.donec:
 				return 0, net.ErrClosed
+			case <-c.scionConnReadyCh():
 			case <-time.After(5 * time.Second):
 			}
 			c.retrySCIONConnect()
@@ -1428,7 +1545,7 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 					// deadline set by closeSCIONBindLocked — re-check.
 					continue
 				}
-				c.logf("magicsock: SCION read error: %v", err)
+				c.scionHotLogf("magicsock: SCION read error: %v", err)
 				continue
 			}
 			// n == 0 and no error means all packets were disco/filtered.
@@ -1447,14 +1564,17 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 			if errors.Is(err, net.ErrClosed) || isTimeoutError(err) {
 				continue
 			}
-			c.logf("magicsock: SCION read error: %v", err)
+			c.scionHotLogf("magicsock: SCION read error: %v", err)
 			continue
 		}
 		if n == 0 {
 			continue
 		}
 
-		c.lastSCIONRecv.StoreAtomic(mono.Now())
+		// Fold into per-call timestamp — slow path returns a single
+		// packet per call, so this is already "per-batch". Keep it
+		// here so we only store on a successful parse.
+		nowRecv := mono.Now()
 
 		b := buffs[0][:n]
 		srcHostAddr := srcAddr.Host.AddrPort()
@@ -1487,18 +1607,36 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		}
 
 		srcEpAddr := epAddr{ap: srcHostAddr}
-		c.mu.Lock()
-		ep, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
-		c.mu.Unlock()
-		if !ok {
-			sizes[0] = n
-			eps[0] = &lazyEndpoint{c: c, src: srcEpAddr}
-			return 1, nil
+		// Small single-entry cache so repeated packets from the same
+		// source in this slow loop skip the c.mu round-trip. Mirrors
+		// the cache pattern in receiveSCIONBatch.
+		var ep *endpoint
+		if slowCachedAddr == srcEpAddr && slowCachedEP != nil && slowCachedGen == slowCachedEP.numStopAndReset() {
+			ep = slowCachedEP
+		} else {
+			c.mu.Lock()
+			de, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
+			c.mu.Unlock()
+			if !ok {
+				// Unknown source. Admit to WireGuard for authentication via a
+				// lazyEndpoint, but bound the rate so a spoofed flood cannot
+				// allocate one lazyEndpoint per packet.
+				if !c.allowSCIONLazyEndpoint() {
+					return 0, nil
+				}
+				sizes[0] = n
+				eps[0] = &lazyEndpoint{c: c, src: srcEpAddr}
+				return 1, nil
+			}
+			slowCachedAddr = srcEpAddr
+			slowCachedEP = de
+			slowCachedGen = de.numStopAndReset()
+			ep = de
 		}
 
-		now := mono.Now()
-		ep.lastRecvUDPAny.StoreAtomic(now)
-		ep.noteRecvActivity(srcEpAddr, now)
+		c.lastSCIONRecv.StoreAtomic(nowRecv)
+		ep.lastRecvUDPAny.StoreAtomic(nowRecv)
+		ep.noteRecvActivity(srcEpAddr, nowRecv)
 		if c.metrics != nil {
 			c.metrics.inboundPacketsSCIONTotal.Add(1)
 			c.metrics.inboundBytesSCIONTotal.Add(int64(n))
@@ -1519,10 +1657,11 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) {
 	sc := c.pconnSCION.Load()
 	if sc == nil {
-		// SCION not connected yet. Wait for mid-session connect.
+		// SCION not connected yet. Wait for signal or timeout.
 		select {
 		case <-c.donec:
 			return 0, net.ErrClosed
+		case <-c.scionConnReadyCh():
 		case <-time.After(5 * time.Second):
 		}
 		sc = c.pconnSCION.Load()
@@ -1531,12 +1670,13 @@ func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoi
 		}
 	} else if sc.shimXPC == nil {
 		// Connected but no dispatcher shim. shimXPC is immutable per
-		// scionConn, so poll infrequently — only a full reconnect
-		// (new scionConn) could create one.
+		// scionConn, so wait for a reconnect signal (which creates a
+		// new scionConn that might have a shim) or poll infrequently.
 		select {
 		case <-c.donec:
 			return 0, net.ErrClosed
-		case <-time.After(30 * time.Second):
+		case <-c.scionConnReadyCh():
+		case <-time.After(5 * time.Second):
 		}
 		sc = c.pconnSCION.Load()
 		if sc == nil || sc.shimXPC == nil {
@@ -1554,22 +1694,23 @@ func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoi
 		// Re-read pconnSCION — it may have been swapped by reconnectSCION.
 		sc = c.pconnSCION.Load()
 		if sc == nil {
-			// Main socket reconnection in progress. Wait and retry;
-			// the reconnect may or may not rebind port 30041.
+			// Main socket reconnection in progress. Wait for signal.
 			select {
 			case <-c.donec:
 				return 0, net.ErrClosed
+			case <-c.scionConnReadyCh():
 			case <-time.After(5 * time.Second):
 			}
 			continue
 		}
 		if sc.shimXPC == nil {
 			// Shim was not created for this connection (immutable per scionConn).
-			// Poll infrequently — only a full reconnect could add one.
+			// Wait for reconnect signal or poll infrequently.
 			select {
 			case <-c.donec:
 				return 0, net.ErrClosed
-			case <-time.After(30 * time.Second):
+			case <-c.scionConnReadyCh():
+			case <-time.After(5 * time.Second):
 			}
 			continue
 		}
@@ -1587,7 +1728,7 @@ func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoi
 			if errors.Is(err, net.ErrClosed) || isTimeoutError(err) {
 				continue
 			}
-			c.logf("magicsock: SCION shim read error: %v", err)
+			c.scionHotLogf("magicsock: SCION shim read error: %v", err)
 			continue
 		}
 		// n == 0 and no error means all packets were disco/filtered.
@@ -1615,6 +1756,19 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 
 	reportToCaller := false
 	count := 0
+	// Per-batch counters — we fold all per-packet atomic stores into a
+	// single update at the end of the loop to cut cache-line ping-pong
+	// at high packet rates.
+	var metricsPkts, metricsBytes int64
+	var anyData bool
+	var lastAcceptedAt mono.Time
+
+	// Batch-scoped endpoint cache: avoids c.mu acquisition for consecutive
+	// packets from the same source (common in high-throughput flows).
+	var cachedAddr epAddr
+	var cachedEP *endpoint
+	var cachedGen int64
+
 	for i := 0; i < numMsgs; i++ {
 		msg := &batch.msgs[i]
 		if msg.N == 0 {
@@ -1622,16 +1776,21 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 			continue
 		}
 
+		// Reset the decoder before each Decode so transient path slices
+		// from the previous packet don't linger between calls.
+		batch.scn.RecyclePaths()
 		srcIA, srcHostAddr, payload, rawPath, ok := parseSCIONPacket(
 			msg.Buffers[0][:msg.N], &batch.scn)
-		if !ok || len(payload) == 0 {
+		if !ok {
+			metricSCIONParseError.Add(1)
+			continue
+		}
+		if len(payload) == 0 {
 			continue
 		}
 
 		// Copy payload into WireGuard's buffer.
 		pn := copy(buffs[count], payload)
-
-		c.lastSCIONRecv.StoreAtomic(mono.Now())
 
 		pt, _ := packetLooksLike(buffs[count][:pn])
 		if pt == packetLooksLikeDisco {
@@ -1649,28 +1808,51 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 		}
 
 		srcEpAddr := epAddr{ap: srcHostAddr}
-		c.mu.Lock()
-		ep, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
-		c.mu.Unlock()
-		if !ok {
-			sizes[count] = pn
-			eps[count] = &lazyEndpoint{c: c, src: srcEpAddr}
-			count++
-			reportToCaller = true
-			continue
+
+		// Check batch-scoped cache before acquiring c.mu.
+		var ep *endpoint
+		if cachedAddr == srcEpAddr && cachedEP != nil && cachedGen == cachedEP.numStopAndReset() {
+			ep = cachedEP
+		} else {
+			c.mu.Lock()
+			de, found := c.peerMap.endpointForEpAddr(srcEpAddr)
+			c.mu.Unlock()
+			if !found {
+				// Unknown source. Admit via lazyEndpoint (so WireGuard can
+				// authenticate it) but rate-limit to cap spoof-flood impact.
+				if !c.allowSCIONLazyEndpoint() {
+					continue
+				}
+				sizes[count] = pn
+				eps[count] = &lazyEndpoint{c: c, src: srcEpAddr}
+				count++
+				reportToCaller = true
+				continue
+			}
+			cachedAddr = srcEpAddr
+			cachedEP = de
+			cachedGen = de.numStopAndReset()
+			ep = de
 		}
 
-		now := mono.Now()
-		ep.lastRecvUDPAny.StoreAtomic(now)
-		ep.noteRecvActivity(srcEpAddr, now)
-		if c.metrics != nil {
-			c.metrics.inboundPacketsSCIONTotal.Add(1)
-			c.metrics.inboundBytesSCIONTotal.Add(int64(pn))
-		}
+		lastAcceptedAt = mono.Now()
+		ep.lastRecvUDPAny.StoreAtomic(lastAcceptedAt)
+		ep.noteRecvActivity(srcEpAddr, lastAcceptedAt)
+		metricsPkts++
+		metricsBytes += int64(pn)
+		anyData = true
 		sizes[count] = pn
 		eps[count] = ep
 		count++
 		reportToCaller = true
+	}
+
+	if anyData {
+		c.lastSCIONRecv.StoreAtomic(lastAcceptedAt)
+		if c.metrics != nil {
+			c.metrics.inboundPacketsSCIONTotal.Add(metricsPkts)
+			c.metrics.inboundBytesSCIONTotal.Add(metricsBytes)
+		}
 	}
 
 	if reportToCaller {
@@ -1691,6 +1873,9 @@ func (c *Conn) handleSCIONDisco(b []byte, srcIA addr.IA, srcHostAddr netip.AddrP
 		// First disco packet from this SCION peer — build a reply path
 		// by reversing the raw SCION path from the incoming packet.
 		replyAddr := buildSCIONReplyAddr(srcIA, srcHostAddr, rawPath, nextHop)
+		if replyAddr == nil {
+			c.logf("magicsock: SCION: failed to build reply path for %s %s (raw path len=%d), disco reply will fail", srcIA, srcHostAddr, len(rawPath))
+		}
 		pi := &scionPathInfo{
 			peerIA:    srcIA,
 			hostAddr:  srcHostAddr,
@@ -1749,6 +1934,7 @@ func (c *Conn) reconnectSCIONSocket() bool {
 	}
 
 	c.pconnSCION.Store(newSC)
+	c.signalSCIONConnReady()
 	c.logf("magicsock: SCION socket-only reconnect succeeded, local IA: %s", newSC.localIA)
 	return true
 }
@@ -1788,26 +1974,39 @@ func (c *Conn) reconnectSCION() {
 	newSC, err := trySCIONConnect(c.connCtx, c.logf, c.netMon)
 	if err != nil {
 		c.logf("magicsock: SCION reconnect failed: %v", err)
+		c.recordSCIONConnectError(err)
 		return
 	}
 
 	c.pconnSCION.Store(newSC)
+	c.recordSCIONConnectError(nil)
+	c.signalSCIONConnReady()
+	metricSCIONReconnect.Add(1)
 	c.logf("magicsock: SCION reconnected successfully, local IA: %s", newSC.localIA)
 	c.rediscoverAllSCIONPaths()
 }
 
 // retrySCIONConnect attempts to re-establish a SCION connection when
-// pconnSCION is nil (previous reconnect attempt failed).
+// pconnSCION is nil (previous reconnect attempt failed). Uses the
+// scionReconnecting CAS guard to prevent concurrent retry attempts.
 func (c *Conn) retrySCIONConnect() {
 	if c.pconnSCION.Load() != nil {
 		return // another goroutine beat us to it
 	}
+	if !c.scionReconnecting.CompareAndSwap(false, true) {
+		return // reconnection already in progress
+	}
+	defer c.scionReconnecting.Store(false)
+
 	newSC, err := trySCIONConnect(c.connCtx, c.logf, c.netMon)
 	if err != nil {
 		c.logf("magicsock: SCION reconnect retry failed: %v", err)
+		c.recordSCIONConnectError(err)
 		return
 	}
 	c.pconnSCION.Store(newSC)
+	c.recordSCIONConnectError(nil)
+	c.signalSCIONConnReady()
 	c.lastSCIONRecv.StoreAtomic(mono.Now())
 	c.logf("magicsock: SCION reconnect retry succeeded, local IA: %s", newSC.localIA)
 	c.rediscoverAllSCIONPaths()
@@ -1885,7 +2084,12 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		return nil, errNoSCION
 	}
 
-	paths, err := sc.daemon.Paths(ctx, peerIA, sc.localIA, daemon.PathReqFlags{Refresh: false})
+	// Same-AS: no inter-AS path needed, use empty SCION path (direct UDP).
+	if peerIA == sc.localIA {
+		return c.registerSameASSCIONPath(sc, peerIA, hostAddr)
+	}
+
+	paths, err := sc.daemon.Paths(ctx, peerIA, sc.localIA, daemontypes.PathReqFlags{Refresh: false})
 	if err != nil {
 		return nil, fmt.Errorf("querying SCION paths to %s: %w", peerIA, err)
 	}
@@ -1918,10 +2122,9 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 	maxPaths := scionMaxProbePaths()
 	unique = selectDiversePaths(unique, maxPaths)
 
-	// Register each path.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	keys := make([]scionPathKey, 0, len(unique))
+	// Build path info structs outside c.mu to avoid holding the lock
+	// during gopacket serialization in buildSCIONFastPath.
+	infos := make([]*scionPathInfo, 0, len(unique))
 	for _, u := range unique {
 		var expiry time.Time
 		var mtu uint16
@@ -1939,9 +2142,17 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		}
 		pi.buildCachedDst()
 		pi.buildDisplayStr()
-		if sc := c.pconnSCION.Load(); sc != nil {
-			pi.fastPath = buildSCIONFastPath(sc, pi)
-		}
+		// sc was non-nil at the top of discoverSCIONPaths (line above
+		// 2154) and is not reassigned in this scope.
+		pi.fastPath = buildSCIONFastPath(sc, pi)
+		infos = append(infos, pi)
+	}
+
+	// Register paths under c.mu — only map insertions, no heavy work.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	keys := make([]scionPathKey, 0, len(infos))
+	for _, pi := range infos {
 		keys = append(keys, c.registerSCIONPath(pi))
 	}
 	// Set the first (lowest-latency) path as active for the reverse index.
@@ -1949,6 +2160,37 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		c.setActiveSCIONPath(peerIA, hostAddr, keys[0])
 	}
 	return keys, nil
+}
+
+// registerSameASSCIONPath creates a synthetic SCION path entry for a peer in
+// the same AS. Same-AS communication uses an empty SCION path (PathType=0,
+// 0 wire bytes) with direct UDP to the peer — no border routers are involved.
+func (c *Conn) registerSameASSCIONPath(sc *scionConn, peerIA addr.IA, hostAddr netip.AddrPort) ([]scionPathKey, error) {
+	pi := &scionPathInfo{
+		peerIA:      peerIA,
+		hostAddr:    hostAddr,
+		fingerprint: scionSameASFingerprint,
+		// path is nil: no snet.Path needed for same-AS.
+		// expiry is zero: same-AS paths never expire.
+	}
+	// Build cachedDst with empty SCION path and direct NextHop.
+	pi.cachedDst = &snet.UDPAddr{
+		IA:   peerIA,
+		Host: &net.UDPAddr{IP: hostAddr.Addr().AsSlice(), Port: int(hostAddr.Port())},
+		Path: snetpath.Empty{},
+		NextHop: &net.UDPAddr{
+			IP:   hostAddr.Addr().AsSlice(),
+			Port: int(hostAddr.Port()),
+		},
+	}
+	pi.buildDisplayStr()
+	pi.fastPath = buildSCIONFastPath(sc, pi)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := c.registerSCIONPath(pi)
+	c.setActiveSCIONPath(peerIA, hostAddr, k)
+	return []scionPathKey{k}, nil
 }
 
 // totalPathLatency returns the sum of all hop latencies for a SCION path.
@@ -2186,9 +2428,14 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		if !g.needRefresh {
 			continue
 		}
+		// Same-AS paths use an empty SCION path and never need daemon refresh.
+		if g.peerIA == sc.localIA {
+			continue
+		}
 
-		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemon.PathReqFlags{Refresh: true})
+		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemontypes.PathReqFlags{Refresh: true})
 		if err != nil || len(daemonPaths) == 0 {
+			metricSCIONPathRefreshError.Add(1)
 			c.logf("magicsock: SCION path refresh for %s failed: %v", g.peerIA, err)
 			if err != nil {
 				lastErr = err
@@ -2299,6 +2546,10 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		if g.needRefresh {
 			continue // already refreshed above
 		}
+		// Same-AS paths don't change; skip daemon query.
+		if g.peerIA == sc.localIA {
+			continue
+		}
 		c.mu.Lock()
 		lastSoft := c.scionSoftRefreshAt[g.peerIA]
 		c.mu.Unlock()
@@ -2306,7 +2557,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 			continue
 		}
 
-		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemon.PathReqFlags{Refresh: false})
+		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemontypes.PathReqFlags{Refresh: false})
 		if err != nil || len(daemonPaths) == 0 {
 			continue
 		}
@@ -2348,6 +2599,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 
 		if len(newPaths) > 0 {
 			newKeys := c.addNewSCIONPathsForPeer(g.peerIA, g.hostAddr, newPaths)
+			metricSCIONPathSoftRefreshAdded.Add(int64(len(newKeys)))
 			for i, k := range newKeys {
 				c.logf("magicsock: SCION soft refresh for %s: [%d] %s", g.peerIA, i, c.scionPathString(k))
 			}
@@ -2358,6 +2610,21 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		c.mu.Unlock()
 	}
 
+	// Opportunistic GC: prune scionSoftRefreshAt entries whose peerIA no
+	// longer has any registered paths. groups was built from the current
+	// scionPaths snapshot; anything not present has been fully unregistered
+	// (all its paths evicted) and the timestamp entry is dead weight.
+	c.mu.Lock()
+	for ia := range c.scionSoftRefreshAt {
+		if _, live := groups[ia]; !live {
+			delete(c.scionSoftRefreshAt, ia)
+		}
+	}
+	c.mu.Unlock()
+
+	if lastErr == nil {
+		metricSCIONPathRefresh.Add(1)
+	}
 	return lastErr
 }
 
@@ -2569,12 +2836,18 @@ func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) {
 
 // discoverSCIONPathAsync runs SCION path discovery in a goroutine,
 // avoiding blocking updateFromNode which holds the endpoint lock.
-// It self-throttles to at most once every 5 seconds to prevent concurrent
-// launches (from updateFromNode and send error paths) from creating
-// orphaned path entries.
+// Uses an atomic CAS guard to prevent concurrent launches (from
+// updateFromNode and send error paths) from creating orphaned path
+// entries, plus a 5-second timestamp throttle to avoid excessive
+// daemon queries.
 func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPort) {
-	// Throttle: skip if discovery ran recently. This prevents concurrent
-	// launches from orphaning path entries in the registry.
+	// CAS guard: only one discovery runs at a time per endpoint.
+	if !de.scionDiscovering.CompareAndSwap(false, true) {
+		return
+	}
+	defer de.scionDiscovering.Store(false)
+
+	// Throttle: skip if discovery ran recently.
 	de.mu.Lock()
 	if de.scionState != nil && time.Since(de.scionState.lastDiscoveryAt) < 5*time.Second {
 		de.mu.Unlock()
@@ -2600,6 +2873,7 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 
 	newKeys, err := de.c.discoverSCIONPaths(ctx, peerIA, hostAddr)
 	if err != nil {
+		metricSCIONPathDiscoveryError.Add(1)
 		de.c.logf("magicsock: SCION path discovery for %s failed: %v", peerIA, err)
 		return
 	}
@@ -2610,16 +2884,43 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 		newKeySet[k] = true
 	}
 
-	// Extract fingerprints and display strings under c.mu (must be acquired before de.mu per lock ordering).
+	// Extract fingerprints, display strings, and wireMTU under c.mu (must be acquired before de.mu per lock ordering).
 	type pathSnapshot struct {
 		fingerprint snet.PathFingerprint
+		ifCount     int
 		displayStr  string
+		wireMTU     tstun.WireMTU
 	}
 	de.c.mu.Lock()
 	snapByKey := make(map[scionPathKey]pathSnapshot, len(newKeys))
 	for _, k := range newKeys {
 		if pi := de.c.lookupSCIONPath(k); pi != nil {
-			snapByKey[k] = pathSnapshot{fingerprint: pi.fingerprint, displayStr: pi.displayStr}
+			pi.mu.Lock()
+			mtu := pi.mtu
+			hdrLen := 0
+			if pi.fastPath != nil {
+				hdrLen = len(pi.fastPath.hdr)
+			}
+			ifCount := 0
+			if pi.path != nil {
+				if md := pi.path.Metadata(); md != nil {
+					ifCount = len(md.Interfaces)
+				}
+			}
+			pi.mu.Unlock()
+			wmtu := scionWireMTU
+			if mtu > 0 && hdrLen > 0 {
+				maxWG := int(mtu) - hdrLen
+				if maxWG > 0 {
+					wmtu = tstun.WireMTU(maxWG)
+				}
+			}
+			snapByKey[k] = pathSnapshot{
+				fingerprint: pi.fingerprint,
+				ifCount:     ifCount,
+				displayStr:  pi.displayStr,
+				wireMTU:     wmtu,
+			}
 		}
 	}
 	// Clean up old keys that aren't in the new set.
@@ -2645,16 +2946,33 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 	newPaths := make(map[scionPathKey]*scionPathProbeState, len(newKeys))
 	for _, k := range newKeys {
 		snap := snapByKey[k]
-		// Preserve existing probe history if the fingerprint matches.
+		// Preserve existing probe history only when fingerprint AND
+		// interface-count match. The extra ifCount check guards against
+		// the (theoretical but possible) case of two topologically
+		// distinct paths colliding on the truncated fingerprint hash —
+		// we don't want latency/health numbers from a stale path to
+		// colour the new one. metricSCIONFingerprintCollision fires when
+		// we see a fingerprint match but a different hop count, which
+		// is strong evidence of such a collision.
 		if snap.fingerprint != "" && oldProbeByFP != nil {
 			if old, ok := oldProbeByFP[snap.fingerprint]; ok {
-				old.fingerprint = snap.fingerprint // ensure set
-				old.displayStr = snap.displayStr
-				newPaths[k] = old
-				continue
+				if old.ifCount == snap.ifCount {
+					old.fingerprint = snap.fingerprint // ensure set
+					old.displayStr = snap.displayStr
+					old.wireMTU = snap.wireMTU
+					newPaths[k] = old
+					continue
+				}
+				metricSCIONFingerprintCollision.Add(1)
 			}
 		}
-		newPaths[k] = &scionPathProbeState{fingerprint: snap.fingerprint, displayStr: snap.displayStr, healthy: true}
+		newPaths[k] = &scionPathProbeState{
+			fingerprint: snap.fingerprint,
+			ifCount:     snap.ifCount,
+			displayStr:  snap.displayStr,
+			wireMTU:     snap.wireMTU,
+			healthy:     true,
+		}
 	}
 
 	activePath := scionPathKey(0)
@@ -2679,18 +2997,21 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 		var mtuInfo string
 		de.c.mu.Lock()
 		if pi, ok := de.c.scionPaths[k]; ok {
+			pi.mu.Lock()
 			hdrLen := 0
 			if pi.fastPath != nil {
 				hdrLen = len(pi.fastPath.hdr)
 			}
-			maxWG := int(pi.mtu) - hdrLen
-			mtuInfo = fmt.Sprintf(" pathMTU=%d hdr=%d maxWG=%d", pi.mtu, hdrLen, maxWG)
+			mtu := pi.mtu
+			pi.mu.Unlock()
+			maxWG := int(mtu) - hdrLen
+			mtuInfo = fmt.Sprintf(" pathMTU=%d hdr=%d maxWG=%d", mtu, hdrLen, maxWG)
 			// WG overhead: 4 type + 4 receiver + 8 counter + 16 tag = 32 bytes.
 			// Max TUN packet that fits: maxWG - 32.
 			const wgOverhead = 32
-			if pi.mtu > 0 && hdrLen > 0 && maxWG < 1280+wgOverhead {
+			if mtu > 0 && hdrLen > 0 && maxWG < 1280+wgOverhead {
 				de.c.logf("magicsock: WARNING: SCION path MTU %d too small for TUN 1280 (need %d, have %d for WG payload)",
-					pi.mtu, 1280+wgOverhead+hdrLen, maxWG)
+					mtu, 1280+wgOverhead+hdrLen, maxWG)
 			}
 		}
 		de.c.mu.Unlock()
@@ -2729,9 +3050,6 @@ func (c *Conn) ReconfigureSCION(cfg SCIONConfig) {
 	} else {
 		envknob.Setenv("TS_PREFER_SCION", "")
 	}
-	// Force embedded mode and fresh bootstrap on Android.
-	envknob.Setenv("TS_SCION_EMBEDDED", "1")
-	envknob.Setenv("TS_SCION_FORCE_BOOTSTRAP", "1")
 
 	// Close existing connection (if any) so retrySCIONConnect starts fresh.
 	c.mu.Lock()
@@ -2750,6 +3068,65 @@ func (c *Conn) SCIONStatus() (connected bool, localIA string) {
 	return true, sc.localIA.String()
 }
 
+// SCIONLastConnectError returns the most recent trySCIONConnect failure
+// message and when it occurred, or ("", time.Time{}) if none has been
+// recorded. Operators use this from /scion-status to diagnose why SCION is
+// down without reading the raw log stream.
+func (c *Conn) SCIONLastConnectError() (msg string, when time.Time) {
+	info := c.scionLastConnectErr.Load()
+	if info == nil {
+		return "", time.Time{}
+	}
+	return info.Err, info.When
+}
+
+// recordSCIONConnectError stores err as the latest trySCIONConnect failure
+// and bumps metricSCIONConnectFailure. Passing nil clears the recorded
+// error — use after a successful connect so /scion-status stops reporting
+// stale errors.
+func (c *Conn) recordSCIONConnectError(err error) {
+	if err == nil {
+		c.scionLastConnectErr.Store(nil)
+		return
+	}
+	metricSCIONConnectFailure.Add(1)
+	c.scionLastConnectErr.Store(&scionLastErrInfo{Err: err.Error(), When: time.Now()})
+}
+
+// SCIONDetailedStatus returns extended SCION connection info for diagnostics.
+func (c *Conn) SCIONDetailedStatus() (info SCIONStatusInfo) {
+	sc := c.pconnSCION.Load()
+	if sc == nil {
+		return info
+	}
+	info.Connected = true
+	info.LocalIA = sc.localIA.String()
+	info.LocalPort = sc.localPort
+	info.HasFastPath = sc.underlayXPC != nil
+	info.HasShim = sc.shimXPC != nil
+
+	c.mu.Lock()
+	info.PathCount = len(c.scionPaths)
+	peerIAs := make(map[addr.IA]bool)
+	for _, pi := range c.scionPaths {
+		peerIAs[pi.peerIA] = true
+	}
+	info.PeerCount = len(peerIAs)
+	c.mu.Unlock()
+	return info
+}
+
+// SCIONStatusInfo holds extended SCION connection information.
+type SCIONStatusInfo struct {
+	Connected   bool
+	LocalIA     string
+	LocalPort   uint16
+	PeerCount   int  // number of unique peer IAs with registered paths
+	PathCount   int  // total number of registered SCION paths
+	HasFastPath bool // whether batch I/O (sendmmsg/recvmmsg) is available
+	HasShim     bool // whether the dispatcher shim socket is active
+}
+
 // populateSCIONPathsLocked fills ps.SCIONPaths from de.scionState.
 // de.mu must be held. c.mu must be held (caller is Conn.UpdateStatus).
 func (de *endpoint) populateSCIONPathsLocked(ps *ipnstate.PeerStatus) {
@@ -2762,23 +3139,46 @@ func (de *endpoint) populateSCIONPathsLocked(ps *ipnstate.PeerStatus) {
 		return
 	}
 	ps.SCIONPaths = make([]ipnstate.SCIONPathInfo, 0, len(ss.paths))
+	now := mono.Now()
 	for pk, probe := range ss.paths {
 		info := ipnstate.SCIONPathInfo{
-			Path:    probe.displayStr,
-			Active:  pk == ss.activePath,
-			Healthy: probe.healthy,
+			Path:               probe.displayStr,
+			Active:             pk == ss.activePath,
+			Healthy:            probe.healthy,
+			Hops:               probe.ifCount,
+			LossPercent:        -1,
+			LastPongSecondsAgo: -1,
 		}
 		lat := probe.latency()
 		if lat < time.Hour {
 			info.LatencyMs = float64(lat.Microseconds()) / 1000.0
 		}
+		if probe.pingsSent > 0 {
+			lost := probe.pingsSent - probe.pongsReceived
+			info.LossPercent = 100.0 * float64(lost) / float64(probe.pingsSent)
+			if info.LossPercent < 0 {
+				info.LossPercent = 0
+			}
+			if info.LossPercent > 100 {
+				info.LossPercent = 100
+			}
+		}
+		if probe.pongCount > 0 {
+			idx := probe.recentPong
+			last := probe.recentPongs[idx].pongAt
+			info.LastPongSecondsAgo = now.Sub(last).Seconds()
+		}
 		// Look up full path info from Conn-level registry for expiry/MTU.
 		if pi, ok := de.c.scionPaths[pk]; ok {
-			if !pi.expiry.IsZero() {
-				info.ExpiresAt = pi.expiry.UTC().Format(time.RFC3339)
+			pi.mu.Lock()
+			expiry := pi.expiry
+			mtu := pi.mtu
+			pi.mu.Unlock()
+			if !expiry.IsZero() {
+				info.ExpiresAt = expiry.UTC().Format(time.RFC3339)
 			}
-			if pi.mtu > 0 {
-				info.MTU = int(pi.mtu)
+			if mtu > 0 {
+				info.MTU = int(mtu)
 			}
 		}
 		ps.SCIONPaths = append(ps.SCIONPaths, info)
