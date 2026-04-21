@@ -57,33 +57,38 @@ jobs:
           name: macos-${{ matrix.goarch }}
           path: dist/*.tgz
 
-  build-windows:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Build binaries
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: 0
-        run: |
-          eval $(go run ./cmd/mkversion)
-          mkdir -p dist
-          ./build_dist.sh -o dist/tailscale.exe ./cmd/tailscale
-          ./build_dist.sh -o dist/tailscaled.exe ./cmd/tailscaled
-          cp LICENSE PATENTS NOTICE dist/ 2>/dev/null || true
-          cd dist && zip "tailscale-scion_${VERSION_SHORT}_windows_amd64.zip" \
-            tailscale.exe tailscaled.exe LICENSE PATENTS NOTICE
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-amd64
-          path: dist/*.zip
+  # build-windows disabled: scionproto v0.15.0 introduced pkg/snet/stun_conn.go
+  # which calls syscall.GetsockoptInt(int(fd), ...) without OS build tags. On
+  # Windows that signature is syscall.GetsockoptInt(syscall.Handle, ...), so
+  # the cross-compile fails. Re-enable once scionproto ships a fix or a local
+  # go.mod replace points at a patched fork.
+  # build-windows:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: go.mod
+  #     - name: Build binaries
+  #       env:
+  #         GOOS: windows
+  #         GOARCH: amd64
+  #         CGO_ENABLED: 0
+  #       run: |
+  #         eval $(go run ./cmd/mkversion)
+  #         mkdir -p dist
+  #         ./build_dist.sh -o dist/tailscale.exe ./cmd/tailscale
+  #         ./build_dist.sh -o dist/tailscaled.exe ./cmd/tailscaled
+  #         cp LICENSE PATENTS NOTICE dist/ 2>/dev/null || true
+  #         cd dist && zip "tailscale-scion_${VERSION_SHORT}_windows_amd64.zip" \
+  #           tailscale.exe tailscaled.exe LICENSE PATENTS NOTICE
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: windows-amd64
+  #         path: dist/*.zip
 
   release:
-    needs: [build-linux, build-macos, build-windows]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -109,7 +114,10 @@ jobs:
             **Linux (rpm):** `sudo rpm -i tailscale-scion_*.rpm && sudo systemctl enable --now tailscaled`
             **Linux (tgz):** Extract and copy `tailscale`/`tailscaled` to PATH
             **macOS:** Extract tgz, run `sudo ./tailscaled &` then `./tailscale up`
-            **Windows:** Extract zip, run `tailscaled.exe` then `tailscale.exe up`
+            <!-- Windows build is disabled; scionproto v0.15.0 STUN code does
+                 not cross-compile for Windows. Re-enable once upstream fixes. -->
+            <!-- **Windows:** Extract zip, run `tailscaled.exe` then `tailscale.exe up` -->
+
 
             ### Documentation
 
