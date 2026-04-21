@@ -27,11 +27,15 @@ import (
 	scionlog "github.com/scionproto/scion/pkg/log"
 	"github.com/scionproto/scion/pkg/private/ctrl/path_mgmt"
 	"github.com/scionproto/scion/pkg/private/serrors"
+	cppb "github.com/scionproto/scion/pkg/proto/control_plane"
+	"github.com/scionproto/scion/pkg/scrypto"
+	"github.com/scionproto/scion/pkg/scrypto/cppki"
 	"github.com/scionproto/scion/pkg/segment/iface"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/private/revcache"
 	segfetchergrpc "github.com/scionproto/scion/private/segment/segfetcher/grpc"
 	"github.com/scionproto/scion/private/storage"
+	truststorage "github.com/scionproto/scion/private/storage/trust"
 	"github.com/scionproto/scion/private/topology"
 	"github.com/scionproto/scion/private/trust"
 	"github.com/scionproto/scion/private/trust/compat"
@@ -81,7 +85,14 @@ type embeddedConnector struct {
 	pathDB   storage.PathDB
 	revCache revcache.RevCache
 	trustDB  storage.TrustDB
+	dialer   libgrpc.Dialer // used to lazily fetch remote-ISD TRCs from the local CS
+	logf     logger.Logf
 	cancel   context.CancelFunc // cancels the topology loader goroutine
+
+	// ensureTRCMu serializes per-ISD TRC fetches so concurrent Paths() calls
+	// don't hammer the CS with duplicate requests.
+	ensureTRCMu    sync.Mutex
+	ensureTRCTried map[addr.ISD]time.Time
 }
 
 // Compile-time interface check.
@@ -130,6 +141,11 @@ func (ec *embeddedConnector) snetTopology() snet.Topology {
 
 // Paths resolves end-to-end paths using the embedded fetcher (segment fetch + combination).
 func (ec *embeddedConnector) Paths(ctx context.Context, dst, src addr.IA, f daemontypes.PathReqFlags) ([]snet.Path, error) {
+	// The MultiSegmentSplitter reads Inspector.ByAttributes / HasAttributes
+	// for dst.ISD() before any segment is fetched. When that ISD's TRC is
+	// not in the local DB this errors out as "TRC not found", so fetch it
+	// from the local CS first (best-effort; cached per ISD to avoid churn).
+	ec.ensureTRCForISD(ctx, dst.ISD())
 	return ec.fetcher.GetPaths(ctx, src, dst, f.Refresh)
 }
 
@@ -291,15 +307,101 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf l
 	})
 
 	ec := &embeddedConnector{
-		topo:     topo,
-		fetcher:  f,
-		pathDB:   pathDB,
-		revCache: revCache,
-		trustDB:  trustDB,
-		cancel:   topoCancel,
+		topo:           topo,
+		fetcher:        f,
+		pathDB:         pathDB,
+		revCache:       revCache,
+		trustDB:        trustDB,
+		dialer:         dialer,
+		logf:           logf,
+		cancel:         topoCancel,
+		ensureTRCTried: make(map[addr.ISD]time.Time),
 	}
+	ec.logTRCInventory(topoCtx, certsDir)
 	success = true
 	return ec, nil
+}
+
+// logTRCInventory reports which ISDs have a TRC loaded in the trust DB.
+// Without this the operator has no way to tell whether daemontrust.NewEngine
+// found any TRC files (scionproto's own log output is discarded).
+func (ec *embeddedConnector) logTRCInventory(ctx context.Context, certsDir string) {
+	trcs, err := ec.trustDB.SignedTRCs(ctx, truststorage.TRCsQuery{Latest: true})
+	if err != nil {
+		ec.logf("magicsock: SCION trust DB query failed: %v", err)
+		return
+	}
+	if len(trcs) == 0 {
+		ec.logf("magicsock: SCION trust DB has no TRCs after loading %s (cross-ISD path discovery will fail until TRCs are fetched)", certsDir)
+		return
+	}
+	isds := make([]addr.ISD, 0, len(trcs))
+	for _, t := range trcs {
+		isds = append(isds, t.TRC.ID.ISD)
+	}
+	ec.logf("magicsock: SCION trust DB loaded TRCs for ISDs %v from %s", isds, certsDir)
+}
+
+// ensureTRCForISD fetches the latest TRC for the given ISD from the local
+// control service if the trust database doesn't already have one. Called by
+// Paths() before each segment fetch so that the MultiSegmentSplitter's
+// attribute lookups don't fail with "TRC not found" for a remote ISD.
+//
+// This is best-effort: failures are logged but not propagated, since the
+// fetcher call that follows will surface its own error when the TRC really
+// is missing. Per-ISD results are cached for a short window to avoid
+// hammering the CS when the remote ISD is unreachable.
+func (ec *embeddedConnector) ensureTRCForISD(ctx context.Context, isd addr.ISD) {
+	if isd == 0 {
+		return
+	}
+	existing, err := ec.trustDB.SignedTRC(ctx, cppki.TRCID{
+		ISD:    isd,
+		Base:   scrypto.LatestVer,
+		Serial: scrypto.LatestVer,
+	})
+	if err == nil && !existing.IsZero() {
+		return
+	}
+
+	ec.ensureTRCMu.Lock()
+	if last, ok := ec.ensureTRCTried[isd]; ok && time.Since(last) < 30*time.Second {
+		ec.ensureTRCMu.Unlock()
+		return
+	}
+	ec.ensureTRCTried[isd] = time.Now()
+	ec.ensureTRCMu.Unlock()
+
+	conn, err := ec.dialer.Dial(ctx, &snet.SVCAddr{SVC: addr.SvcCS})
+	if err != nil {
+		ec.logf("magicsock: SCION: dialing CS to fetch ISD %d TRC failed: %v", isd, err)
+		return
+	}
+	defer conn.Close()
+	client := cppb.NewTrustMaterialServiceClient(conn)
+	resp, err := client.TRC(ctx, &cppb.TRCRequest{
+		Isd:    uint32(isd),
+		Base:   uint64(scrypto.LatestVer),
+		Serial: uint64(scrypto.LatestVer),
+	})
+	if err != nil {
+		ec.logf("magicsock: SCION: CS TRC fetch for ISD %d failed: %v", isd, err)
+		return
+	}
+	trc, err := cppki.DecodeSignedTRC(resp.Trc)
+	if err != nil {
+		ec.logf("magicsock: SCION: CS returned undecodable TRC for ISD %d: %v", isd, err)
+		return
+	}
+	if trc.TRC.ID.ISD != isd {
+		ec.logf("magicsock: SCION: CS returned wrong-ISD TRC (want %d got %d)", isd, trc.TRC.ID.ISD)
+		return
+	}
+	if _, err := ec.trustDB.InsertTRC(ctx, trc); err != nil {
+		ec.logf("magicsock: SCION: inserting ISD %d TRC into DB failed: %v", isd, err)
+		return
+	}
+	ec.logf("magicsock: SCION: fetched TRC for ISD %d (base=%d serial=%d) from CS", isd, trc.TRC.ID.Base, trc.TRC.ID.Serial)
 }
 
 // certsDirHasTRC reports whether the given directory contains at least one
