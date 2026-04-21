@@ -3388,10 +3388,16 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 	if runtime.GOOS == "js" {
 		fns = []conn.ReceiveFunc{c.receiveDERP}
 	}
-	// Always register SCION receive funcs so they're available when
-	// SCION connects mid-session (e.g. via ReconfigureSCION from Android).
-	// receiveSCION handles nil pconnSCION by waiting and retrying.
-	fns = append(fns, c.receiveSCION, c.receiveSCIONShim)
+	// Register SCION receive funcs only when the binary was built with
+	// SCION support. Under ts_omit_scion the funcs are no-op stubs, and
+	// registering them would burn two extra function calls per
+	// RoutineReceiveIncoming cycle in the hottest loop of the daemon.
+	// When enabled, we always register — receiveSCION handles nil
+	// pconnSCION by waiting and retrying so mid-session connects (e.g.
+	// via ReconfigureSCION from Android) still work.
+	if buildfeatures.HasSCION {
+		fns = append(fns, c.receiveSCION, c.receiveSCIONShim)
+	}
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
 	return fns, c.LocalPort(), nil

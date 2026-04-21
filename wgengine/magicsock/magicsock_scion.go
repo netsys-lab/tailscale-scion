@@ -383,6 +383,14 @@ type scionSendBatch struct {
 	msgs []ipv4.Message
 }
 
+// scionSendBatchInitBufSize is the initial capacity of each per-packet send
+// buffer. Sized so typical SCION+UDP+WireGuard packets (up to ~60 bytes
+// SCION header + 8 UDP + ~1472 SCION payload MTU on common testbeds) fit
+// without the hot-path grow branch in sendSCIONBatchFast firing on a fresh
+// batch. Larger-MTU paths still grow lazily; the grown buffer sticks with
+// the batch via sync.Pool reuse, so subsequent batches skip the realloc.
+const scionSendBatchInitBufSize = 2048
+
 var scionSendBatchPool = sync.Pool{
 	New: func() any {
 		b := &scionSendBatch{
@@ -390,7 +398,7 @@ var scionSendBatchPool = sync.Pool{
 			msgs: make([]ipv4.Message, scionMaxBatchSize),
 		}
 		for i := range b.bufs {
-			b.bufs[i] = make([]byte, 1500)
+			b.bufs[i] = make([]byte, scionSendBatchInitBufSize)
 		}
 		for i := range b.msgs {
 			b.msgs[i].Buffers = make([][]byte, 1)
@@ -414,7 +422,7 @@ var scionRecvBatchPool = sync.Pool{
 		}
 		b.scn.RecyclePaths()
 		for i := range b.bufs {
-			b.bufs[i] = make([]byte, 1500)
+			b.bufs[i] = make([]byte, scionSendBatchInitBufSize)
 		}
 		for i := range b.msgs {
 			b.msgs[i].Buffers = [][]byte{b.bufs[i]}
@@ -1364,6 +1372,10 @@ func (c *Conn) sendSCIONBatchFast(sc *scionConn, fp *scionFastPath, buffs [][]by
 			if retries >= 3 {
 				return fmt.Errorf("sendmmsg made no progress after %d retries (%d/%d sent)", retries, head, n)
 			}
+			// Brief backoff instead of tight-spin on transient socket
+			// buffer pressure / EAGAIN. Scales from 10µs to 40µs across
+			// the three allowed retries.
+			time.Sleep(time.Duration(10<<retries) * time.Microsecond)
 		}
 	}
 }
@@ -1588,6 +1600,12 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		}
 	}
 
+	// Single-entry endpoint cache shared across loop iterations: repeated
+	// packets from the same source in this slow path avoid c.mu.
+	var slowCachedAddr epAddr
+	var slowCachedEP *endpoint
+	var slowCachedGen int64
+
 	for {
 		// Check for graceful shutdown.
 		select {
@@ -1657,7 +1675,10 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 			continue
 		}
 
-		c.lastSCIONRecv.StoreAtomic(mono.Now())
+		// Fold into per-call timestamp — slow path returns a single
+		// packet per call, so this is already "per-batch". Keep it
+		// here so we only store on a successful parse.
+		nowRecv := mono.Now()
 
 		b := buffs[0][:n]
 		srcHostAddr := srcAddr.Host.AddrPort()
@@ -1690,24 +1711,36 @@ func (c *Conn) receiveSCION(buffs [][]byte, sizes []int, eps []wgconn.Endpoint) 
 		}
 
 		srcEpAddr := epAddr{ap: srcHostAddr}
-		c.mu.Lock()
-		ep, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
-		c.mu.Unlock()
-		if !ok {
-			// Unknown source. Admit to WireGuard for authentication via a
-			// lazyEndpoint, but bound the rate so a spoofed flood cannot
-			// allocate one lazyEndpoint per packet.
-			if !c.allowSCIONLazyEndpoint() {
-				return 0, nil
+		// Small single-entry cache so repeated packets from the same
+		// source in this slow loop skip the c.mu round-trip. Mirrors
+		// the cache pattern in receiveSCIONBatch.
+		var ep *endpoint
+		if slowCachedAddr == srcEpAddr && slowCachedEP != nil && slowCachedGen == slowCachedEP.numStopAndReset() {
+			ep = slowCachedEP
+		} else {
+			c.mu.Lock()
+			de, ok := c.peerMap.endpointForEpAddr(srcEpAddr)
+			c.mu.Unlock()
+			if !ok {
+				// Unknown source. Admit to WireGuard for authentication via a
+				// lazyEndpoint, but bound the rate so a spoofed flood cannot
+				// allocate one lazyEndpoint per packet.
+				if !c.allowSCIONLazyEndpoint() {
+					return 0, nil
+				}
+				sizes[0] = n
+				eps[0] = &lazyEndpoint{c: c, src: srcEpAddr}
+				return 1, nil
 			}
-			sizes[0] = n
-			eps[0] = &lazyEndpoint{c: c, src: srcEpAddr}
-			return 1, nil
+			slowCachedAddr = srcEpAddr
+			slowCachedEP = de
+			slowCachedGen = de.numStopAndReset()
+			ep = de
 		}
 
-		now := mono.Now()
-		ep.lastRecvUDPAny.StoreAtomic(now)
-		ep.noteRecvActivity(srcEpAddr, now)
+		c.lastSCIONRecv.StoreAtomic(nowRecv)
+		ep.lastRecvUDPAny.StoreAtomic(nowRecv)
+		ep.noteRecvActivity(srcEpAddr, nowRecv)
 		if c.metrics != nil {
 			c.metrics.inboundPacketsSCIONTotal.Add(1)
 			c.metrics.inboundBytesSCIONTotal.Add(int64(n))
@@ -1747,7 +1780,7 @@ func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoi
 		case <-c.donec:
 			return 0, net.ErrClosed
 		case <-c.scionConnReadyCh():
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Second):
 		}
 		sc = c.pconnSCION.Load()
 		if sc == nil || sc.shimXPC == nil {
@@ -1781,7 +1814,7 @@ func (c *Conn) receiveSCIONShim(buffs [][]byte, sizes []int, eps []wgconn.Endpoi
 			case <-c.donec:
 				return 0, net.ErrClosed
 			case <-c.scionConnReadyCh():
-			case <-time.After(30 * time.Second):
+			case <-time.After(5 * time.Second):
 			}
 			continue
 		}
@@ -1827,6 +1860,12 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 
 	reportToCaller := false
 	count := 0
+	// Per-batch counters — we fold all per-packet atomic stores into a
+	// single update at the end of the loop to cut cache-line ping-pong
+	// at high packet rates.
+	var metricsPkts, metricsBytes int64
+	var anyData bool
+	var lastAcceptedAt mono.Time
 
 	// Batch-scoped endpoint cache: avoids c.mu acquisition for consecutive
 	// packets from the same source (common in high-throughput flows).
@@ -1841,6 +1880,9 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 			continue
 		}
 
+		// Reset the decoder before each Decode so transient path slices
+		// from the previous packet don't linger between calls.
+		batch.scn.RecyclePaths()
 		srcIA, srcHostAddr, payload, rawPath, ok := parseSCIONPacket(
 			msg.Buffers[0][:msg.N], &batch.scn)
 		if !ok {
@@ -1853,8 +1895,6 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 
 		// Copy payload into WireGuard's buffer.
 		pn := copy(buffs[count], payload)
-
-		c.lastSCIONRecv.StoreAtomic(mono.Now())
 
 		pt, _ := packetLooksLike(buffs[count][:pn])
 		if pt == packetLooksLikeDisco {
@@ -1899,17 +1939,24 @@ func (c *Conn) receiveSCIONBatch(xpc scionBatchRW, buffs [][]byte, sizes []int, 
 			ep = de
 		}
 
-		now := mono.Now()
-		ep.lastRecvUDPAny.StoreAtomic(now)
-		ep.noteRecvActivity(srcEpAddr, now)
-		if c.metrics != nil {
-			c.metrics.inboundPacketsSCIONTotal.Add(1)
-			c.metrics.inboundBytesSCIONTotal.Add(int64(pn))
-		}
+		lastAcceptedAt = mono.Now()
+		ep.lastRecvUDPAny.StoreAtomic(lastAcceptedAt)
+		ep.noteRecvActivity(srcEpAddr, lastAcceptedAt)
+		metricsPkts++
+		metricsBytes += int64(pn)
+		anyData = true
 		sizes[count] = pn
 		eps[count] = ep
 		count++
 		reportToCaller = true
+	}
+
+	if anyData {
+		c.lastSCIONRecv.StoreAtomic(lastAcceptedAt)
+		if c.metrics != nil {
+			c.metrics.inboundPacketsSCIONTotal.Add(metricsPkts)
+			c.metrics.inboundBytesSCIONTotal.Add(metricsBytes)
+		}
 	}
 
 	if reportToCaller {
@@ -2199,9 +2246,9 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		}
 		pi.buildCachedDst()
 		pi.buildDisplayStr()
-		if sc != nil {
-			pi.fastPath = buildSCIONFastPath(sc, pi)
-		}
+		// sc was non-nil at the top of discoverSCIONPaths (line above
+		// 2154) and is not reassigned in this scope.
+		pi.fastPath = buildSCIONFastPath(sc, pi)
 		infos = append(infos, pi)
 	}
 

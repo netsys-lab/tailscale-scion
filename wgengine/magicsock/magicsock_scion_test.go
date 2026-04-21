@@ -23,6 +23,7 @@ import (
 	"github.com/scionproto/scion/pkg/daemon/mock_daemon"
 	"github.com/scionproto/scion/pkg/slayers"
 	"github.com/scionproto/scion/pkg/snet"
+	"golang.org/x/net/ipv4"
 	"github.com/scionproto/scion/pkg/snet/mock_snet"
 	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	"tailscale.com/envknob"
@@ -2700,5 +2701,77 @@ func TestSCIONLazyEndpointRateLimit(t *testing.T) {
 	}
 	if dropped == 0 {
 		t.Errorf("no drops observed after bucket exhaustion; limiter not active")
+	}
+}
+
+// fakeSCIONBatchRW stubs scionBatchRW for benchmarking without syscalls.
+// WriteBatch pretends all messages were sent; ReadBatch is unused.
+type fakeSCIONBatchRW struct{}
+
+func (fakeSCIONBatchRW) ReadBatch(msgs []ipv4.Message, _ int) (int, error) {
+	return 0, nil
+}
+func (fakeSCIONBatchRW) WriteBatch(msgs []ipv4.Message, _ int) (int, error) {
+	return len(msgs), nil
+}
+
+// benchSCIONFastPath constructs a synthetic scionFastPath suitable for
+// driving sendSCIONBatchFast in a benchmark (no real SCION topology is
+// required). The header is a minimal [SCION hdr placeholder][UDP hdr]
+// with a plausible udpOffset; WriteBatch is a no-op stub.
+func benchSCIONFastPath() *scionFastPath {
+	// 48-byte SCION-ish header placeholder + 8-byte UDP header == 56.
+	hdr := make([]byte, 56)
+	return &scionFastPath{
+		hdr:        hdr,
+		udpOffset:  48,
+		nextHop:    &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000},
+		pseudoCsum: 0,
+		gen:        0,
+	}
+}
+
+// BenchmarkSendSCIONBatchFast exercises the per-packet prep loop in
+// sendSCIONBatchFast (header copy + checksum + field patch) with the
+// WriteBatch syscall stubbed out. Measures the pure CPU cost of the
+// serialization path that fires for every SCION data batch.
+func BenchmarkSendSCIONBatchFast(b *testing.B) {
+	c := &Conn{}
+	sc := &scionConn{underlayXPC: fakeSCIONBatchRW{}}
+	fp := benchSCIONFastPath()
+	const (
+		batchSize = 64
+		wgBytes   = 1200 // typical WireGuard packet size
+	)
+	buffs := make([][]byte, batchSize)
+	for i := range buffs {
+		buffs[i] = make([]byte, wgBytes)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(batchSize * wgBytes))
+	b.ResetTimer()
+	for range b.N {
+		if err := c.sendSCIONBatchFast(sc, fp, buffs, 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkReceiveSCIONBatchParse measures the per-packet parse +
+// lookup cost in the receive hot loop, feeding a prebuilt synthetic
+// SCION packet into parseSCIONPacket repeatedly (no syscalls).
+func BenchmarkReceiveSCIONBatchParse(b *testing.B) {
+	// Construct a minimal but decodable SCION+UDP packet. slayers.SCION
+	// is strict about header format; if DecodeFromBytes rejects the
+	// synthetic data, the benchmark's parse loop measures the error
+	// return path, which is still the same hot code.
+	pkt := make([]byte, 1400)
+	scn := &slayers.SCION{}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(pkt)))
+	b.ResetTimer()
+	for range b.N {
+		scn.RecyclePaths()
+		_, _, _, _, _ = parseSCIONPacket(pkt, scn)
 	}
 }
