@@ -8,7 +8,6 @@ package magicsock
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -61,7 +60,6 @@ var preferSCION = envknob.RegisterBool("TS_PREFER_SCION")
 const scionDispatcherPort = 30041
 
 var (
-	scionDaemonAddress = envknob.RegisterString("SCION_DAEMON_ADDRESS")
 	scionPort          = envknob.RegisterString("TS_SCION_PORT")
 	scionListenAddrEnv = envknob.RegisterString("TS_SCION_LISTEN_ADDR")
 	noDispatcherShim   = envknob.RegisterBool("TS_SCION_NO_DISPATCHER_SHIM")
@@ -759,15 +757,6 @@ func (sc *scionConn) readFrom(b []byte) (int, *snet.UDPAddr, error) {
 	return n, src, nil
 }
 
-// scionDaemonAddr returns the SCION daemon address to use, checking the
-// environment variable first, then falling back to the default socket.
-func scionDaemonAddr() string {
-	if a := scionDaemonAddress(); a != "" {
-		return a
-	}
-	return daemon.DefaultAPIAddress
-}
-
 // scionListenPort returns the SCION port to use, checking the TS_SCION_PORT
 // environment variable first, then falling back to 0 (auto-select from the
 // topology's dispatched port range).
@@ -840,56 +829,35 @@ func scionListenAddr(ctx context.Context, connector daemon.Connector, logf logge
 	return &net.UDPAddr{IP: ip.AsSlice(), Port: int(port)}
 }
 
-// forceEmbeddedSCION is the TS_SCION_EMBEDDED envknob. When set to "1",
-// the external daemon attempt is skipped and only the embedded connector is tried.
-var forceEmbeddedSCION = envknob.RegisterBool("TS_SCION_EMBEDDED")
-
-// forceBootstrapSCION is the TS_SCION_FORCE_BOOTSTRAP envknob. When set to "1",
-// the local topology file attempt is skipped and only the bootstrap attempt is tried.
-var forceBootstrapSCION = envknob.RegisterBool("TS_SCION_FORCE_BOOTSTRAP")
-
-// trySCIONConnect attempts to set up a SCION connection using a cascading
-// fallback strategy:
-//  1. External daemon (existing behavior, quick check) — skipped if TS_SCION_EMBEDDED=1
-//  2. Embedded with existing local topology file (TS_SCION_TOPOLOGY or /etc/scion/topology.json)
-//  3. Bootstrap from configured URL (TS_SCION_BOOTSTRAP_URL / TS_SCION_BOOTSTRAP_URLS)
-//  4. DNS-based discovery (SRV for _sciondiscovery._tcp)
-//  5. Hardcoded bootstrap URLs (if any)
+// trySCIONConnect attempts to set up a SCION connection via the embedded
+// connector. It first tries a local topology file (TS_SCION_TOPOLOGY or
+// /etc/scion/topology.json); if that fails or is absent, it walks the
+// configured bootstrap URLs (explicit env → DNS SRV → hardcoded defaults),
+// fetches a topology and TRCs, and retries against the bootstrapped topology.
 //
-// Returns nil if SCION is not available via any method.
+// Returns an error that names the remedies (TS_SCION_TOPOLOGY,
+// TS_SCION_BOOTSTRAP_URL) when no path to a usable topology succeeds.
 func trySCIONConnect(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor) (*scionConn, error) {
-	var externalErr error
-
-	// Step 1: Try external daemon (unless forced embedded).
-	if !forceEmbeddedSCION() {
-		sc, err := tryExternalDaemon(ctx, logf, netMon)
+	// Step 1: Try embedded with existing local topology file.
+	topoPath := scionTopologyPath()
+	if _, statErr := os.Stat(topoPath); statErr == nil {
+		sc, err := tryEmbeddedDaemon(ctx, topoPath, logf, netMon)
 		if err == nil {
 			return sc, nil
 		}
-		externalErr = err
+		logf("scion: embedded from %s failed: %v", topoPath, err)
 	}
 
-	// Step 2: Try embedded with existing local topology file.
-	if !forceBootstrapSCION() {
-		topoPath := scionTopologyPath()
-		if _, err := os.Stat(topoPath); err == nil {
-			sc, err := tryEmbeddedDaemon(ctx, topoPath, logf, netMon)
-			if err == nil {
-				return sc, nil
-			}
-			// Fall through to bootstrap attempts.
-		}
-	}
-
-	// Steps 3-5: Try bootstrap from URLs (explicit, DNS-discovered, hardcoded).
+	// Step 2: Bootstrap from URLs (explicit env, DNS-discovered, hardcoded defaults).
 	stateDir := scionStateDir()
 	if stateDir == "" {
-		if externalErr != nil {
-			return nil, fmt.Errorf("external daemon: %w; embedded: no state directory available", externalErr)
-		}
-		return nil, fmt.Errorf("SCION not available: no external daemon, no topology file, no state directory for bootstrap")
+		return nil, fmt.Errorf("SCION not available: no topology file at %s and no state directory (set TS_SCION_STATE_DIR) for bootstrap", topoPath)
 	}
-	for _, url := range bootstrapURLs(ctx, logf) {
+	urls := bootstrapURLs(ctx, logf)
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("SCION not available: no topology file at %s and no bootstrap URL (set TS_SCION_TOPOLOGY or TS_SCION_BOOTSTRAP_URL)", topoPath)
+	}
+	for _, url := range urls {
 		if err := bootstrapSCION(ctx, logf, url, stateDir); err != nil {
 			logf("scion: bootstrap from %s failed: %v", url, err)
 			continue
@@ -902,105 +870,10 @@ func trySCIONConnect(ctx context.Context, logf logger.Logf, netMon *netmon.Monit
 		if err == nil {
 			return sc, nil
 		}
+		logf("scion: embedded from bootstrapped %s failed: %v", bootstrappedTopo, err)
 	}
 
-	if externalErr != nil {
-		return nil, fmt.Errorf("external daemon: %w; embedded: no topology available", externalErr)
-	}
-	return nil, fmt.Errorf("SCION not available: no external daemon, no topology file, no bootstrap server")
-}
-
-// tryExternalDaemon attempts to connect to an external SCION daemon and set up
-// a SCION listener. This is the original trySCIONConnect behavior.
-func tryExternalDaemon(ctx context.Context, logf logger.Logf, netMon *netmon.Monitor) (*scionConn, error) {
-	daemonAddr := scionDaemonAddr()
-	svc := daemon.Service{Address: daemonAddr}
-	conn, err := svc.Connect(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to SCION daemon at %s: %w", daemonAddr, err)
-	}
-
-	topo, err := snetTopologyFromConnector(ctx, conn)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("building topology from daemon: %w", err)
-	}
-
-	// Probe Paths() to detect wire-format incompatibility with older
-	// daemons (e.g. v0.12 daemon vs v0.14 client). Simple RPCs like
-	// LocalIA/Interfaces/ASInfo use compatible proto types, but Paths
-	// responses with real hop data trigger unmarshal failures.
-	// We need a reachable remote IA to get a non-empty response;
-	// parse the topology file for a neighbor AS.
-	if neighborIA, ok := neighborIAFromTopology(scionTopologyPath()); ok {
-		localIA, _ := conn.LocalIA(ctx)
-		if _, err := conn.Paths(ctx, neighborIA, localIA, daemon.PathReqFlags{}); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("daemon path probe failed (version mismatch?): %w", err)
-		}
-	}
-
-	sc, err := finishSCIONConnect(ctx, conn, topo, logf, netMon)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return sc, nil
-}
-
-// snetTopologyFromConnector builds an snet.Topology struct by querying
-// a daemon.Connector for local topology information.
-func snetTopologyFromConnector(ctx context.Context, conn daemon.Connector) (snet.Topology, error) {
-	localIA, err := conn.LocalIA(ctx)
-	if err != nil {
-		return snet.Topology{}, fmt.Errorf("querying local IA: %w", err)
-	}
-	portStart, portEnd, err := conn.PortRange(ctx)
-	if err != nil {
-		return snet.Topology{}, fmt.Errorf("querying port range: %w", err)
-	}
-	ifMap, err := conn.Interfaces(ctx)
-	if err != nil {
-		return snet.Topology{}, fmt.Errorf("querying interfaces: %w", err)
-	}
-	return snet.Topology{
-		LocalIA:   localIA,
-		PortRange: snet.TopologyPortRange{Start: portStart, End: portEnd},
-		Interface: func(id uint16) (netip.AddrPort, bool) {
-			ap, ok := ifMap[id]
-			return ap, ok
-		},
-	}, nil
-}
-
-// neighborIAFromTopology parses the SCION topology JSON file and returns
-// the IA of the first neighbor AS found in the border router interfaces.
-// This is used to probe the daemon with a Paths() call that returns real
-// path data, detecting proto wire-format incompatibilities.
-func neighborIAFromTopology(topoPath string) (addr.IA, bool) {
-	data, err := os.ReadFile(topoPath)
-	if err != nil {
-		return 0, false
-	}
-	var topo struct {
-		BorderRouters map[string]struct {
-			Interfaces map[string]struct {
-				ISDAS string `json:"isd_as"`
-			} `json:"interfaces"`
-		} `json:"border_routers"`
-	}
-	if err := json.Unmarshal(data, &topo); err != nil {
-		return 0, false
-	}
-	for _, br := range topo.BorderRouters {
-		for _, iface := range br.Interfaces {
-			ia, err := addr.ParseIA(iface.ISDAS)
-			if err == nil {
-				return ia, true
-			}
-		}
-	}
-	return 0, false
+	return nil, fmt.Errorf("SCION not available: no topology file at %s and no bootstrap server succeeded (set TS_SCION_TOPOLOGY or TS_SCION_BOOTSTRAP_URL)", topoPath)
 }
 
 // finishSCIONConnect completes the SCION connection setup given a
@@ -3154,9 +3027,6 @@ func (c *Conn) ReconfigureSCION(cfg SCIONConfig) {
 	} else {
 		envknob.Setenv("TS_PREFER_SCION", "")
 	}
-	// Force embedded mode and fresh bootstrap on Android.
-	envknob.Setenv("TS_SCION_EMBEDDED", "1")
-	envknob.Setenv("TS_SCION_FORCE_BOOTSTRAP", "1")
 
 	// Close existing connection (if any) so retrySCIONConnect starts fresh.
 	c.mu.Lock()
