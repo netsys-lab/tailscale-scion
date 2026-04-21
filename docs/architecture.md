@@ -20,26 +20,22 @@ SCION is added as a third transport in `magicsock.Conn`, alongside the existing 
 
 ## Connection Flow
 
-`trySCIONConnect()` uses a cascading fallback strategy:
+`trySCIONConnect()` uses the embedded connector in all modes:
 
-1. **External daemon** -- connects to sciond via gRPC at `SCION_DAEMON_ADDRESS` (default `127.0.0.1:30255`). Probes `Paths()` to detect version mismatch. *Skipped if `TS_SCION_EMBEDDED=1`.*
-
-2. **Embedded daemon with local topology** -- checks for topology file at:
+1. **Embedded daemon with local topology** -- checks for topology file at:
    - `TS_SCION_TOPOLOGY` (explicit path)
    - `/etc/scion/topology.json` (Linux default)
    - `<stateDir>/scion/topology.json` (from prior bootstrap)
 
-   Creates an in-process `embeddedConnector` with topology loader + segment fetcher (accept-all verification, Phase 1). *Skipped if `TS_SCION_FORCE_BOOTSTRAP=1`.*
+   Creates an in-process `embeddedConnector` with topology loader, segment fetcher, and a TRC-backed trust engine. TRCs are loaded from `<stateDir>/certs/*.trc`; the connector refuses to start when no TRCs are present.
 
-3. **Bootstrap + embedded** -- tries each URL from `bootstrapURLs()` in order:
+2. **Bootstrap + embedded** -- tries each URL from `bootstrapURLs()` in order:
    1. Explicit `TS_SCION_BOOTSTRAP_URL`
    2. Comma-separated `TS_SCION_BOOTSTRAP_URLS`
    3. DNS SRV: `_sciondiscovery._tcp.<local-search-domain>`
    4. Hardcoded defaults (ovgu.de, uva, ethz.ch)
 
-   For each URL: fetches `topology.json` + TRCs (TRCs optional) → saves to stateDir → creates embedded daemon with bootstrapped topology.
-
-**Android**: `ReconfigureSCION()` forces `TS_SCION_EMBEDDED=1` + `TS_SCION_FORCE_BOOTSTRAP=1`, always skipping steps 1-2 and going straight to bootstrap.
+   For each URL: fetches `topology.json` + TRCs (both required; URLs that cannot serve TRCs are skipped) → saves to stateDir → creates embedded connector with bootstrapped topology.
 
 ## Data Flow
 
@@ -55,9 +51,9 @@ SCION is added as a third transport in `magicsock.Conn`, alongside the existing 
 
 - **Path selection via `betterAddr`.** SCION paths get a configurable preference bonus (`TS_SCION_PREFERENCE`, default 15 points). +25 additional points when both peers have the `NodeAttrSCIONPrefer` capability. Incumbent bias prevents flapping (candidate must be >=20% or >=2ms faster).
 
-- **Embedded daemon.** `scion_embedded.go` implements `daemon.Connector` with an in-process topology loader and segment fetcher. No external sciond process required -- critical for Android.
+- **Embedded daemon.** `scion_embedded.go` implements `daemon.Connector` with an in-process topology loader, segment fetcher, and trust engine (`daemontrust.NewEngine`). Path segments are cryptographically verified against bootstrapped TRCs. No external sciond process required.
 
-- **Bootstrap discovery.** `scion_bootstrap.go` discovers topology via DNS SRV (`_sciondiscovery._tcp`) or hardcoded fallback URLs. TRC fetch is best-effort (Phase 1: accept-all verification).
+- **Bootstrap discovery.** `scion_bootstrap.go` discovers topology via DNS SRV (`_sciondiscovery._tcp`) or hardcoded fallback URLs. Both `topology.json` and TRC blobs are required for bootstrap success; servers that cannot serve TRCs are skipped.
 
 - **Fast-path sends.** Pre-serialized SCION+UDP header templates (`scionFastPath`) avoid per-packet allocation. Batch send via `sendmmsg` where available. Disable with `TS_SCION_NO_FAST_PATH`.
 

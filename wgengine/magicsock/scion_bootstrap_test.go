@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"tailscale.com/envknob"
@@ -113,8 +114,11 @@ func TestBootstrapSCION(t *testing.T) {
 	}
 }
 
-func TestBootstrapSCIONTopologyOnly(t *testing.T) {
-	// Server that returns topology but 404 on TRCs — should succeed.
+func TestBootstrapSCIONRequiresTRCs(t *testing.T) {
+	// Server that returns topology but 404 on /trcs. With real segment
+	// verification in place, TRCs are required: bootstrap must return an
+	// error so the caller tries the next URL instead of leaving the state
+	// directory half-populated.
 	topoJSON := `{"isd_as":"19-ffaa:1:eba"}`
 
 	mux := http.NewServeMux()
@@ -127,16 +131,41 @@ func TestBootstrapSCIONTopologyOnly(t *testing.T) {
 	destDir := t.TempDir()
 	logf := logger.WithPrefix(t.Logf, "test: ")
 
-	if err := bootstrapSCION(context.Background(), logf, srv.URL, destDir); err != nil {
-		t.Fatalf("bootstrapSCION: %v", err)
+	err := bootstrapSCION(context.Background(), logf, srv.URL, destDir)
+	if err == nil {
+		t.Fatal("expected bootstrapSCION to fail when /trcs is 404")
 	}
+	if !strings.Contains(err.Error(), "TRC") {
+		t.Errorf("error should mention TRCs, got: %v", err)
+	}
+}
 
-	data, err := os.ReadFile(filepath.Join(destDir, "topology.json"))
-	if err != nil {
-		t.Fatalf("reading topology: %v", err)
+func TestBootstrapSCIONNoTRCsFetched(t *testing.T) {
+	// Server that serves topology and a valid TRC index but 404s every
+	// per-blob fetch. Bootstrap must fail so the caller moves on.
+	topoJSON := `{"isd_as":"19-ffaa:1:eba"}`
+	trcIndex := `[{"id":{"isd":19,"base_number":1,"serial_number":1}}]`
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/topology", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(topoJSON))
+	})
+	mux.HandleFunc("/trcs", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(trcIndex))
+	})
+	// No /trcs/.../blob handler — default mux returns 404.
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	destDir := t.TempDir()
+	logf := logger.WithPrefix(t.Logf, "test: ")
+
+	err := bootstrapSCION(context.Background(), logf, srv.URL, destDir)
+	if err == nil {
+		t.Fatal("expected bootstrapSCION to fail when no TRC blobs can be fetched")
 	}
-	if string(data) != topoJSON {
-		t.Errorf("topology content = %q, want %q", data, topoJSON)
+	if !strings.Contains(err.Error(), "no TRCs") {
+		t.Errorf("error should mention no TRCs, got: %v", err)
 	}
 }
 

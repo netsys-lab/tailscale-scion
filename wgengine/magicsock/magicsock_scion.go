@@ -14,16 +14,19 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/gopacket/gopacket"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
+	daemontypes "github.com/scionproto/scion/pkg/daemon/types"
 	"github.com/scionproto/scion/pkg/slayers"
 	scionpath "github.com/scionproto/scion/pkg/slayers/path/scion"
 	"github.com/scionproto/scion/pkg/snet"
@@ -770,6 +773,22 @@ func scionListenPort() uint16 {
 	return 0 // let snet auto-select from topology port range
 }
 
+// extractSCIONUnderlayUDPConn returns the *net.UDPConn underlying an
+// snet.SCIONPacketConn, or nil if it could not be accessed. scionproto v0.15
+// made the field unexported; we read it reflectively because the fast-path
+// sendmmsg/recvmmsg helpers and the netns control hook both need the raw
+// *net.UDPConn. If scionproto later reshapes the struct this returns nil, the
+// fast path is skipped, and magicsock falls back to pc.WriteTo / pc.ReadFrom.
+func extractSCIONUnderlayUDPConn(pc *snet.SCIONPacketConn) *net.UDPConn {
+	v := reflect.ValueOf(pc).Elem().FieldByName("conn")
+	if !v.IsValid() {
+		return nil
+	}
+	iface := reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Interface()
+	udp, _ := iface.(*net.UDPConn)
+	return udp
+}
+
 // scionResolveLocalIP determines the local IP for the SCION underlay socket
 // by checking what source IP the OS would use to reach the border routers'
 // internal addresses from the topology. This mirrors how `scion address` works
@@ -913,8 +932,12 @@ func finishSCIONConnect(ctx context.Context, connector daemon.Connector, topo sn
 	// snet.Conn serialization. Also increase socket buffer sizes.
 	var underlayConn *net.UDPConn
 	if pc, ok := pconn.(*snet.SCIONPacketConn); ok {
-		underlayConn = pc.Conn
-		logf("magicsock: SCION: extracted underlay conn, local=%v", underlayConn.LocalAddr())
+		underlayConn = extractSCIONUnderlayUDPConn(pc)
+		if underlayConn != nil {
+			logf("magicsock: SCION: extracted underlay conn, local=%v", underlayConn.LocalAddr())
+		} else {
+			logf("magicsock: SCION: WARNING: could not extract underlay *net.UDPConn from SCIONPacketConn; fast-path disabled")
+		}
 		if err := pc.SetReadBuffer(socketBufferSize); err != nil {
 			logf("magicsock: SCION: failed to set read buffer to %d: %v", socketBufferSize, err)
 		}
@@ -2066,7 +2089,7 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 		return c.registerSameASSCIONPath(sc, peerIA, hostAddr)
 	}
 
-	paths, err := sc.daemon.Paths(ctx, peerIA, sc.localIA, daemon.PathReqFlags{Refresh: false})
+	paths, err := sc.daemon.Paths(ctx, peerIA, sc.localIA, daemontypes.PathReqFlags{Refresh: false})
 	if err != nil {
 		return nil, fmt.Errorf("querying SCION paths to %s: %w", peerIA, err)
 	}
@@ -2410,7 +2433,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 			continue
 		}
 
-		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemon.PathReqFlags{Refresh: true})
+		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemontypes.PathReqFlags{Refresh: true})
 		if err != nil || len(daemonPaths) == 0 {
 			metricSCIONPathRefreshError.Add(1)
 			c.logf("magicsock: SCION path refresh for %s failed: %v", g.peerIA, err)
@@ -2534,7 +2557,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 			continue
 		}
 
-		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemon.PathReqFlags{Refresh: false})
+		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemontypes.PathReqFlags{Refresh: false})
 		if err != nil || len(daemonPaths) == 0 {
 			continue
 		}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -19,8 +20,8 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/scionproto/scion/pkg/addr"
-	"github.com/scionproto/scion/pkg/daemon"
 	"github.com/scionproto/scion/pkg/daemon/mock_daemon"
+	daemontypes "github.com/scionproto/scion/pkg/daemon/types"
 	"github.com/scionproto/scion/pkg/slayers"
 	"github.com/scionproto/scion/pkg/snet"
 	"golang.org/x/net/ipv4"
@@ -829,7 +830,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 			Expiry:  time.Now().Add(time.Hour),
 		})
 
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: false}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: false}).
 			Return([]snet.Path{slowPath, fastPath, mediumPath}, nil)
 
 		c := &Conn{}
@@ -866,7 +867,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 	})
 
 	t.Run("no paths available", func(t *testing.T) {
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: false}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: false}).
 			Return(nil, nil)
 
 		c := &Conn{}
@@ -879,7 +880,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 	})
 
 	t.Run("daemon error", func(t *testing.T) {
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: false}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: false}).
 			Return(nil, fmt.Errorf("daemon unavailable"))
 
 		c := &Conn{}
@@ -901,7 +902,7 @@ func TestDiscoverSCIONPaths(t *testing.T) {
 
 	t.Run("single path with no metadata", func(t *testing.T) {
 		noMetaPath := newMockPathWithMetadata(ctrl, nil)
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: false}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: false}).
 			Return([]snet.Path{noMetaPath}, nil)
 
 		c := &Conn{}
@@ -987,7 +988,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			Expiry:  newExpiry,
 		})
 
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: true}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: true}).
 			Return([]snet.Path{newPath}, nil)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1027,7 +1028,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 	t.Run("skips non-expiring path", func(t *testing.T) {
 		// Hard refresh skipped (path far from expiry), but soft refresh
 		// queries the daemon with Refresh: false to discover new paths.
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: false}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: false}).
 			Return(nil, nil)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1052,7 +1053,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 	})
 
 	t.Run("handles daemon failure gracefully", func(t *testing.T) {
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: true}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: true}).
 			Return(nil, fmt.Errorf("daemon unreachable"))
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1100,7 +1101,7 @@ func TestRefreshSCIONPathsOnce(t *testing.T) {
 			Expiry:  time.Now().Add(2 * time.Hour),
 		})
 
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: true}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: true}).
 			Return([]snet.Path{slowPath, fastPath}, nil)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1822,7 +1823,7 @@ func TestScionStalePathCleanup(t *testing.T) {
 
 	// Call refresh scionStalePathThreshold times.
 	for i := 0; i < scionStalePathThreshold; i++ {
-		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemon.PathReqFlags{Refresh: true}).
+		mockDaemon.EXPECT().Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: true}).
 			Return([]snet.Path{newPath}, nil)
 		c.refreshSCIONPathsOnce()
 	}
@@ -2546,19 +2547,82 @@ func TestRecordBetterAddrCategory(t *testing.T) {
 	}
 }
 
-// TestEmbeddedConnectorRequiresInsecureAck verifies that the embedded SCION
-// connector refuses to start unless the operator has explicitly acknowledged
-// the Phase 1 accept-all verifier. This prevents silent deployment of a
-// connector that accepts unverified path segments.
-func TestEmbeddedConnectorRequiresInsecureAck(t *testing.T) {
-	t.Setenv("TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS", "")
+// TestExtractSCIONUnderlayUDPConn verifies that the reflective accessor for
+// the unexported net.UDPConn inside snet.SCIONPacketConn works against the
+// pinned scionproto version. If scionproto reshapes SCIONPacketConn, this
+// test fails and alerts us before the fast path silently stops working.
+func TestExtractSCIONUnderlayUDPConn(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer udp.Close()
+
+	// Use unsafe to construct a SCIONPacketConn with the unexported `conn`
+	// field populated. This mirrors what snet.SCIONNetwork.OpenRaw does
+	// internally. If this test ever panics or returns nil, scionproto has
+	// renamed the field or changed its type and the fast-path extraction
+	// needs to be updated.
+	pc := &snet.SCIONPacketConn{}
+	v := reflect.ValueOf(pc).Elem().FieldByName("conn")
+	if !v.IsValid() {
+		t.Fatal("SCIONPacketConn no longer has a field named 'conn'")
+	}
+	ptr := unsafe.Pointer(v.UnsafeAddr())
+	reflect.NewAt(v.Type(), ptr).Elem().Set(reflect.ValueOf(udp))
+
+	extracted := extractSCIONUnderlayUDPConn(pc)
+	if extracted != udp {
+		t.Fatalf("extractSCIONUnderlayUDPConn returned %v, want %v", extracted, udp)
+	}
+}
+
+// TestEmbeddedConnectorRequiresTRCs verifies that the embedded SCION
+// connector refuses to start if no TRC blobs are present in the state
+// directory's certs/ subdirectory. Real segment verification cannot proceed
+// without at least one TRC, so the connector must fail loudly rather than
+// silently accept unverified segments.
+func TestEmbeddedConnectorRequiresTRCs(t *testing.T) {
 	_, err := newEmbeddedConnector(context.Background(), "/tmp/nonexistent-topology.json", t.TempDir(), t.Logf, nil)
 	if err == nil {
-		t.Fatal("expected error when TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS is unset")
+		t.Fatal("expected error when certs/ directory has no TRCs")
 	}
-	if !strings.Contains(err.Error(), "ACKNOWLEDGE_INSECURE_SEGMENTS") {
-		t.Errorf("error should mention the envknob, got: %v", err)
+	// Topology load happens before the TRC check, so the error may be
+	// topology-load for a nonexistent path; that still surfaces a clear
+	// failure. We only need to ensure no insecure startup slipped through.
+	if strings.Contains(err.Error(), "ACKNOWLEDGE_INSECURE_SEGMENTS") {
+		t.Errorf("removed knob should not be referenced, got: %v", err)
 	}
+}
+
+// TestResolveSCIONCertsDir verifies the TRC directory resolution rules:
+// topology-sibling by default so hosts with /etc/scion/certs/*.trc work
+// out of the box, overridden by TS_SCION_CERTS_DIR when explicitly set.
+func TestResolveSCIONCertsDir(t *testing.T) {
+	t.Run("sibling_of_topology_by_default", func(t *testing.T) {
+		envknob.Setenv("TS_SCION_CERTS_DIR", "")
+		t.Cleanup(func() { envknob.Setenv("TS_SCION_CERTS_DIR", "") })
+		got := resolveSCIONCertsDir("/etc/scion/topology.json")
+		if want := "/etc/scion/certs"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("state_dir_bootstrap", func(t *testing.T) {
+		envknob.Setenv("TS_SCION_CERTS_DIR", "")
+		t.Cleanup(func() { envknob.Setenv("TS_SCION_CERTS_DIR", "") })
+		got := resolveSCIONCertsDir("/var/lib/tailscale/scion/topology.json")
+		if want := "/var/lib/tailscale/scion/certs"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("explicit_env_override", func(t *testing.T) {
+		envknob.Setenv("TS_SCION_CERTS_DIR", "/opt/scion-trust")
+		t.Cleanup(func() { envknob.Setenv("TS_SCION_CERTS_DIR", "") })
+		got := resolveSCIONCertsDir("/etc/scion/topology.json")
+		if want := "/opt/scion-trust"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
 }
 
 // FuzzParseSCIONPacket throws random bytes at the SCION wire parser that

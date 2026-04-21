@@ -24,8 +24,7 @@ For CLI usage, see the [Tailscale CLI reference](https://tailscale.com/docs/refe
 # Build
 go install tailscale.com/cmd/tailscale{,d}
 
-# Run with embedded SCION daemon + bootstrap
-TS_SCION_EMBEDDED=1 \
+# Run with the embedded SCION daemon (bootstraps topology + TRCs)
 TS_SCION_BOOTSTRAP_URL=http://your-bootstrap-server:8041 \
   tailscaled
 
@@ -35,7 +34,7 @@ curl -s --unix-socket /var/run/tailscale/tailscaled.sock \
 # {"Connected":true,"LocalIA":"19-ffaa:1:eba"}
 ```
 
-If you have a local SCION daemon (sciond) running, no environment variables are needed -- Tailscale will connect to it automatically at `127.0.0.1:30255`.
+If `/etc/scion/topology.json` and `/etc/scion/certs/*.trc` already exist (e.g. from a locally managed SCION daemon), no bootstrap is needed — the embedded connector loads TRCs from the topology file's sibling `certs/` directory by default. Override with `TS_SCION_CERTS_DIR` if TRCs live elsewhere.
 
 ## Android
 
@@ -43,11 +42,12 @@ See [netsys-lab/tailscale-android-scion](https://github.com/netsys-lab/tailscale
 
 ## Connection Flow
 
-SCION connects using a cascading fallback:
+SCION runs entirely in-process via an embedded connector. Startup:
 
-1. **External daemon** -- connects to sciond at `SCION_DAEMON_ADDRESS`. *Skipped if `TS_SCION_EMBEDDED=1`.*
-2. **Embedded daemon** -- loads local topology file (`TS_SCION_TOPOLOGY` or `/etc/scion/topology.json`). *Skipped if `TS_SCION_FORCE_BOOTSTRAP=1`.*
-3. **Bootstrap** -- fetches topology from: explicit URL → DNS SRV discovery → hardcoded defaults. Then starts embedded daemon with the fetched topology.
+1. **Local topology** -- if `TS_SCION_TOPOLOGY` or `/etc/scion/topology.json` exists, load it and read TRCs from `${TS_SCION_STATE_DIR}/certs/*.trc`.
+2. **Bootstrap** -- otherwise, fetch topology and TRCs from: explicit URL → DNS SRV discovery → hardcoded defaults. Then start the embedded connector with the fetched state.
+
+Path segments returned by the SCION control plane are cryptographically verified against the bootstrapped TRCs before use.
 
 See [docs/architecture.md](docs/architecture.md) for details.
 
@@ -57,8 +57,6 @@ See [docs/architecture.md](docs/architecture.md) for details.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCION_DAEMON_ADDRESS` | `127.0.0.1:30255` | External SCION daemon gRPC address |
-| `TS_SCION_EMBEDDED` | `false` | Skip external daemon, use embedded connector only |
 | `TS_PREFER_SCION` | `false` | Unconditionally prefer SCION over all other paths |
 | `TS_SCION_PREFERENCE` | `15` | betterAddr points bonus for SCION (0 to disable) |
 | `TS_SCION_PORT` | (auto) | Local SCION/UDP listen port |
@@ -69,10 +67,10 @@ See [docs/architecture.md](docs/architecture.md) for details.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TS_SCION_TOPOLOGY` | (auto) | Path to `topology.json` (defaults to `/etc/scion/topology.json` on Linux) |
+| `TS_SCION_CERTS_DIR` | (auto) | Directory of TRC blobs (`*.trc`). Defaults to the topology file's sibling `certs/` dir (e.g. `/etc/scion/certs`) |
 | `TS_SCION_BOOTSTRAP_URL` | (unset) | Single bootstrap server URL |
 | `TS_SCION_BOOTSTRAP_URLS` | (unset) | Comma-separated bootstrap server URLs |
-| `TS_SCION_FORCE_BOOTSTRAP` | `false` | Skip local topology, go straight to bootstrap |
-| `TS_SCION_STATE_DIR` | (auto) | State directory for bootstrap data and PathDB |
+| `TS_SCION_STATE_DIR` | (auto) | State directory for bootstrap data, PathDB, and TrustDB SQLite |
 
 ### Advanced
 

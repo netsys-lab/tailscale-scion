@@ -69,7 +69,7 @@ var (
 // to the stored shape (new files, renamed fields, incompatible SCION
 // dependency upgrade) can detect and rebuild stale state instead of reusing
 // it and producing mysterious failures at startup.
-const bootstrapStateVersion = 1
+const bootstrapStateVersion = 2
 
 // bootstrapStateMeta is the payload stored in version.json.
 type bootstrapStateMeta struct {
@@ -139,13 +139,13 @@ func bootstrapSCION(ctx context.Context, logf logger.Logf, serverURL string, des
 	}
 	logf("scion: bootstrap: fetched topology (%d bytes) from %s", len(topoData), serverURL)
 
-	// Fetch TRC index.
+	// Fetch TRC index. TRCs are required: segment verification will not
+	// start without at least one TRC present, so a bootstrap server that
+	// cannot serve them is not usable and the caller should try the next.
 	trcsURL := strings.TrimRight(serverURL, "/") + "/trcs"
 	trcsData, err := httpGet(ctx, client, trcsURL, bootstrapTRCIndexSizeMax)
 	if err != nil {
-		// TRCs are optional for Phase 1 (accept-all verification).
-		logf("scion: bootstrap: TRC index not available from %s: %v", serverURL, err)
-		return nil
+		return fmt.Errorf("fetching TRC index from %s: %w", trcsURL, err)
 	}
 	totalFetched += int64(len(trcsData))
 
@@ -157,9 +157,7 @@ func bootstrapSCION(ctx context.Context, logf logger.Logf, serverURL string, des
 	// Parse TRC index and fetch each TRC blob.
 	var trcIndex []trcEntry
 	if err := json.Unmarshal(trcsData, &trcIndex); err != nil {
-		// Non-fatal: TRC index may not be JSON array on all servers.
-		logf("scion: bootstrap: failed to parse TRC index: %v", err)
-		return nil
+		return fmt.Errorf("parsing TRC index from %s: %w", trcsURL, err)
 	}
 
 	// Cap the number of TRC entries we'll attempt. A malicious server
@@ -184,7 +182,7 @@ func bootstrapSCION(ctx context.Context, logf logger.Logf, serverURL string, des
 		blobURL := strings.TrimRight(serverURL, "/") + "/trcs/" + idStr + "/blob"
 		blob, err := httpGet(ctx, client, blobURL, bootstrapTRCBlobSizeMax)
 		if err != nil {
-			continue // Best-effort TRC download.
+			continue // Best-effort per blob; overall success requires fetched > 0 below.
 		}
 		totalFetched += int64(len(blob))
 		trcPath := filepath.Join(certsDir, idStr+".trc")
@@ -195,6 +193,9 @@ func bootstrapSCION(ctx context.Context, logf logger.Logf, serverURL string, des
 	}
 	logf("scion: bootstrap: fetched %d/%d TRCs from %s (total %d bytes)",
 		fetched, len(trcIndex), serverURL, totalFetched)
+	if fetched == 0 {
+		return fmt.Errorf("bootstrap from %s produced no TRCs", serverURL)
+	}
 
 	if err := writeBootstrapVersion(destDir); err != nil {
 		// Non-fatal: the bootstrap succeeded, but next boot won't detect

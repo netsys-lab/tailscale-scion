@@ -3,26 +3,11 @@
 
 //go:build !ts_omit_scion
 
-// The embedded SCION connector deliberately uses a no-op segment verifier
-// (acceptAllVerifier) in this fork. This is a known Phase 1 limitation: path
-// segments returned by the SCION control plane are accepted without
-// cryptographic validation against TRCs. A hostile control server or on-path
-// attacker (given the current plaintext bootstrap) can inject fabricated
-// segments, effectively controlling path routing for SCION traffic.
-//
-// Operators must acknowledge this explicitly: the embedded connector refuses
-// to start unless TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS=1 is set. When the
-// knob is set, the connector logs a one-time warning at startup so the risk
-// is visible in the process's log stream. Removing the knob (leaving it
-// unset) is the path forward for operators who cannot accept this posture.
-//
-// Phase 2 will replace acceptAllVerifier with a real trust-engine-backed
-// verifier that validates segments against the bootstrapped TRCs.
-
 package magicsock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -30,26 +15,26 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
-	"github.com/scionproto/scion/daemon/config"
-	"github.com/scionproto/scion/daemon/fetcher"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/daemon"
+	"github.com/scionproto/scion/pkg/daemon/fetcher"
+	daemontrust "github.com/scionproto/scion/pkg/daemon/private/trust"
+	daemontypes "github.com/scionproto/scion/pkg/daemon/types"
 	"github.com/scionproto/scion/pkg/drkey"
 	libgrpc "github.com/scionproto/scion/pkg/grpc"
+	scionlog "github.com/scionproto/scion/pkg/log"
 	"github.com/scionproto/scion/pkg/private/ctrl/path_mgmt"
 	"github.com/scionproto/scion/pkg/private/serrors"
-	cryptopb "github.com/scionproto/scion/pkg/proto/crypto"
-	"github.com/scionproto/scion/pkg/scrypto/cppki"
-	"github.com/scionproto/scion/pkg/scrypto/signed"
 	"github.com/scionproto/scion/pkg/segment/iface"
 	"github.com/scionproto/scion/pkg/snet"
-	segfetchergrpc "github.com/scionproto/scion/private/segment/segfetcher/grpc"
-	infra "github.com/scionproto/scion/private/segment/verifier"
 	"github.com/scionproto/scion/private/revcache"
+	segfetchergrpc "github.com/scionproto/scion/private/segment/segfetcher/grpc"
 	"github.com/scionproto/scion/private/storage"
 	"github.com/scionproto/scion/private/topology"
 	"github.com/scionproto/scion/private/trust"
+	"github.com/scionproto/scion/private/trust/compat"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/resolver"
@@ -65,25 +50,26 @@ var (
 	scionTopology    = envknob.RegisterString("TS_SCION_TOPOLOGY")
 	scionStateDirEnv = envknob.RegisterString("TS_SCION_STATE_DIR")
 
-	// scionAcceptInsecureSegments gates the Phase 1 accept-all verifier.
-	// When unset, the embedded connector refuses to start so that a
-	// security-conscious operator isn't surprised by the insecure posture.
-	// When set, a one-time startup warning is emitted.
-	scionAcceptInsecureSegments = envknob.RegisterBool("TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS")
+	// scionCertsDirEnv overrides the directory that TRC blobs are loaded
+	// from. If unset, the directory is derived from the loaded topology
+	// file's parent (i.e. /etc/scion/certs when TS_SCION_TOPOLOGY is
+	// /etc/scion/topology.json), falling back to $stateDir/certs for
+	// bootstrapped topologies.
+	scionCertsDirEnv = envknob.RegisterString("TS_SCION_CERTS_DIR")
 )
 
-// scionInsecureWarnOnce ensures the Phase 1 verifier warning is logged at most
-// once per process, even if the embedded connector is constructed multiple times
-// (e.g., across SCION reconnects).
-var scionInsecureWarnOnce sync.Once
+// errNoTRCs is returned by newEmbeddedConnector when no TRC blobs are
+// available in the state directory. With real segment verification in place
+// the connector cannot usefully start without at least one TRC.
+var errNoTRCs = errors.New("no TRCs available; run bootstrap or set TS_SCION_BOOTSTRAP_URL")
 
-func warnSCIONInsecureSegments(logf logger.Logf) {
-	scionInsecureWarnOnce.Do(func() {
-		logf("magicsock: SCION PHASE 1 WARNING: path segments are accepted without " +
-			"cryptographic verification (acceptAllVerifier). A compromised SCION control " +
-			"plane or on-path attacker can inject arbitrary path segments. This knob " +
-			"(TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS=1) must be explicitly set to opt in.")
-	})
+// scionLogDiscardOnce silences scionproto's package-global zap logger on
+// first embedded-connector construction. Without this, daemontrust.NewEngine
+// and friends log directly to stderr via an uninitialized logger.
+var scionLogDiscardOnce sync.Once
+
+func silenceSCIONLog() {
+	scionLogDiscardOnce.Do(scionlog.Discard)
 }
 
 // embeddedConnector implements daemon.Connector using an embedded topology
@@ -94,6 +80,7 @@ type embeddedConnector struct {
 	fetcher  fetcher.Fetcher
 	pathDB   storage.PathDB
 	revCache revcache.RevCache
+	trustDB  storage.TrustDB
 	cancel   context.CancelFunc // cancels the topology loader goroutine
 }
 
@@ -142,13 +129,13 @@ func (ec *embeddedConnector) snetTopology() snet.Topology {
 }
 
 // Paths resolves end-to-end paths using the embedded fetcher (segment fetch + combination).
-func (ec *embeddedConnector) Paths(ctx context.Context, dst, src addr.IA, f daemon.PathReqFlags) ([]snet.Path, error) {
+func (ec *embeddedConnector) Paths(ctx context.Context, dst, src addr.IA, f daemontypes.PathReqFlags) ([]snet.Path, error) {
 	return ec.fetcher.GetPaths(ctx, src, dst, f.Refresh)
 }
 
 // ASInfo is not supported by the embedded connector.
-func (ec *embeddedConnector) ASInfo(_ context.Context, _ addr.IA) (daemon.ASInfo, error) {
-	return daemon.ASInfo{}, serrors.New("not supported by embedded connector")
+func (ec *embeddedConnector) ASInfo(_ context.Context, _ addr.IA) (daemontypes.ASInfo, error) {
+	return daemontypes.ASInfo{}, serrors.New("not supported by embedded connector")
 }
 
 // SVCInfo is not supported by the embedded connector.
@@ -188,21 +175,20 @@ func (ec *embeddedConnector) Close() error {
 	if ec.revCache != nil {
 		ec.revCache.Close()
 	}
+	if ec.trustDB != nil {
+		ec.trustDB.Close()
+	}
 	return nil
 }
 
 // newEmbeddedConnector creates a new embeddedConnector from a topology file.
 // It wires up the path fetcher pipeline following the daemon's own assembly
-// (daemon/cmd/daemon/main.go), but without trust verification (Phase 1).
+// (daemon/cmd/daemon/main.go), including TRC-backed segment verification via
+// daemontrust.NewEngine. The connector requires at least one TRC blob under
+// stateDir/certs/ to start; callers should bootstrap first when the state
+// directory is empty.
 func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf logger.Logf, netMon *netmon.Monitor) (*embeddedConnector, error) {
-	// Enforce explicit operator acknowledgement of the Phase 1 accept-all
-	// verifier. See the top-of-file comment for the threat model.
-	if !scionAcceptInsecureSegments() {
-		return nil, fmt.Errorf("embedded SCION connector requires " +
-			"TS_SCION_ACKNOWLEDGE_INSECURE_SEGMENTS=1 (Phase 1 limitation — " +
-			"segments are not cryptographically verified)")
-	}
-	warnSCIONInsecureSegments(logf)
+	silenceSCIONLog()
 
 	// 1. Load topology.
 	topo, err := topology.NewLoader(topology.LoaderCfg{
@@ -256,26 +242,52 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf l
 		NetDialer: netns.NewDialer(logf, netMon).DialContext,
 	}
 
-	// 4. Create the segment fetcher requester (gRPC to local CS).
+	// 4. Build the trust engine backed by the on-disk TRC/chain store. The
+	// engine supplies both the verifier (which checks each segment against a
+	// TRC) and the inspector (which reports AS attributes from the trust DB).
+	//
+	// TRC location: prefer TS_SCION_CERTS_DIR if set; otherwise use the
+	// topology file's sibling "certs" directory (matches the stock SCION
+	// daemon's /etc/scion layout). This keeps hosts that already have TRCs
+	// under /etc/scion/certs/ from needing to copy them into stateDir.
+	certsDir := resolveSCIONCertsDir(topoPath)
+	if !certsDirHasTRC(certsDir) {
+		pathDB.Close()
+		revCache.Close()
+		return nil, fmt.Errorf("%s: %w", certsDir, errNoTRCs)
+	}
+	trustDBPath := filepath.Join(stateDir, "scion-trustdb.sqlite")
+	trustDB, err := storage.NewTrustStorage(storage.DBConfig{Connection: trustDBPath})
+	if err != nil {
+		pathDB.Close()
+		revCache.Close()
+		return nil, fmt.Errorf("creating trust storage at %s: %w", trustDBPath, err)
+	}
+	engine, err := daemontrust.NewEngine(topoCtx, certsDir, topo.IA(), trustDB, dialer)
+	if err != nil {
+		trustDB.Close()
+		pathDB.Close()
+		revCache.Close()
+		return nil, fmt.Errorf("building trust engine: %w", err)
+	}
+
+	// 5. Create the segment fetcher requester (gRPC to local CS) and the path
+	// fetcher with real TRC-based segment verification.
 	requester := &segfetchergrpc.Requester{
 		Dialer: dialer,
 	}
 
-	// 5. Create the path fetcher with accept-all verification (Phase 1).
-	sdCfg := config.SDConfig{}
-	sdCfg.InitDefaults()
-
 	f := fetcher.NewFetcher(fetcher.FetcherConfig{
-		IA:         topo.IA(),
-		MTU:        topo.MTU(),
-		Core:       topo.Core(),
-		NextHopper: topo,
-		RPC:        requester,
-		PathDB:     pathDB,
-		Inspector:  endHostInspector{},
-		Verifier:   acceptAllVerifier{},
-		RevCache:   revCache,
-		Cfg:        sdCfg,
+		IA:            topo.IA(),
+		MTU:           topo.MTU(),
+		Core:          topo.Core(),
+		NextHopper:    topo,
+		RPC:           requester,
+		PathDB:        pathDB,
+		Inspector:     engine,
+		Verifier:      compat.Verifier{Verifier: trust.Verifier{Engine: engine}},
+		RevCache:      revCache,
+		QueryInterval: 5 * time.Minute,
 	})
 
 	ec := &embeddedConnector{
@@ -283,43 +295,32 @@ func newEmbeddedConnector(ctx context.Context, topoPath, stateDir string, logf l
 		fetcher:  f,
 		pathDB:   pathDB,
 		revCache: revCache,
+		trustDB:  trustDB,
 		cancel:   topoCancel,
 	}
 	success = true
 	return ec, nil
 }
 
-// acceptAllVerifier skips segment verification. This matches the daemon's own
-// behavior when DisableSegVerification is set (daemon/cmd/daemon/main.go:359-377).
-type acceptAllVerifier struct{}
-
-func (acceptAllVerifier) Verify(_ context.Context, _ *cryptopb.SignedMessage,
-	_ ...[]byte) (*signed.Message, error) {
-	return nil, nil
+// certsDirHasTRC reports whether the given directory contains at least one
+// *.trc blob. Bootstrap writes TRCs under stateDir/certs/ using ID-based
+// filenames (e.g. isd19-b1-s1.trc); the real scionproto loader globs *.trc.
+func certsDirHasTRC(dir string) bool {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.trc"))
+	return err == nil && len(matches) > 0
 }
 
-func (v acceptAllVerifier) WithServer(_ net.Addr) infra.Verifier {
-	return v
-}
-
-func (v acceptAllVerifier) WithIA(_ addr.IA) infra.Verifier {
-	return v
-}
-
-func (v acceptAllVerifier) WithValidity(_ cppki.Validity) infra.Verifier {
-	return v
-}
-
-// endHostInspector is a minimal trust.Inspector for non-core endhosts.
-// It always reports no attributes, which is correct for endhost path resolution.
-type endHostInspector struct{}
-
-func (endHostInspector) ByAttributes(_ context.Context, _ addr.ISD, _ trust.Attribute) ([]addr.IA, error) {
-	return nil, nil
-}
-
-func (endHostInspector) HasAttributes(_ context.Context, _ addr.IA, _ trust.Attribute) (bool, error) {
-	return false, nil
+// resolveSCIONCertsDir returns the directory to load TRC blobs from. The
+// explicit TS_SCION_CERTS_DIR envknob wins when set; otherwise the directory
+// is derived from the topology file's parent (so /etc/scion/topology.json
+// resolves to /etc/scion/certs, matching the stock SCION daemon layout, and
+// $stateDir/topology.json resolves to $stateDir/certs, matching what
+// bootstrap writes).
+func resolveSCIONCertsDir(topoPath string) string {
+	if d := scionCertsDirEnv(); d != "" {
+		return d
+	}
+	return filepath.Join(filepath.Dir(topoPath), "certs")
 }
 
 // netnsTCPDialer implements libgrpc.Dialer with netns-aware TCP connections
