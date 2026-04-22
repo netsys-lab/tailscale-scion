@@ -348,7 +348,7 @@ func infoFromCache(ref string, runner dirRunner) (verInfo, error) {
 	r := dirRunner(tailscaleCache)
 
 	if _, err := os.Stat(tailscaleCache); err != nil {
-		if !runner.ok("git", "clone", "https://github.com/tailscale/tailscale", tailscaleCache) {
+		if !runner.ok("git", "clone", "https://github.com/netsys-lab/tailscale-scion", tailscaleCache) {
 			return verInfo{}, fmt.Errorf("cloning tailscale.com repo failed")
 		}
 	}
