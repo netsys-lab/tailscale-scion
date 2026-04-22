@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 )
 
 // VersionInfo is version information extracted from a git checkout.
@@ -187,12 +188,16 @@ func tailscaleModuleRef(modBs []byte) (string, error) {
 		if req.Mod.Path != "tailscale.com" {
 			continue
 		}
-		// Get the last - separated part of req.Mod.Version
-		// (which is the git hash).
-		if i := strings.LastIndexByte(req.Mod.Version, '-'); i != -1 {
-			return req.Mod.Version[i+1:], nil
+		// Pseudo-versions encode the commit SHA in their trailing segment;
+		// real tags (including semver pre-releases like v1.2.3-alpha.4)
+		// resolve directly as git refs.
+		if module.IsPseudoVersion(req.Mod.Version) {
+			rev, err := module.PseudoVersionRev(req.Mod.Version)
+			if err != nil {
+				return "", fmt.Errorf("parsing pseudo-version %q: %w", req.Mod.Version, err)
+			}
+			return rev, nil
 		}
-		// If there are no dashes, the version is a tag.
 		return req.Mod.Version, nil
 	}
 	return "", fmt.Errorf("no require tailscale.com line in go.mod")
