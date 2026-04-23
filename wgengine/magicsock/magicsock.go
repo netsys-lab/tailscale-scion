@@ -439,6 +439,26 @@ type Conn struct {
 	scionPathSeq       atomic.Uint64                   // monotonic key generator for scionPaths (never wraps in practice)
 	scionSoftRefreshAt map[scionIAKey]time.Time        // last soft refresh per peer, guarded by c.mu; bounded by unique peer count
 
+	// scionRefreshByIA tracks per-peer refresh backoff state (guarded by
+	// c.mu). Exponential backoff on consecutive daemon.Paths failures is
+	// scoped to individual peers so that one failing peer (missing TRC,
+	// AS unreachable, transient daemon error) does not starve refresh
+	// for every other SCION-reachable peer. Replaces a prior goroutine-
+	// wide consecutiveFailures counter. Entries are garbage-collected in
+	// refreshSCIONPathsOnce when a peer no longer has any registered paths.
+	scionRefreshByIA map[scionIAKey]*scionRefreshBackoff
+	// scionRefreshLastSuccess is the wall-clock time of the most recent
+	// refresh that succeeded for at least one peer (guarded by c.mu).
+	// Surfaced via /scion-status as an operator health signal.
+	scionRefreshLastSuccess time.Time
+
+	// scionDiscoveryLogAt tracks the most recent wall-clock time we logged
+	// a per-peer SCION discovery failure (guarded by c.mu). Used to
+	// rate-limit otherwise-spammy "SCION path discovery for X failed" logs
+	// when the same peer's failure recurs on every netmap update or demote.
+	// One log line per peer per scionDiscoveryLogInterval.
+	scionDiscoveryLogAt map[scionIAKey]time.Time
+
 	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
 	// Used by receiveSCION to detect a dead socket and trigger reconnection.
 	lastSCIONRecv mono.Time
@@ -447,6 +467,13 @@ type Conn struct {
 	// reconnectSCION goroutines. Set via CAS(false,true) before reconnecting,
 	// reset to false after completion or failure.
 	scionReconnecting atomic.Bool
+
+	// scionStartupRetryActive is an atomic flag guarding the startup retry
+	// goroutine (see retrySCIONStartup in magicsock_scion_conn.go). Set via
+	// CAS(false,true) when initSCIONLocked fails and the retry loop begins;
+	// cleared when the loop exits (success or Conn shutdown). Separate from
+	// scionReconnecting, which handles mid-session send-error recovery.
+	scionStartupRetryActive atomic.Bool
 
 	// scionConnReady holds a channel that is closed when pconnSCION
 	// transitions from nil to non-nil, giving receiveSCION/receiveSCIONShim

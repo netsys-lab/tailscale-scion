@@ -28,6 +28,7 @@ import (
 	"github.com/scionproto/scion/pkg/snet/mock_snet"
 	snetpath "github.com/scionproto/scion/pkg/snet/path"
 	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
@@ -1931,6 +1932,86 @@ func TestScionDemoteSCIONPathLocked(t *testing.T) {
 	}
 }
 
+// TestScionDemoteSCIONPathLocked_AllUnhealthyKicksDiscovery (Phase 2) verifies
+// that when every SCION path for a peer goes unhealthy and demote clears
+// bestAddr, we also kick an asynchronous rediscovery. Without this, recovery
+// would wait for the next periodic refresh tick (up to 30s, or minutes
+// under per-peer backoff) before fresh paths are fetched.
+//
+// Observability: discoverSCIONPathAsync sets de.scionState.lastDiscoveryAt
+// early in its CAS-guarded critical section, before any daemon call. A
+// successful kick will bump that timestamp from its pre-seeded "10 min ago"
+// value to the current time.
+func TestScionDemoteSCIONPathLocked_AllUnhealthyKicksDiscovery(t *testing.T) {
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+	// pconnSCION intentionally left nil: discoverSCIONPathAsync's throttle
+	// check runs before it loads pconnSCION, so the timestamp will still be
+	// bumped even though the subsequent Conn.discoverSCIONPaths will return
+	// errNoSCION. This keeps the test hermetic (no mock daemon needed).
+
+	staleDiscovery := time.Now().Add(-10 * time.Minute)
+	de := &endpoint{c: c}
+	de.scionState = &scionEndpointState{
+		peerIA:          peerIA,
+		hostAddr:        hostAddr,
+		activePath:      scionPathKey(1),
+		lastDiscoveryAt: staleDiscovery, // older than 5s throttle
+		paths: map[scionPathKey]*scionPathProbeState{
+			// Single path, marked unhealthy — the demote-with-no-survivors case.
+			scionPathKey(1): {
+				healthy:     false,
+				pingsSent:   3,
+				recentPongs: [scionPongHistoryCount]scionPongReply{},
+			},
+		},
+	}
+	de.bestAddr = addrQuality{
+		epAddr: epAddr{ap: hostAddr, scionKey: scionPathKey(1)},
+	}
+
+	de.mu.Lock()
+	de.demoteSCIONPathLocked(scionPathKey(1))
+	de.mu.Unlock()
+
+	// discoverSCIONPathAsync runs in a goroutine; poll briefly for
+	// lastDiscoveryAt to advance.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var got time.Time
+	for time.Now().Before(deadline) {
+		de.mu.Lock()
+		got = de.scionState.lastDiscoveryAt
+		de.mu.Unlock()
+		if got.After(staleDiscovery) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !got.After(staleDiscovery) {
+		t.Fatalf("lastDiscoveryAt = %v (unchanged from pre-seeded %v); rediscovery was not kicked on all-unhealthy demote",
+			got, staleDiscovery)
+	}
+
+	// And demote's normal contract: activePath cleared, SCION bestAddr cleared.
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	if de.scionState.activePath.IsSet() {
+		t.Errorf("activePath = %d, want 0 (no healthy paths remaining)", de.scionState.activePath)
+	}
+	if de.bestAddr.isSCION() {
+		t.Errorf("bestAddr still SCION after all paths unhealthy; want cleared")
+	}
+}
+
 func TestScionReEvalSCIONPathsLocked(t *testing.T) {
 	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
 	peerIA := addr.MustParseIA("1-ff00:0:111")
@@ -2837,5 +2918,595 @@ func BenchmarkReceiveSCIONBatchParse(b *testing.B) {
 	for range b.N {
 		scn.RecyclePaths()
 		_, _, _, _, _ = parseSCIONPacket(pkt, scn)
+	}
+}
+
+// --- Phase 5: classify discovery errors ---
+
+func TestClassifySCIONDiscoveryErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want scionDiscoveryErrorKind
+	}{
+		{"nil", nil, scionErrOther},
+		{"TRC not found", fmt.Errorf("querying SCION paths to 71-2:0:4a: TRC not found"), scionErrTRCMissing},
+		// Exact error shape observed in the incident-triggering log for ISD 71.
+		{"reserved number (gRPC from SCION CS)", fmt.Errorf("rpc error: code = Unknown desc = reserved number"), scionErrTRCMissing},
+		// False-positive guard: plain "reserved number" without the gRPC wrapper
+		// could come from unrelated decoders; don't misclassify.
+		{"reserved number without gRPC wrapper", fmt.Errorf("cert chain validation: reserved number encountered"), scionErrOther},
+		{"context deadline", fmt.Errorf("context deadline exceeded"), scionErrDaemonUnreachable},
+		{"gRPC Unavailable", fmt.Errorf("rpc error: code = Unavailable desc = transport is closing"), scionErrDaemonUnreachable},
+		{"no paths", fmt.Errorf("no paths to 19-ffaa:1:120a"), scionErrNoSegments},
+		{"arbitrary", fmt.Errorf("something else"), scionErrOther},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifySCIONDiscoveryErr(tt.err)
+			if got != tt.want {
+				t.Errorf("classifySCIONDiscoveryErr(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- Phase 4a: per-peer discovery error surfaced in PeerStatus.SCION ---
+
+// TestPopulateSCIONPathsLocked_SurfacesDiscoveryError verifies that when
+// discovery for a peer has failed (e.g. TRC not found for the peer's ISD),
+// the error is exposed on PeerStatus.SCION so operators can diagnose the
+// failure via `tailscale status --json` without reading journalctl.
+func TestPopulateSCIONPathsLocked_SurfacesDiscoveryError(t *testing.T) {
+	peerIA := addr.MustParseIA("71-2:0:4a")
+	hostAddr := netip.MustParseAddrPort("141.44.29.237:32767")
+
+	c := &Conn{connCtx: context.Background()}
+	c.logf = t.Logf
+	c.pconnSCION.Store(&scionConn{localIA: addr.MustParseIA("19-ffaa:1:120b")})
+
+	errAt := time.Now().Add(-30 * time.Second)
+	de := &endpoint{c: c}
+	de.scionState = &scionEndpointState{
+		peerIA:               peerIA,
+		hostAddr:             hostAddr,
+		lastDiscoveryAt:      errAt,
+		lastDiscoveryError:   "TRC not found",
+		lastDiscoveryErrorAt: errAt,
+		// paths intentionally empty: discovery never succeeded.
+	}
+
+	var ps ipnstate.PeerStatus
+	c.mu.Lock()
+	de.mu.Lock()
+	de.populateSCIONPathsLocked(&ps)
+	de.mu.Unlock()
+	c.mu.Unlock()
+
+	if ps.SCION == nil {
+		t.Fatalf("ps.SCION nil; expected peer-level state even with empty paths")
+	}
+	if got, want := ps.SCION.PeerIA, peerIA.String(); got != want {
+		t.Errorf("PeerIA = %q, want %q", got, want)
+	}
+	if got, want := ps.SCION.LastDiscoveryError, "TRC not found"; got != want {
+		t.Errorf("LastDiscoveryError = %q, want %q", got, want)
+	}
+	if ps.SCION.LastDiscoveryAt == "" {
+		t.Errorf("LastDiscoveryAt empty; expected RFC3339 timestamp")
+	}
+	if ps.SCION.LastDiscoveryErrorAt == "" {
+		t.Errorf("LastDiscoveryErrorAt empty; expected RFC3339 timestamp")
+	}
+	if len(ps.SCIONPaths) != 0 {
+		t.Errorf("SCIONPaths len = %d, want 0", len(ps.SCIONPaths))
+	}
+}
+
+// --- Phase 3: auto-retry SCION connect on startup failure ---
+
+func TestScionStartupRetrySleep(t *testing.T) {
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{1, 5 * time.Second},
+		{2, 10 * time.Second},
+		{3, 20 * time.Second},
+		{4, 40 * time.Second},
+		{5, 60 * time.Second}, // capped
+		{10, 60 * time.Second},
+	}
+	for _, tt := range tests {
+		got := scionStartupRetrySleep(tt.attempt)
+		if got != tt.want {
+			t.Errorf("scionStartupRetrySleep(%d) = %v, want %v", tt.attempt, got, tt.want)
+		}
+	}
+}
+
+// --- Phase 1a: fingerprint-keyed reconciler (key-stability + collision guard) ---
+
+// TestUpsertSCIONPathLocked_StableReSignPreservesKey verifies Phase 1a's
+// load-bearing guarantee: when the daemon returns a path with the same
+// fingerprint as an already-registered entry (the common "re-signed segment,
+// same topology" case), the same scionPathKey is reused and only the
+// mutable fields (expiry, path bytes, fastPath) are updated. Previously,
+// this case churned keys unnecessarily on every rediscovery round.
+func TestUpsertSCIONPathLocked_StableReSignPreservesKey(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+
+	iface1 := snet.PathInterface{IA: localIA, ID: 1}
+	iface2 := snet.PathInterface{IA: peerIA, ID: 2}
+	oldExpiry := time.Now().Add(1 * time.Hour)
+	newExpiry := time.Now().Add(2 * time.Hour)
+
+	oldPath := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Interfaces: []snet.PathInterface{iface1, iface2},
+		Expiry:     oldExpiry,
+		MTU:        1472,
+	})
+	newPath := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Interfaces: []snet.PathInterface{iface1, iface2}, // same topology
+		Expiry:     newExpiry,                            // later expiry (re-sign)
+		MTU:        1472,
+	})
+	fp := oldPath.Metadata().Fingerprint()
+	if fp == "" || fp != newPath.Metadata().Fingerprint() {
+		t.Fatalf("test setup: oldPath and newPath must share a non-empty fingerprint")
+	}
+
+	c := &Conn{connCtx: context.Background()}
+	c.logf = t.Logf
+	c.pconnSCION.Store(&scionConn{localIA: localIA})
+
+	c.mu.Lock()
+	k1, registered1, collision1 := c.upsertSCIONPathLocked(c.pconnSCION.Load(), peerIA, hostAddr, oldPath, fp)
+	c.mu.Unlock()
+	if !registered1 {
+		t.Fatalf("first upsert: expected registered=true (fresh fingerprint)")
+	}
+	if collision1 {
+		t.Fatalf("first upsert: collision=true unexpected on fresh fingerprint")
+	}
+
+	// Re-upsert with the same fingerprint and a later expiry — same key should
+	// be returned and the in-place mutation should bump expiry without
+	// minting a new scionPathKey.
+	c.mu.Lock()
+	k2, registered2, collision2 := c.upsertSCIONPathLocked(c.pconnSCION.Load(), peerIA, hostAddr, newPath, fp)
+	c.mu.Unlock()
+	if k2 != k1 {
+		t.Fatalf("second upsert key = %d, want %d (same key for same fingerprint)", k2, k1)
+	}
+	if registered2 {
+		t.Errorf("second upsert: expected registered=false (updated in place), got true")
+	}
+	if collision2 {
+		t.Errorf("second upsert: collision=true unexpected for same-topology re-sign")
+	}
+
+	// Expiry was bumped in place.
+	pi := c.lookupSCIONPathLocking(k1)
+	if pi == nil {
+		t.Fatalf("scionPathInfo for key %d missing after re-upsert", k1)
+	}
+	pi.mu.Lock()
+	gotExpiry := pi.expiry
+	pi.mu.Unlock()
+	if !gotExpiry.Equal(newExpiry) {
+		t.Errorf("expiry after re-upsert = %v, want %v (later expiry from re-signed path)", gotExpiry, newExpiry)
+	}
+}
+
+// TestUpsertSCIONPathLocked_HopCountCollision verifies the fingerprint-
+// collision guard: if a daemon response yields the same fingerprint but a
+// different interface count as an already-registered entry, we treat it as
+// a hash collision (two topologically distinct paths hashing to the same
+// fingerprint), leave the existing entry untouched, and bump the
+// metricSCIONFingerprintCollision counter.
+func TestUpsertSCIONPathLocked_HopCountCollision(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+
+	iface1 := snet.PathInterface{IA: localIA, ID: 1}
+	iface2 := snet.PathInterface{IA: peerIA, ID: 2}
+	iface3 := snet.PathInterface{IA: addr.MustParseIA("1-ff00:0:abc"), ID: 3}
+
+	path2hop := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Interfaces: []snet.PathInterface{iface1, iface2},
+		Expiry:     time.Now().Add(1 * time.Hour),
+		MTU:        1472,
+	})
+	path4hop := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Interfaces: []snet.PathInterface{iface1, iface3, iface3, iface2},
+		Expiry:     time.Now().Add(2 * time.Hour),
+		MTU:        1472,
+	})
+	// Force both mocks to hash to the same fingerprint to simulate collision.
+	// We can't control the fingerprint directly, so we use a shared FP value
+	// via the upsert helper's acceptance of an explicit fp argument.
+	fakeFP := snet.PathFingerprint("fake-collision-fp")
+
+	c := &Conn{connCtx: context.Background()}
+	c.logf = t.Logf
+	c.pconnSCION.Store(&scionConn{localIA: localIA})
+
+	c.mu.Lock()
+	k1, registered1, _ := c.upsertSCIONPathLocked(c.pconnSCION.Load(), peerIA, hostAddr, path2hop, fakeFP)
+	c.mu.Unlock()
+	if !registered1 {
+		t.Fatalf("first upsert: expected registered=true")
+	}
+
+	before := metricSCIONFingerprintCollision.Value()
+
+	// Second upsert uses SAME fingerprint but a DIFFERENT interface count.
+	// Must NOT overwrite the existing entry and must bump the collision metric.
+	c.mu.Lock()
+	k2, registered2, collision := c.upsertSCIONPathLocked(c.pconnSCION.Load(), peerIA, hostAddr, path4hop, fakeFP)
+	c.mu.Unlock()
+	if !collision {
+		t.Fatalf("second upsert: collision=false, want true (differing hop counts should collide)")
+	}
+	if registered2 {
+		t.Errorf("second upsert: registered=true on collision; must not mint a new entry")
+	}
+	if k2 != k1 {
+		t.Errorf("second upsert: returned key %d, want %d (existing key, not new)", k2, k1)
+	}
+	if got, want := metricSCIONFingerprintCollision.Value(), before+1; got != want {
+		t.Errorf("metricSCIONFingerprintCollision = %d, want %d (+1 from collision)", got, want)
+	}
+	// The existing entry's path must still be the 2-hop one.
+	pi := c.lookupSCIONPathLocking(k1)
+	pi.mu.Lock()
+	existingIfaces := 0
+	if pi.path != nil {
+		if md := pi.path.Metadata(); md != nil {
+			existingIfaces = len(md.Interfaces)
+		}
+	}
+	pi.mu.Unlock()
+	if existingIfaces != 2 {
+		t.Errorf("existing path interface count = %d, want 2 (untouched)", existingIfaces)
+	}
+}
+
+// --- Phase 1c: per-peer refresh backoff ---
+
+func TestScionRefreshBackoff_FreshShouldAttempt(t *testing.T) {
+	// Freshly zeroed backoff: should attempt immediately.
+	var b scionRefreshBackoff
+	now := time.Now()
+	if !b.shouldAttempt(now) {
+		t.Fatalf("fresh scionRefreshBackoff must allow attempt; got nextAttemptAt=%v now=%v",
+			b.nextAttemptAt, now)
+	}
+}
+
+func TestScionRefreshBackoff_SuccessClearsBackoff(t *testing.T) {
+	// After a successful refresh, the failure counter and scheduled-next-attempt
+	// must both clear so the next refresh tick (from the outer ticker) can run
+	// without being throttled. The outer ticker is the authority on cadence;
+	// per-peer backoff only gates failure retries.
+	var b scionRefreshBackoff
+	b.consecutiveFailures = 3
+	b.lastError = "boom"
+	now := time.Unix(1_000_000, 0)
+	b.nextAttemptAt = now.Add(5 * time.Minute) // leftover from prior failure
+
+	b.recordSuccess(now, 30*time.Second)
+
+	if b.consecutiveFailures != 0 {
+		t.Errorf("consecutiveFailures after success: got %d, want 0", b.consecutiveFailures)
+	}
+	if b.lastError != "" {
+		t.Errorf("lastError after success: got %q, want empty", b.lastError)
+	}
+	if !b.nextAttemptAt.IsZero() {
+		t.Errorf("nextAttemptAt after success: got %v, want zero (cleared)", b.nextAttemptAt)
+	}
+	if !b.shouldAttempt(now) {
+		t.Errorf("shouldAttempt right after success must be true (no throttling on the success path)")
+	}
+}
+
+func TestScionRefreshBackoff_FailureGrowsExpCapped(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	const (
+		base = 30 * time.Second
+		cap_ = 2 * time.Minute
+	)
+	// The table encodes: failure N ⇒ backoff = base * 2^min(N,5), capped at cap_.
+	// N=1 → 60s,  N=2 → 120s (capped),  N=3..7 → 120s (capped),  ...
+	tests := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{1, 60 * time.Second},
+		{2, 2 * time.Minute},
+		{3, 2 * time.Minute},
+		{4, 2 * time.Minute},
+		{5, 2 * time.Minute},
+		{6, 2 * time.Minute},
+		{10, 2 * time.Minute},
+	}
+	for _, tt := range tests {
+		var fresh scionRefreshBackoff
+		for i := 0; i < tt.failures; i++ {
+			fresh.recordFailure(now, fmt.Errorf("fail %d", i), base, cap_)
+		}
+		if fresh.consecutiveFailures != tt.failures {
+			t.Errorf("failures=%d: counter=%d, want %d", tt.failures, fresh.consecutiveFailures, tt.failures)
+		}
+		gotBackoff := fresh.nextAttemptAt.Sub(now)
+		if gotBackoff != tt.want {
+			t.Errorf("failures=%d: backoff=%v, want %v (nextAttemptAt=%v)",
+				tt.failures, gotBackoff, tt.want, fresh.nextAttemptAt)
+		}
+		if fresh.lastError == "" {
+			t.Errorf("failures=%d: lastError empty; should have recorded last error message", tt.failures)
+		}
+	}
+}
+
+// TestRefreshSCIONPathsOnce_PerPeerBackoffIsolation verifies that one peer's
+// refresh failure does not delay refreshes for other peers. Before per-peer
+// backoff, any peer's daemon error would increment a goroutine-wide counter
+// and back off refresh attempts for every peer.
+func TestRefreshSCIONPathsOnce_PerPeerBackoffIsolation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockDaemon := mock_daemon.NewMockConnector(ctrl)
+
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerGood := addr.MustParseIA("1-ff00:0:111")
+	peerBad := addr.MustParseIA("71-2:0:4a") // mimic the TRC-missing SCIONLab case
+
+	// Good peer: daemon returns a valid path.
+	goodExpiry := time.Now().Add(2 * time.Hour)
+	goodPath := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Latency: []time.Duration{3 * time.Millisecond},
+		Expiry:  goodExpiry,
+	})
+	mockDaemon.EXPECT().
+		Paths(gomock.Any(), peerGood, localIA, daemontypes.PathReqFlags{Refresh: true}).
+		Return([]snet.Path{goodPath}, nil)
+
+	// Bad peer: daemon errors (simulates "TRC not found" class of failure).
+	mockDaemon.EXPECT().
+		Paths(gomock.Any(), peerBad, localIA, daemontypes.PathReqFlags{Refresh: true}).
+		Return(nil, fmt.Errorf("TRC not found"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Conn{connCtx: ctx}
+	c.logf = t.Logf
+	c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
+
+	// Both peers have paths near expiry (needs hard refresh).
+	piGood := &scionPathInfo{
+		peerIA:   peerGood,
+		hostAddr: netip.MustParseAddrPort("10.0.0.1:41641"),
+		expiry:   time.Now().Add(30 * time.Second),
+	}
+	piBad := &scionPathInfo{
+		peerIA:      peerBad,
+		hostAddr:    netip.MustParseAddrPort("10.0.0.2:41641"),
+		expiry:      time.Now().Add(30 * time.Second),
+		fingerprint: "some-fp",
+	}
+	c.registerSCIONPathLocking(piGood)
+	c.registerSCIONPathLocking(piBad)
+
+	if err := c.refreshSCIONPathsOnce(); err == nil {
+		t.Fatalf("expected error from bad peer; got nil")
+	}
+
+	// Good peer backoff: 0 failures, nextAttemptAt ≈ now + base.
+	c.mu.Lock()
+	bGood := c.scionRefreshByIA[peerGood]
+	bBad := c.scionRefreshByIA[peerBad]
+	c.mu.Unlock()
+	if bGood == nil {
+		t.Fatalf("good peer has no refresh backoff entry; per-peer state not recorded")
+	}
+	if bGood.consecutiveFailures != 0 {
+		t.Errorf("good peer consecutiveFailures = %d, want 0", bGood.consecutiveFailures)
+	}
+	if bBad == nil {
+		t.Fatalf("bad peer has no refresh backoff entry")
+	}
+	if bBad.consecutiveFailures != 1 {
+		t.Errorf("bad peer consecutiveFailures = %d, want 1", bBad.consecutiveFailures)
+	}
+	// Bad peer's nextAttemptAt must be further out than good peer's.
+	if !bBad.nextAttemptAt.After(bGood.nextAttemptAt) {
+		t.Errorf("bad peer nextAttemptAt (%v) should be after good peer nextAttemptAt (%v)",
+			bBad.nextAttemptAt, bGood.nextAttemptAt)
+	}
+}
+
+// TestRefreshSCIONPathsOnce_SkipsPeerBeforeNextAttempt verifies that
+// refreshSCIONPathsOnce respects per-peer backoff: a peer whose backoff has
+// not yet elapsed is NOT queried from the daemon.
+func TestRefreshSCIONPathsOnce_SkipsPeerBeforeNextAttempt(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockDaemon := mock_daemon.NewMockConnector(ctrl)
+
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerBackedOff := addr.MustParseIA("71-2:0:4a")
+
+	// Crucially: no EXPECT on mockDaemon.Paths for peerBackedOff in Refresh:true
+	// mode. If the refresh attempts to call daemon.Paths for this peer, gomock
+	// will fail the test with "unexpected call".
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Conn{connCtx: ctx}
+	c.logf = t.Logf
+	c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
+
+	pi := &scionPathInfo{
+		peerIA:      peerBackedOff,
+		hostAddr:    netip.MustParseAddrPort("10.0.0.2:41641"),
+		expiry:      time.Now().Add(30 * time.Second), // would trigger hard refresh
+		fingerprint: "some-fp",
+	}
+	c.registerSCIONPathLocking(pi)
+
+	// Seed backoff state: we're mid-backoff, next attempt 5 minutes from now.
+	c.mu.Lock()
+	if c.scionRefreshByIA == nil {
+		c.scionRefreshByIA = make(map[addr.IA]*scionRefreshBackoff)
+	}
+	c.scionRefreshByIA[peerBackedOff] = &scionRefreshBackoff{
+		consecutiveFailures: 5,
+		nextAttemptAt:       time.Now().Add(5 * time.Minute),
+	}
+	c.mu.Unlock()
+
+	// This must NOT call daemon.Paths for peerBackedOff; if it did, gomock
+	// would raise an unexpected-call error and fail the test.
+	_ = c.refreshSCIONPathsOnce()
+
+	// Backoff state unchanged.
+	c.mu.Lock()
+	b := c.scionRefreshByIA[peerBackedOff]
+	c.mu.Unlock()
+	if b == nil {
+		t.Fatalf("backoff entry was lost")
+	}
+	if b.consecutiveFailures != 5 {
+		t.Errorf("consecutiveFailures = %d, want 5 (unchanged because refresh was skipped)", b.consecutiveFailures)
+	}
+}
+
+// TestRefreshSCIONPathsOnce_BackoffRecovery verifies that once a previously-
+// failing peer succeeds, its backoff state clears so future refresh ticks
+// proceed at the base cadence. This is the counterpart to the isolation
+// test: that test shows a failing peer doesn't drag others down; this one
+// shows recovery works.
+func TestRefreshSCIONPathsOnce_BackoffRecovery(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockDaemon := mock_daemon.NewMockConnector(ctrl)
+
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+
+	// The daemon will fail twice, then return a valid path.
+	goodPath := newMockPathWithMetadata(ctrl, &snet.PathMetadata{
+		Latency: []time.Duration{3 * time.Millisecond},
+		Expiry:  time.Now().Add(2 * time.Hour),
+	})
+	gomock.InOrder(
+		mockDaemon.EXPECT().
+			Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: true}).
+			Return(nil, fmt.Errorf("transient")),
+		mockDaemon.EXPECT().
+			Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: true}).
+			Return(nil, fmt.Errorf("transient")),
+		mockDaemon.EXPECT().
+			Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: true}).
+			Return([]snet.Path{goodPath}, nil),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Conn{connCtx: ctx}
+	c.logf = t.Logf
+	c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
+
+	pi := &scionPathInfo{
+		peerIA:      peerIA,
+		hostAddr:    netip.MustParseAddrPort("10.0.0.1:41641"),
+		expiry:      time.Now().Add(30 * time.Second),
+		fingerprint: "some-fp",
+	}
+	c.registerSCIONPathLocking(pi)
+
+	// First call: fails. Counter = 1, nextAttemptAt set.
+	_ = c.refreshSCIONPathsOnce()
+	c.mu.Lock()
+	b := c.scionRefreshByIA[peerIA]
+	c.mu.Unlock()
+	if b == nil || b.consecutiveFailures != 1 {
+		t.Fatalf("after first failure: counter=%d, want 1", b.consecutiveFailures)
+	}
+	firstBackoff := b.nextAttemptAt
+
+	// Force-advance the backoff window so the next refresh call proceeds.
+	// (In production the outer ticker fires at 30s regardless; in this
+	// synchronous test we clear nextAttemptAt to bypass the gate.)
+	c.mu.Lock()
+	c.scionRefreshByIA[peerIA].nextAttemptAt = time.Time{}
+	c.mu.Unlock()
+
+	// Second call: fails again. Counter = 2.
+	_ = c.refreshSCIONPathsOnce()
+	c.mu.Lock()
+	b = c.scionRefreshByIA[peerIA]
+	c.mu.Unlock()
+	if b.consecutiveFailures != 2 {
+		t.Fatalf("after second failure: counter=%d, want 2", b.consecutiveFailures)
+	}
+	if !b.nextAttemptAt.After(firstBackoff) {
+		t.Errorf("second failure backoff %v should be further out than first %v",
+			b.nextAttemptAt, firstBackoff)
+	}
+
+	// Clear gate again for the third (successful) attempt.
+	c.mu.Lock()
+	c.scionRefreshByIA[peerIA].nextAttemptAt = time.Time{}
+	c.mu.Unlock()
+
+	// Third call: succeeds. Counter MUST reset to 0 and nextAttemptAt MUST clear.
+	err := c.refreshSCIONPathsOnce()
+	if err != nil {
+		t.Fatalf("third call expected success, got error: %v", err)
+	}
+	c.mu.Lock()
+	b = c.scionRefreshByIA[peerIA]
+	last := c.scionRefreshLastSuccess
+	c.mu.Unlock()
+	if b.consecutiveFailures != 0 {
+		t.Errorf("after success: counter=%d, want 0 (reset)", b.consecutiveFailures)
+	}
+	if !b.nextAttemptAt.IsZero() {
+		t.Errorf("after success: nextAttemptAt=%v, want zero (cleared)", b.nextAttemptAt)
+	}
+	if b.lastError != "" {
+		t.Errorf("after success: lastError=%q, want empty", b.lastError)
+	}
+	if last.IsZero() {
+		t.Errorf("scionRefreshLastSuccess not updated after successful refresh")
+	}
+}
+
+func TestScionRefreshBackoff_ShouldAttemptRespectsNextAttempt(t *testing.T) {
+	var b scionRefreshBackoff
+	now := time.Unix(1_000_000, 0)
+	b.recordFailure(now, fmt.Errorf("boom"), 30*time.Second, 2*time.Minute)
+
+	// Immediately after failure, must NOT attempt.
+	if b.shouldAttempt(now) {
+		t.Errorf("shouldAttempt at failure time must be false")
+	}
+	// Halfway through the backoff window, still no.
+	if b.shouldAttempt(now.Add(15 * time.Second)) {
+		t.Errorf("shouldAttempt mid-window must be false")
+	}
+	// Exactly at nextAttemptAt, YES.
+	if !b.shouldAttempt(b.nextAttemptAt) {
+		t.Errorf("shouldAttempt at nextAttemptAt must be true")
+	}
+	// After, YES.
+	if !b.shouldAttempt(b.nextAttemptAt.Add(1 * time.Second)) {
+		t.Errorf("shouldAttempt after nextAttemptAt must be true")
 	}
 }

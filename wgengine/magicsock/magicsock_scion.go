@@ -294,6 +294,155 @@ func scionMaxProbePaths() int {
 	return defaultSCIONProbePaths
 }
 
+// scionRefreshBaseInterval is the cadence at which refreshSCIONPaths ticks
+// and (in the success case) the interval between per-peer refresh attempts.
+const scionRefreshBaseInterval = 30 * time.Second
+
+// scionRefreshMaxBackoff caps the per-peer exponential backoff on consecutive
+// refresh failures. At 2 min a failing peer is retried 4 times per segment
+// expiry cycle in the worst case, while leaving enough room that transient
+// daemon errors do not produce tight retry storms. A global backoff of 10 min
+// was the previous design and meant one failing peer (missing TRC, AS
+// unreachable) could starve refresh for every other peer for minutes.
+const scionRefreshMaxBackoff = 2 * time.Minute
+
+// scionDiscoveryLogInterval is the minimum wall-clock gap between logging
+// SCION discovery failures for the same peer. Previously, the same
+// "SCION path discovery for 71-2:0:4a failed: TRC not found" line could
+// fire on every netmap update and every all-paths-unhealthy demote for a
+// permanently-broken peer (e.g. TRC missing for its ISD), flooding
+// journalctl. The error is still surfaced for status queries via
+// PeerStatus.SCION.LastDiscoveryError (Phase 4a) with no rate limit.
+const scionDiscoveryLogInterval = 5 * time.Minute
+
+// scionDiscoveryErrorKind classifies SCION path-discovery failures so
+// operators (and the per-peer backoff) can distinguish config problems
+// (TRC missing — won't self-heal) from transient infrastructure errors
+// (daemon timeout, no segments this moment). Phase 5.
+type scionDiscoveryErrorKind int
+
+const (
+	scionErrOther             scionDiscoveryErrorKind = iota
+	scionErrTRCMissing                                // trust root absent for the peer's ISD
+	scionErrNoSegments                                // daemon returned zero paths to the peer (AS may be briefly unreachable)
+	scionErrDaemonUnreachable                         // daemon gRPC Unavailable / context deadline
+)
+
+// String returns a short stable token suitable for JSON export. Empty
+// string for scionErrOther keeps API payloads compact (omitempty-friendly).
+func (k scionDiscoveryErrorKind) String() string {
+	switch k {
+	case scionErrTRCMissing:
+		return "trc-missing"
+	case scionErrNoSegments:
+		return "no-segments"
+	case scionErrDaemonUnreachable:
+		return "daemon-unreachable"
+	default:
+		return ""
+	}
+}
+
+// classifySCIONDiscoveryErr pattern-matches a discovery error into a kind.
+// The pattern list is intentionally small: these are the error shapes we've
+// seen in practice from the scionproto daemon + embedded connector. Unknown
+// errors return scionErrOther — still useful (operator sees the raw
+// LastError string), just not typed.
+//
+// Classification is heuristic. Clients exposing this via an API should
+// always surface the raw error string as well and treat the kind only as a
+// typed bucket (for conditional UX, metrics, or backoff policy), not as
+// authoritative cause.
+func classifySCIONDiscoveryErr(err error) scionDiscoveryErrorKind {
+	if err == nil {
+		return scionErrOther
+	}
+	msg := err.Error()
+	// The embedded connector's trust engine wraps missing TRCs as
+	// "TRC not found". Production SCION CS uses gRPC
+	// "Unknown desc = reserved number" when the ISD number is not in its
+	// cross-signing set — but the same phrase appears in unrelated
+	// capnp/cert decoders, so require co-occurrence with ISD/TRC to avoid
+	// over-claiming.
+	if strings.Contains(msg, "TRC not found") {
+		return scionErrTRCMissing
+	}
+	// Production SCION CS returns a gRPC error
+	// `rpc error: code = Unknown desc = reserved number` on ISD-AS lookups
+	// where the ISD is outside its cross-signing set. Require the
+	// "rpc error:" wrapper to avoid false positives from any non-gRPC
+	// caller that happens to render a reserved-number diagnostic.
+	if strings.Contains(msg, "reserved number") && strings.Contains(msg, "rpc error:") {
+		return scionErrTRCMissing
+	}
+	if strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "Unavailable") {
+		return scionErrDaemonUnreachable
+	}
+	if strings.Contains(msg, "no paths") || strings.Contains(msg, "no SCION paths") {
+		return scionErrNoSegments
+	}
+	return scionErrOther
+}
+
+// scionRefreshBackoff tracks per-peer refresh attempt throttling. Exponential
+// backoff on consecutive failures, capped at scionRefreshMaxBackoff. Reset on
+// success. Pure state — no timers, no goroutines; the refresh loop consults
+// shouldAttempt before calling daemon.Paths for each peer.
+type scionRefreshBackoff struct {
+	consecutiveFailures int
+	nextAttemptAt       time.Time
+	lastError           string
+	lastErrorAt         time.Time
+	lastErrorKind       scionDiscoveryErrorKind
+}
+
+// shouldAttempt reports whether enough time has elapsed since the last
+// scheduled attempt that we should try again. A zero nextAttemptAt (fresh
+// struct) always returns true.
+func (b *scionRefreshBackoff) shouldAttempt(now time.Time) bool {
+	return b.nextAttemptAt.IsZero() || !now.Before(b.nextAttemptAt)
+}
+
+// recordSuccess resets the failure counter and clears any prior backoff
+// schedule, so the next refresh tick can proceed immediately. The outer
+// refresh goroutine's ticker (scionRefreshBaseInterval) is the authority
+// on cadence in the success path; shouldAttempt only gates failures.
+//
+// The base argument is accepted for symmetry with recordFailure but is
+// currently unused; retained for a potential future "healthy peers refresh
+// slower" policy without a caller API change.
+func (b *scionRefreshBackoff) recordSuccess(now time.Time, base time.Duration) {
+	_ = base
+	b.consecutiveFailures = 0
+	b.lastError = ""
+	b.lastErrorAt = time.Time{}
+	b.lastErrorKind = scionErrOther
+	b.nextAttemptAt = time.Time{}
+}
+
+// recordFailure increments the failure counter, stores the error, and
+// schedules the next attempt with exponential backoff (base · 2^min(N,5))
+// capped at maxBackoff. Also classifies the error into a lastErrorKind so
+// operators can see at a glance whether a peer is unreachable due to a
+// config issue (trc-missing) vs a transient infrastructure blip.
+func (b *scionRefreshBackoff) recordFailure(now time.Time, err error, base, maxBackoff time.Duration) {
+	b.consecutiveFailures++
+	if err != nil {
+		b.lastError = err.Error()
+	}
+	b.lastErrorKind = classifySCIONDiscoveryErr(err)
+	b.lastErrorAt = now
+	shift := b.consecutiveFailures
+	if shift > 5 {
+		shift = 5
+	}
+	backoff := base * time.Duration(1<<shift)
+	if backoff > maxBackoff {
+		backoff = maxBackoff
+	}
+	b.nextAttemptAt = now.Add(backoff)
+}
+
 // scionEndpointState tracks SCION-specific per-peer state on an endpoint.
 type scionEndpointState struct {
 	peerIA          addr.IA                               // peer's ISD-AS from Services advertisement
@@ -303,6 +452,14 @@ type scionEndpointState struct {
 	lastDiscoveryAt time.Time                             // when path discovery last started (throttle)
 	lastFullEvalAt  mono.Time                             // throttles re-evaluation of SCION path latencies
 	probeRoundRobin int                                   // round-robin index for non-best path probing
+
+	// lastDiscoveryError is the most recent discovery error string for this
+	// peer (e.g. "TRC not found"). Cleared on a successful discovery.
+	// Surfaced via PeerStatus.SCION.LastDiscoveryError so operators can see
+	// why a SCION-advertising peer has no probed paths without reading logs.
+	lastDiscoveryError     string
+	lastDiscoveryErrorAt   time.Time
+	lastDiscoveryErrorKind scionDiscoveryErrorKind
 }
 
 // scionPathProbeState tracks disco probing state for one SCION path.
@@ -2490,37 +2647,23 @@ func selectDiversePaths(candidates []pathWithMeta, maxPaths int) []pathWithMeta 
 // SCION paths before they expire. It uses exponential backoff when the SCION
 // daemon is unreachable.
 func (c *Conn) refreshSCIONPaths() {
-	const (
-		baseInterval = 30 * time.Second
-		maxBackoff   = 10 * time.Minute
-	)
-	ticker := time.NewTicker(baseInterval)
+	ticker := time.NewTicker(scionRefreshBaseInterval)
 	defer ticker.Stop()
 
-	var consecutiveFailures int
 	for {
 		select {
 		case <-c.donec:
 			return
 		case <-ticker.C:
-			if consecutiveFailures > 0 {
-				backoff := baseInterval * time.Duration(1<<min(consecutiveFailures, 5))
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-				ticker.Reset(backoff)
-			}
+			// Backoff is now per-peer (scionRefreshByIA, consulted inside
+			// refreshSCIONPathsOnce). The outer goroutine ticks at a fixed
+			// base interval; a failing peer delays only its own next attempt,
+			// not refreshes for other peers. See scionRefreshBackoff.
 			if err := c.refreshSCIONPathsOnce(); err != nil {
-				consecutiveFailures++
-				if consecutiveFailures == 1 || consecutiveFailures&(consecutiveFailures-1) == 0 {
-					c.logf("magicsock: SCION path refresh failed (%d consecutive): %v",
-						consecutiveFailures, err)
-				}
-			} else {
-				if consecutiveFailures > 0 {
-					ticker.Reset(baseInterval)
-				}
-				consecutiveFailures = 0
+				// err reports the last per-peer failure observed this tick.
+				// Log sparsely: once per tick is fine since per-peer state
+				// throttles further attempts.
+				c.logf("magicsock: SCION path refresh: %v", err)
 			}
 		}
 	}
@@ -2573,6 +2716,7 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 	defer cancel()
 
 	var lastErr error
+	anySuccess := false
 	for _, g := range groups {
 		if !g.needRefresh {
 			continue
@@ -2582,17 +2726,50 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 			continue
 		}
 
+		// Per-peer backoff gate: skip this peer if the last failure's
+		// backoff window has not yet elapsed. Isolates a failing peer's
+		// retry cadence from healthy peers on the same refresh tick.
+		c.mu.Lock()
+		b := c.scionRefreshByIA[g.peerIA]
+		skip := b != nil && !b.shouldAttempt(now)
+		c.mu.Unlock()
+		if skip {
+			continue
+		}
+
 		daemonPaths, err := sc.daemon.Paths(ctx, g.peerIA, sc.localIA, daemontypes.PathReqFlags{Refresh: true})
 		if err != nil || len(daemonPaths) == 0 {
 			metricSCIONPathRefreshError.Add(1)
-			c.logf("magicsock: SCION path refresh for %s failed: %v", g.peerIA, err)
-			if err != nil {
-				lastErr = err
-			} else {
-				lastErr = fmt.Errorf("no paths to %s", g.peerIA)
+			if err == nil {
+				err = fmt.Errorf("no paths to %s", g.peerIA)
 			}
+			c.logf("magicsock: SCION path refresh for %s failed: %v", g.peerIA, err)
+			lastErr = err
+			// Record failure in per-peer backoff. Future ticks consult
+			// scionRefreshByIA[g.peerIA].shouldAttempt before re-querying,
+			// so a bad peer's failures do not delay refresh for good peers.
+			c.mu.Lock()
+			if c.scionRefreshByIA == nil {
+				c.scionRefreshByIA = make(map[addr.IA]*scionRefreshBackoff)
+			}
+			if c.scionRefreshByIA[g.peerIA] == nil {
+				c.scionRefreshByIA[g.peerIA] = &scionRefreshBackoff{}
+			}
+			c.scionRefreshByIA[g.peerIA].recordFailure(time.Now(), err, scionRefreshBaseInterval, scionRefreshMaxBackoff)
+			c.mu.Unlock()
 			continue
 		}
+		// Success: clear any prior backoff state for this peer.
+		c.mu.Lock()
+		if c.scionRefreshByIA == nil {
+			c.scionRefreshByIA = make(map[addr.IA]*scionRefreshBackoff)
+		}
+		if c.scionRefreshByIA[g.peerIA] == nil {
+			c.scionRefreshByIA[g.peerIA] = &scionRefreshBackoff{}
+		}
+		c.scionRefreshByIA[g.peerIA].recordSuccess(time.Now(), scionRefreshBaseInterval)
+		c.mu.Unlock()
+		anySuccess = true
 
 		// Index daemon paths by fingerprint for matching.
 		type daemonPathEntry struct {
@@ -2724,7 +2901,15 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		}
 		c.mu.Lock()
 		lastSoft := c.scionSoftRefreshAt[g.peerIA]
+		// Honor per-peer refresh backoff: if hard-refresh is backing off for
+		// this peer (e.g. daemon reports TRC missing), don't hit the daemon
+		// every 5 min for the same peer via soft-refresh either.
+		b := c.scionRefreshByIA[g.peerIA]
+		inBackoff := b != nil && !b.shouldAttempt(now)
 		c.mu.Unlock()
+		if inBackoff {
+			continue
+		}
 		if !lastSoft.IsZero() && now.Sub(lastSoft) < softRefreshInterval {
 			continue
 		}
@@ -2782,15 +2967,24 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 		c.mu.Unlock()
 	}
 
-	// Opportunistic GC: prune scionSoftRefreshAt entries whose peerIA no
-	// longer has any registered paths. groups was built from the current
-	// scionPaths snapshot; anything not present has been fully unregistered
-	// (all its paths evicted) and the timestamp entry is dead weight.
+	// Opportunistic GC: prune scionSoftRefreshAt and scionRefreshByIA
+	// entries whose peerIA no longer has any registered paths. groups was
+	// built from the current scionPaths snapshot; anything not present has
+	// been fully unregistered (all its paths evicted) and the accompanying
+	// metadata entries are dead weight.
 	c.mu.Lock()
 	for ia := range c.scionSoftRefreshAt {
 		if _, live := groups[ia]; !live {
 			delete(c.scionSoftRefreshAt, ia)
 		}
+	}
+	for ia := range c.scionRefreshByIA {
+		if _, live := groups[ia]; !live {
+			delete(c.scionRefreshByIA, ia)
+		}
+	}
+	if anySuccess {
+		c.scionRefreshLastSuccess = time.Now()
 	}
 	c.mu.Unlock()
 
@@ -2812,29 +3006,22 @@ func (c *Conn) addNewSCIONPathsForPeer(peerIA addr.IA, hostAddr netip.AddrPort, 
 	c.mu.Lock()
 	var newKeys []scionPathKey
 	for _, p := range paths {
-		md := p.Metadata()
-		var expiry time.Time
-		var mtu uint16
-		if md != nil {
-			expiry = md.Expiry
-			mtu = md.MTU
-		}
 		var fp snet.PathFingerprint
-		if md != nil {
+		if md := p.Metadata(); md != nil {
 			fp = md.Fingerprint()
 		}
-		pi := &scionPathInfo{
-			peerIA:      peerIA,
-			hostAddr:    hostAddr,
-			fingerprint: fp,
-			path:        p,
-			expiry:      expiry,
-			mtu:         mtu,
+		// Route through upsertSCIONPathLocked so that if the same
+		// fingerprint is already registered for this peer (e.g. a
+		// concurrent discovery registered it), we update the existing
+		// entry in place instead of orphaning it. upsert preserves the
+		// scionPathsByFP reverse-index invariant; a direct
+		// registerSCIONPath here would leave the old entry indexed but
+		// no longer reachable as (peerIA, fp) since the index would now
+		// point at the new key.
+		k, _, collision := c.upsertSCIONPathLocked(sc, peerIA, hostAddr, p, fp)
+		if collision {
+			continue
 		}
-		pi.buildCachedDst()
-		pi.buildDisplayStr()
-		pi.fastPath = buildSCIONFastPath(sc, pi)
-		k := c.registerSCIONPath(pi)
 		newKeys = append(newKeys, k)
 	}
 
@@ -3046,9 +3233,55 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 	newKeys, err := de.c.discoverSCIONPaths(ctx, peerIA, hostAddr)
 	if err != nil {
 		metricSCIONPathDiscoveryError.Add(1)
-		de.c.logf("magicsock: SCION path discovery for %s failed: %v", peerIA, err)
+		// Rate-limit the log to one line per peer per
+		// scionDiscoveryLogInterval. The error itself is always recorded
+		// on scionState (and surfaced via /scion-status and
+		// PeerStatus.SCION.LastDiscoveryError) — it's just the log line
+		// that's throttled, so journalctl doesn't fill with repeats of
+		// the same "TRC not found" message for a permanently-broken peer.
+		de.c.mu.Lock()
+		last := de.c.scionDiscoveryLogAt[peerIA]
+		shouldLog := last.IsZero() || time.Since(last) >= scionDiscoveryLogInterval
+		if shouldLog {
+			if de.c.scionDiscoveryLogAt == nil {
+				de.c.scionDiscoveryLogAt = make(map[scionIAKey]time.Time)
+			}
+			de.c.scionDiscoveryLogAt[peerIA] = time.Now()
+		}
+		de.c.mu.Unlock()
+		if shouldLog {
+			de.c.logf("magicsock: SCION path discovery for %s failed: %v", peerIA, err)
+		}
+		// Record the error on per-endpoint state so it surfaces via
+		// PeerStatus.SCION.LastDiscoveryError (tailscale status --json).
+		// Operators can then see "peer advertises SCION but discovery is
+		// failing with TRC not found" without reading logs. Also stash
+		// the classified kind for typed consumers (Phase 5).
+		errKind := classifySCIONDiscoveryErr(err)
+		de.mu.Lock()
+		if de.scionState != nil {
+			de.scionState.lastDiscoveryError = err.Error()
+			de.scionState.lastDiscoveryErrorAt = time.Now()
+			de.scionState.lastDiscoveryErrorKind = errKind
+		}
+		de.mu.Unlock()
 		return
 	}
+	// Successful discovery: clear any stale error so status reflects the
+	// current state, not a prior transient failure.
+	de.mu.Lock()
+	if de.scionState != nil {
+		de.scionState.lastDiscoveryError = ""
+		de.scionState.lastDiscoveryErrorAt = time.Time{}
+		de.scionState.lastDiscoveryErrorKind = scionErrOther
+	}
+	de.mu.Unlock()
+	// Also clear the per-peer log-throttle timestamp so the next failure
+	// (if any) logs promptly rather than being silently throttled from a
+	// prior bad window.
+	de.c.mu.Lock()
+	delete(de.c.scionDiscoveryLogAt, peerIA)
+	de.c.mu.Unlock()
 
 	// Build set of new keys for fast lookup.
 	newKeySet := make(map[scionPathKey]bool, len(newKeys))
@@ -3252,6 +3485,56 @@ func (c *Conn) SCIONLastConnectError() (msg string, when time.Time) {
 	return info.Err, info.When
 }
 
+// SCIONRefreshBackoffSnapshot is the per-peer refresh backoff view exposed
+// to the localapi /scion-status endpoint (Phase 4b). All timestamps are
+// wall-clock UTC, RFC3339-encoded at the handler layer.
+type SCIONRefreshBackoffSnapshot struct {
+	IA                  string
+	ConsecutiveFailures int
+	NextAttemptAt       time.Time
+	LastError           string
+	LastErrorAt         time.Time
+	// LastErrorKind is the typed classification of LastError (Phase 5).
+	// Empty string for unclassified ("other") errors. See
+	// scionDiscoveryErrorKind.String for the vocabulary.
+	LastErrorKind string
+}
+
+// SCIONRefreshStatus returns a snapshot of the refresh-health state: the
+// most recent successful-refresh timestamp, and per-peer backoff entries
+// for any peer whose refresh has failed recently. Empty map and zero
+// timestamp if refresh has never run (e.g. SCION not connected yet).
+// Returns copies of internal state so callers can iterate without
+// holding c.mu.
+func (c *Conn) SCIONRefreshStatus() (lastSuccessAt time.Time, perPeer []SCIONRefreshBackoffSnapshot) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lastSuccessAt = c.scionRefreshLastSuccess
+	if len(c.scionRefreshByIA) == 0 {
+		return lastSuccessAt, nil
+	}
+	perPeer = make([]SCIONRefreshBackoffSnapshot, 0, len(c.scionRefreshByIA))
+	for ia, b := range c.scionRefreshByIA {
+		if b == nil {
+			continue
+		}
+		// Only surface entries that have actually failed; clean peers
+		// (ConsecutiveFailures=0, everything zero) are noise.
+		if b.consecutiveFailures == 0 && b.nextAttemptAt.IsZero() && b.lastError == "" {
+			continue
+		}
+		perPeer = append(perPeer, SCIONRefreshBackoffSnapshot{
+			IA:                  ia.String(),
+			ConsecutiveFailures: b.consecutiveFailures,
+			NextAttemptAt:       b.nextAttemptAt,
+			LastError:           b.lastError,
+			LastErrorAt:         b.lastErrorAt,
+			LastErrorKind:       b.lastErrorKind.String(),
+		})
+	}
+	return lastSuccessAt, perPeer
+}
+
 // recordSCIONConnectError stores err as the latest trySCIONConnect failure
 // and bumps metricSCIONConnectFailure. Passing nil clears the recorded
 // error — use after a successful connect so /scion-status stops reporting
@@ -3299,15 +3582,42 @@ type SCIONStatusInfo struct {
 	HasShim     bool // whether the dispatcher shim socket is active
 }
 
-// populateSCIONPathsLocked fills ps.SCIONPaths from de.scionState.
+// populateSCIONPathsLocked fills ps.SCIONPaths and ps.SCION from de.scionState.
 // de.mu must be held. c.mu must be held (caller is Conn.UpdateStatus).
+//
+// Populates ps.SCION whenever scionState is present (i.e. the peer has ever
+// advertised SCION), even if SCIONPaths is empty — so a peer that advertised
+// SCION but whose discovery keeps failing still shows up in
+// `tailscale status --json` with the failure reason. Phase 4a.
 func (de *endpoint) populateSCIONPathsLocked(ps *ipnstate.PeerStatus) {
 	// Don't report paths if SCION is disconnected - they're stale.
 	if de.c.pconnSCION.Load() == nil {
 		return
 	}
 	ss := de.scionState
-	if ss == nil || len(ss.paths) == 0 {
+	if ss == nil {
+		return
+	}
+
+	// Peer-level SCION state: always emitted when scionState exists, even
+	// if ss.paths is empty (discovery never ran, or always failed).
+	peerState := &ipnstate.SCIONPeerState{
+		PeerIA:   ss.peerIA.String(),
+		HostAddr: ss.hostAddr.String(),
+	}
+	if !ss.lastDiscoveryAt.IsZero() {
+		peerState.LastDiscoveryAt = ss.lastDiscoveryAt.UTC().Format(time.RFC3339)
+	}
+	if ss.lastDiscoveryError != "" {
+		peerState.LastDiscoveryError = ss.lastDiscoveryError
+		if !ss.lastDiscoveryErrorAt.IsZero() {
+			peerState.LastDiscoveryErrorAt = ss.lastDiscoveryErrorAt.UTC().Format(time.RFC3339)
+		}
+		peerState.LastDiscoveryErrorKind = ss.lastDiscoveryErrorKind.String()
+	}
+	ps.SCION = peerState
+
+	if len(ss.paths) == 0 {
 		return
 	}
 	ps.SCIONPaths = make([]ipnstate.SCIONPathInfo, 0, len(ss.paths))

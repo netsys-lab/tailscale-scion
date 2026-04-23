@@ -304,12 +304,23 @@ func (de *endpoint) demoteSCIONPathLocked(demotedKey scionPathKey) {
 	} else {
 		// No healthy SCION paths remain. Clear SCION bestAddr to fall back
 		// and proactively trigger a full ping round to quickly find direct
-		// UDP paths rather than waiting for the next natural cycle.
+		// UDP paths rather than waiting for the next natural cycle. Also
+		// kick an async SCION rediscovery (Phase 2): if the failure was
+		// transient (brief network blip, simultaneous segment expiry), a
+		// fresh daemon query may return usable paths well before the next
+		// periodic refresh tick. discoverSCIONPathAsync CAS-guards and
+		// throttles to 5 s so repeated demotions coalesce.
+		peerIA := de.scionState.peerIA
+		hostAddr := de.scionState.hostAddr
 		de.scionState.activePath = 0
 		if de.bestAddr.isSCION() {
-			de.c.logf("magicsock: no healthy SCION paths for %v, clearing bestAddr and triggering full ping", de.publicKey.ShortString())
+			de.c.logf("magicsock: no healthy SCION paths for %v, clearing bestAddr and triggering full ping + rediscovery", de.publicKey.ShortString())
 			de.clearBestAddrLocked()
 			de.sendDiscoPingsLocked(mono.Now(), true)
+			// `go`, not sync: discoverSCIONPathAsync re-acquires de.mu,
+			// which the caller still holds here. CAS in that function
+			// coalesces with other rediscovery triggers.
+			go de.discoverSCIONPathAsync(peerIA, hostAddr)
 		}
 	}
 }

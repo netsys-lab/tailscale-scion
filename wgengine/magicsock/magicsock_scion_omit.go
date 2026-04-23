@@ -57,6 +57,7 @@ type scionAddrKey struct{}
 type scionPathFPKey struct{}
 type scionEndpointState struct{}
 type scionIAKey = uint64
+type scionRefreshBackoff struct{}
 
 const scionWireMTU = tstun.WireMTU(1280)
 
@@ -94,6 +95,12 @@ func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) { return tailcfg.Se
 func (c *Conn) ReconfigureSCION(_ SCIONConfig)                             {}
 func (c *Conn) SCIONStatus() (connected bool, localIA string)              { return false, "" }
 func (c *Conn) SCIONLastConnectError() (msg string, when time.Time)        { return "", time.Time{} }
+
+type SCIONRefreshBackoffSnapshot struct{}
+
+func (c *Conn) SCIONRefreshStatus() (time.Time, []SCIONRefreshBackoffSnapshot) {
+	return time.Time{}, nil
+}
 
 // Stub standalone functions used by betterAddr in endpoint.go.
 

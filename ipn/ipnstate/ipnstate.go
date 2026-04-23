@@ -176,6 +176,35 @@ type TailnetStatus struct {
 	MagicDNSEnabled bool
 }
 
+// SCIONPeerState describes peer-level SCION state that is orthogonal to
+// per-path data. Populated on any SCION-advertising peer even when SCIONPaths
+// is empty, so operators can see why: "peer advertised SCION, but discovery
+// keeps failing with TRC not found" is a very different situation from "peer
+// never advertised SCION" — and both used to look the same in the JSON output.
+type SCIONPeerState struct {
+	// PeerIA is the peer's ISD-AS (e.g. "19-ffaa:1:120a") as advertised in
+	// Hostinfo.Services. Empty if no SCION advertisement has been seen.
+	PeerIA string `json:"PeerIA,omitempty"`
+	// HostAddr is the peer's SCION underlay host:port as advertised.
+	HostAddr string `json:"HostAddr,omitempty"`
+	// LastDiscoveryAt is the RFC3339 timestamp of the most recent path
+	// discovery attempt for this peer (successful or not). Empty if no
+	// discovery has run.
+	LastDiscoveryAt string `json:"LastDiscoveryAt,omitempty"`
+	// LastDiscoveryError is the error string from the most recent failed
+	// discovery attempt. Cleared on the next successful discovery. Empty
+	// string when the last attempt succeeded.
+	LastDiscoveryError string `json:"LastDiscoveryError,omitempty"`
+	// LastDiscoveryErrorAt is when LastDiscoveryError was recorded (RFC3339).
+	LastDiscoveryErrorAt string `json:"LastDiscoveryErrorAt,omitempty"`
+	// LastDiscoveryErrorKind is a short stable classification of
+	// LastDiscoveryError: "trc-missing" | "no-segments" |
+	// "daemon-unreachable" | "" (other/unclassified). Heuristic — clients
+	// MUST treat LastDiscoveryError as the source of truth for display;
+	// use this field only for typed bucketing (metrics, conditional UX).
+	LastDiscoveryErrorKind string `json:"LastDiscoveryErrorKind,omitempty"`
+}
+
 // SCIONPathInfo describes a SCION path to a peer.
 type SCIONPathInfo struct {
 	Path      string  `json:"Path"`
@@ -278,6 +307,12 @@ type PeerStatus struct {
 	PeerRelay string // peer relay address (ip:port:vni)
 
 	SCIONPaths []SCIONPathInfo `json:"SCIONPaths,omitempty"`
+	// SCION captures peer-level SCION diagnostic state: advertised peerIA/
+	// hostAddr and last-discovery-attempt info. Non-nil whenever the peer
+	// has ever advertised SCION, regardless of whether discovery has ever
+	// succeeded, so operators can diagnose "advertised but unreachable"
+	// (typically TRC missing for the peer's ISD) without journalctl.
+	SCION *SCIONPeerState `json:"SCION,omitempty"`
 
 	RxBytes        int64
 	TxBytes        int64
@@ -570,6 +605,9 @@ func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	}
 	if v := st.SCIONPaths; v != nil {
 		e.SCIONPaths = v
+	}
+	if v := st.SCION; v != nil {
+		e.SCION = v
 	}
 	e.Location = st.Location
 }
