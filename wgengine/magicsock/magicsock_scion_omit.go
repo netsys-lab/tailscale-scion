@@ -54,6 +54,7 @@ type scionPathInfo struct{}
 func (pi *scionPathInfo) String() string { return "" }
 
 type scionAddrKey struct{}
+type scionPathFPKey struct{}
 type scionEndpointState struct{}
 type scionIAKey = uint64
 

@@ -1165,6 +1165,12 @@ func (c *Conn) sendSCIONBatch(addr epAddr, buffs [][]byte, offset int) (sent boo
 	expired := !pi.expiry.IsZero() && now.Add(scionExpiryGuard).After(pi.expiry)
 	pi.mu.Unlock()
 	if expired {
+		// Kick an async rediscovery for this peer so fresh paths arrive
+		// before the next scheduled refresh tick (which may be minutes
+		// away under backoff). CAS + 5s-throttle inside
+		// discoverSCIONPathAsync coalesces bursts from many expired-send
+		// callers into at most one discovery round per peer.
+		c.kickSCIONPathRediscoveryForKey(addr.scionKey)
 		return false, fmt.Errorf("SCION path expired for key %d", addr.scionKey)
 	}
 	// If the captured fastPath predates the current pi.generation (a path
@@ -1301,6 +1307,7 @@ func (c *Conn) sendSCION(sk scionPathKey, b []byte) (bool, error) {
 	expired := !pi.expiry.IsZero() && time.Now().Add(scionExpiryGuard).After(pi.expiry)
 	pi.mu.Unlock()
 	if expired {
+		c.kickSCIONPathRediscoveryForKey(sk)
 		return false, fmt.Errorf("SCION path expired for key %d", sk)
 	}
 	_, err := sc.writeTo(b, pi)
@@ -1417,6 +1424,129 @@ func (c *Conn) registerSCIONPathLocking(pi *scionPathInfo) scionPathKey {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.registerSCIONPath(pi)
+}
+
+// kickSCIONPathRediscoveryForKey schedules an asynchronous SCION path
+// rediscovery for the peer owning the given scionPathKey. Called from
+// send-time expiry detection so a peer with all-paths-about-to-expire
+// doesn't have to wait for the next periodic refresh tick (up to 30 s,
+// or longer under backoff) to get fresh paths.
+//
+// Safe for concurrent use. Takes c.mu briefly to resolve (peerIA, hostAddr,
+// endpoint) from the scionPathKey. The actual rediscovery goroutine is
+// CAS-guarded and 5s-throttled inside discoverSCIONPathAsync, so bursts
+// of expired-send callers for the same peer coalesce into at most one
+// discovery round.
+func (c *Conn) kickSCIONPathRediscoveryForKey(k scionPathKey) {
+	c.mu.Lock()
+	pi := c.scionPaths[k]
+	if pi == nil {
+		c.mu.Unlock()
+		return
+	}
+	peerIA := pi.peerIA
+	hostAddr := pi.hostAddr
+	scionEp := epAddr{ap: hostAddr, scionKey: k}
+	peerInf := c.peerMap.byEpAddr[scionEp]
+	c.mu.Unlock()
+	if peerInf == nil || peerInf.ep == nil {
+		return
+	}
+	go peerInf.ep.discoverSCIONPathAsync(peerIA, hostAddr)
+}
+
+// upsertSCIONPathLocked either updates an existing scionPathInfo for
+// (peerIA, fp) in place or registers a new one. Returns the scionPathKey,
+// whether the entry was freshly registered (vs updated in place), and whether
+// a fingerprint collision was detected (two topologically distinct paths
+// colliding on the same truncated fingerprint hash).
+//
+// If fp is set and already in the reverse index for peerIA, the existing
+// entry is updated in place: same scionPathKey, pi.generation bumped,
+// fastPath template rebuilt. This is the key-stability guarantee for the
+// common "re-signed segment, same topology" refresh case.
+//
+// If the existing entry's hop count differs from the new path's hop count,
+// it's a collision: metricSCIONFingerprintCollision is incremented, the
+// existing entry is left untouched, and the caller should skip this path
+// (the returned key is the existing one but registered=false,collision=true).
+//
+// c.mu must be held. sc must be non-nil.
+func (c *Conn) upsertSCIONPathLocked(
+	sc *scionConn,
+	peerIA addr.IA,
+	hostAddr netip.AddrPort,
+	path snet.Path,
+	fp snet.PathFingerprint,
+) (k scionPathKey, registered, collision bool) {
+	if fp != "" {
+		fpk := scionPathFPKey{ia: peerIA, fp: fp}
+		if existing, ok := c.scionPathsByFP[fpk]; ok {
+			pi := c.scionPaths[existing]
+			if pi == nil {
+				// Stale reverse-index entry (should not happen; indicates a
+				// bug where scionPaths was mutated without updating the
+				// index). Clean up and fall through to fresh registration.
+				delete(c.scionPathsByFP, fpk)
+			} else {
+				newHops := 0
+				if md := path.Metadata(); md != nil {
+					newHops = len(md.Interfaces)
+				}
+				pi.mu.Lock()
+				oldHops := 0
+				if pi.path != nil {
+					if md := pi.path.Metadata(); md != nil {
+						oldHops = len(md.Interfaces)
+					}
+				}
+				if oldHops != newHops {
+					// Hop-count differs despite fingerprint match → treat as
+					// a hash collision. Leave the existing entry untouched;
+					// the caller should skip this path rather than stomping
+					// over probed latency history.
+					pi.mu.Unlock()
+					metricSCIONFingerprintCollision.Add(1)
+					return existing, false, true
+				}
+				var expiry time.Time
+				var mtu uint16
+				if md := path.Metadata(); md != nil {
+					expiry = md.Expiry
+					mtu = md.MTU
+				}
+				pi.refreshMissCount = 0
+				pi.path = path
+				pi.expiry = expiry
+				pi.mtu = mtu
+				pi.buildCachedDst() // bumps pi.generation
+				pi.buildDisplayStr()
+				pi.fastPath = buildSCIONFastPath(sc, pi)
+				pi.mu.Unlock()
+				return existing, false, false
+			}
+		}
+	}
+	// Not in registry (or empty fingerprint): register fresh.
+	var expiry time.Time
+	var mtu uint16
+	if md := path.Metadata(); md != nil {
+		expiry = md.Expiry
+		mtu = md.MTU
+	}
+	pi := &scionPathInfo{
+		peerIA:      peerIA,
+		hostAddr:    hostAddr,
+		fingerprint: fp,
+		path:        path,
+		expiry:      expiry,
+		mtu:         mtu,
+	}
+	pi.buildCachedDst()
+	pi.buildDisplayStr()
+	pi.fastPath = buildSCIONFastPath(sc, pi)
+	k = c.registerSCIONPath(pi)
+	return k, true, false
 }
 
 // unregisterSCIONPath removes a SCION path entry and its peerMap entry.
@@ -2150,38 +2280,29 @@ func (c *Conn) discoverSCIONPaths(ctx context.Context, peerIA addr.IA, hostAddr 
 	maxPaths := scionMaxProbePaths()
 	unique = selectDiversePaths(unique, maxPaths)
 
-	// Build path info structs outside c.mu to avoid holding the lock
-	// during gopacket serialization in buildSCIONFastPath.
-	infos := make([]*scionPathInfo, 0, len(unique))
-	for _, u := range unique {
-		var expiry time.Time
-		var mtu uint16
-		if md := u.path.Metadata(); md != nil {
-			expiry = md.Expiry
-			mtu = md.MTU
-		}
-		pi := &scionPathInfo{
-			peerIA:      peerIA,
-			hostAddr:    hostAddr,
-			fingerprint: u.fingerprint,
-			path:        u.path,
-			expiry:      expiry,
-			mtu:         mtu,
-		}
-		pi.buildCachedDst()
-		pi.buildDisplayStr()
-		// sc was non-nil at the top of discoverSCIONPaths (line above
-		// 2154) and is not reassigned in this scope.
-		pi.fastPath = buildSCIONFastPath(sc, pi)
-		infos = append(infos, pi)
-	}
-
-	// Register paths under c.mu — only map insertions, no heavy work.
+	// Upsert under c.mu. upsertSCIONPathLocked reuses existing scionPathKey
+	// when (peerIA, fingerprint) is already registered, preserving key
+	// identity across rediscovery for paths whose topology hasn't changed.
+	// This is the key-stability guarantee that lets endpoint-level
+	// scionState.paths[] entries survive a rediscovery when their
+	// fingerprint is still present in the daemon response.
+	//
+	// buildSCIONFastPath (gopacket serialization) runs under c.mu here.
+	// discoverSCIONPaths is called on demand (peer joins netmap,
+	// all-paths-unhealthy demote, send-time expiry) at human timescales,
+	// not on a hot path, so the lock hold time is acceptable.
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	keys := make([]scionPathKey, 0, len(infos))
-	for _, pi := range infos {
-		keys = append(keys, c.registerSCIONPath(pi))
+	keys := make([]scionPathKey, 0, len(unique))
+	for _, u := range unique {
+		k, _, collision := c.upsertSCIONPathLocked(sc, peerIA, hostAddr, u.path, u.fingerprint)
+		if collision {
+			// Existing path with same fingerprint but different hop count
+			// was kept; skip this daemon path. Logged/counted inside
+			// upsertSCIONPathLocked via metricSCIONFingerprintCollision.
+			continue
+		}
+		keys = append(keys, k)
 	}
 	// Set the first (lowest-latency) path as active for the reverse index.
 	if len(keys) > 0 {
@@ -2535,7 +2656,30 @@ func (c *Conn) refreshSCIONPathsOnce() error {
 				matched = bestDaemon
 			}
 
+			// Hop-count collision guard: if the fingerprint matches but the
+			// hop count differs, treat as a truncated-hash collision rather
+			// than a legitimate re-signing. Leave the existing entry
+			// untouched so probed latency/health history isn't
+			// contaminated by an unrelated topology. Discovery already
+			// guards on the probe-state side (endpoint_scion.go); this
+			// mirrors it on the Conn-registry side so the two paths are
+			// symmetric, per the Phase 1a reconciler design.
+			matchedHops := 0
+			if md := matched.Metadata(); md != nil {
+				matchedHops = len(md.Interfaces)
+			}
 			pi.mu.Lock()
+			existingHops := 0
+			if pi.path != nil {
+				if md := pi.path.Metadata(); md != nil {
+					existingHops = len(md.Interfaces)
+				}
+			}
+			if fp != "" && existingHops != matchedHops {
+				pi.mu.Unlock()
+				metricSCIONFingerprintCollision.Add(1)
+				continue
+			}
 			pi.refreshMissCount = 0
 			pi.path = matched
 			if md := matched.Metadata(); md != nil {
