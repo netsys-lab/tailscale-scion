@@ -144,6 +144,17 @@ type scionAddrKey struct {
 	addr netip.AddrPort
 }
 
+// scionPathFPKey is a comparable key for the reverse index from
+// (peer IA, path fingerprint) to scionPathKey. The fingerprint is SCION's
+// stable topological identity — same interface sequence ⇒ same fingerprint —
+// so this index lets the reconciler find the existing scionPathInfo when
+// the daemon returns a re-signed (same-topology, later-expiry) path without
+// accidentally minting a fresh scionPathKey and churning endpoint state.
+type scionPathFPKey struct {
+	ia addr.IA
+	fp snet.PathFingerprint
+}
+
 // scionPathInfo holds the full SCION path information for a peer, indexed by
 // scionPathKey. The actual SCION address and path data live here rather than
 // in epAddr to keep epAddr comparable and small.
@@ -1375,12 +1386,23 @@ func (c *Conn) lookupSCIONPathLocking(k scionPathKey) *scionPathInfo {
 
 // registerSCIONPath stores a scionPathInfo and returns a key for it.
 // c.mu must be held.
+//
+// If pi.fingerprint is set, the (peerIA, fingerprint) reverse index is
+// populated. Callers that upsert paths should check scionPathsByFP first
+// and update the existing entry in place rather than calling this function,
+// to preserve key stability across refresh. See reconcileSCIONPathsLocked.
 func (c *Conn) registerSCIONPath(pi *scionPathInfo) scionPathKey {
 	k := scionPathKey(c.scionPathSeq.Add(1))
 	if c.scionPaths == nil {
 		c.scionPaths = make(map[scionPathKey]*scionPathInfo)
 	}
 	c.scionPaths[k] = pi
+	if pi.fingerprint != "" {
+		if c.scionPathsByFP == nil {
+			c.scionPathsByFP = make(map[scionPathFPKey]scionPathKey)
+		}
+		c.scionPathsByFP[scionPathFPKey{ia: pi.peerIA, fp: pi.fingerprint}] = k
+	}
 	metricSCIONPathsRegistered.Add(1)
 	metricSCIONPathsLive.Set(int64(len(c.scionPaths)))
 	// Don't unconditionally overwrite scionPathsByAddr here — with multi-path,
@@ -1419,6 +1441,12 @@ func (c *Conn) unregisterSCIONPath(k scionPathKey) {
 	ak := scionAddrKey{ia: pi.peerIA, addr: pi.hostAddr}
 	if c.scionPathsByAddr[ak] == k {
 		delete(c.scionPathsByAddr, ak)
+	}
+	if pi.fingerprint != "" {
+		fpk := scionPathFPKey{ia: pi.peerIA, fp: pi.fingerprint}
+		if c.scionPathsByFP[fpk] == k {
+			delete(c.scionPathsByFP, fpk)
+		}
 	}
 	// Remove stale peerMap entry for this scionKey.
 	scionEp := epAddr{ap: pi.hostAddr, scionKey: k}

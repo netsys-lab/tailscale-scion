@@ -434,9 +434,10 @@ type Conn struct {
 	// scionPathKey. Each entry holds the full SCION address and path
 	// data for a peer.
 	scionPaths         map[scionPathKey]*scionPathInfo
-	scionPathsByAddr   map[scionAddrKey]scionPathKey // reverse index for O(1) lookup
-	scionPathSeq       atomic.Uint64                 // monotonic key generator for scionPaths (never wraps in practice)
-	scionSoftRefreshAt map[scionIAKey]time.Time       // last soft refresh per peer, guarded by c.mu; bounded by unique peer count
+	scionPathsByAddr   map[scionAddrKey]scionPathKey   // reverse index for O(1) lookup
+	scionPathsByFP     map[scionPathFPKey]scionPathKey // reverse index by (peerIA, pathFingerprint); used by reconciler
+	scionPathSeq       atomic.Uint64                   // monotonic key generator for scionPaths (never wraps in practice)
+	scionSoftRefreshAt map[scionIAKey]time.Time        // last soft refresh per peer, guarded by c.mu; bounded by unique peer count
 
 	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
 	// Used by receiveSCION to detect a dead socket and trigger reconnection.
