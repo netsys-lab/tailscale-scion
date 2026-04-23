@@ -19,6 +19,9 @@ import (
 // do not spawn parallel retries.
 // c.mu must be held.
 func (c *Conn) initSCIONLocked(ctx context.Context) {
+	if scionDisabled() {
+		return
+	}
 	if c.pconnSCION.Load() != nil {
 		return
 	}
@@ -73,6 +76,10 @@ func (c *Conn) retrySCIONStartup(ctx context.Context) {
 		case <-c.donec:
 			return
 		case <-time.After(sleep):
+		}
+		if scionDisabled() {
+			// User turned SCION off while a retry loop was in flight; bail.
+			return
 		}
 		if c.pconnSCION.Load() != nil {
 			// Another code path (reconnectSCION, ReconfigureSCION) got there

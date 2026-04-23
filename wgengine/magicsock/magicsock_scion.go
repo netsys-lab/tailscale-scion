@@ -57,6 +57,13 @@ var debugSCIONPreference = envknob.RegisterInt("TS_SCION_PREFERENCE")
 // Other paths are only used if no SCION path is available.
 var preferSCION = envknob.RegisterBool("TS_PREFER_SCION")
 
+// scionDisabled reports whether TS_SCION_DISABLED=1 is set, which suppresses
+// all SCION connection attempts. Default off for backward compatibility —
+// Linux tailscaled users who don't set the var keep getting SCION init as
+// before. Android sets it to "1" when the user turns SCION off in settings
+// so magicsock skips the bootstrap attempt and the background retry loop.
+var scionDisabled = envknob.RegisterBool("TS_SCION_DISABLED")
+
 // scionDispatcherPort is the legacy SCION dispatcher port. Older deployments
 // redirect all SCION traffic to this port instead of delivering to application
 // ports directly.
@@ -3662,6 +3669,14 @@ func (c *Conn) RefreshSCION() {
 // If enabled, updates envknobs, closes any existing connection, and
 // triggers a fresh reconnection attempt.
 func (c *Conn) ReconfigureSCION(cfg SCIONConfig) {
+	// Mirror the user's enable choice into the gating env var so that any
+	// subsequent rebind-triggered initSCIONLocked and any in-flight
+	// retrySCIONStartup see the intended state.
+	if cfg.Enabled {
+		envknob.Setenv("TS_SCION_DISABLED", "")
+	} else {
+		envknob.Setenv("TS_SCION_DISABLED", "1")
+	}
 	if !cfg.Enabled {
 		c.mu.Lock()
 		c.closeSCIONLocked()
