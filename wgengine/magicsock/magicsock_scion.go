@@ -3475,6 +3475,28 @@ var errNoSCION = fmt.Errorf("SCION not available")
 
 const discoRXPathSCION discoRXPath = "SCION"
 
+// RefreshSCION re-triggers SCION path discovery for every peer without
+// tearing down the SCION socket. Called when the IPN engine transitions
+// from a non-Running state back to Running: the peer map and per-endpoint
+// scionState survive the disconnect, but their paths may have gone stale
+// (path expiry, idle peerings), and nothing else in the SetNetworkMap
+// path re-runs discovery when the netmap hasn't structurally changed.
+//
+// If the SCION socket is up, this is a cheap "rediscover + catch up any
+// peers that were skipped" pass. If the socket is down, it ensures a
+// startup retry is in flight; retrySCIONStartup itself calls
+// discoverNewSCIONPeers on success. No-op when SCION is disabled.
+func (c *Conn) RefreshSCION() {
+	if c.pconnSCION.Load() == nil {
+		if c.scionStartupRetryActive.CompareAndSwap(false, true) {
+			go c.retrySCIONStartup(c.connCtx)
+		}
+		return
+	}
+	c.rediscoverAllSCIONPaths()
+	c.discoverNewSCIONPeers()
+}
+
 // ReconfigureSCION updates SCION configuration at runtime.
 // If disabled, closes the current SCION connection.
 // If enabled, updates envknobs, closes any existing connection, and

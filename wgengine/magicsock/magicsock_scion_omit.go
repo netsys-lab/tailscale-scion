@@ -92,6 +92,7 @@ func (de *endpoint) populateSCIONPathsLocked(_ *ipnstate.PeerStatus)            
 // SCIONService returns false when SCION is omitted.
 func (c *Conn) SCIONService() (svc tailcfg.Service, ok bool) { return tailcfg.Service{}, false }
 
+func (c *Conn) RefreshSCION()                                              {}
 func (c *Conn) ReconfigureSCION(_ SCIONConfig)                             {}
 func (c *Conn) SCIONStatus() (connected bool, localIA string)              { return false, "" }
 func (c *Conn) SCIONLastConnectError() (msg string, when time.Time)        { return "", time.Time{} }

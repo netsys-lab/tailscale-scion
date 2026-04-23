@@ -5739,6 +5739,15 @@ func (b *LocalBackend) enterStateLocked(newState ipn.State) {
 		// necessary and add unit tests to cover those cases, or remove it.
 		if oldState != ipn.Running {
 			b.resetAuthURLLocked()
+			// Re-trigger SCION path discovery after a stop→start cycle.
+			// The peer map and scionState survive the disconnect, so nothing
+			// in the SetNetworkMap path re-runs discovery when peers haven't
+			// structurally changed; paths registered before the stop may have
+			// expired or be attached to a stale peering. Without this the
+			// user has to toggle "prefer SCION" off/on to kick rediscovery.
+			if ms, ok := b.sys.MagicSock.GetOK(); ok {
+				ms.RefreshSCION()
+			}
 		}
 
 		// Start a captive portal detection loop if none has been
