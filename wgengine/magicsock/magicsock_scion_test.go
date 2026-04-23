@@ -3185,6 +3185,82 @@ func TestUpsertSCIONPathLocked_StableReSignPreservesKey(t *testing.T) {
 	}
 }
 
+// TestUpsertSCIONPathLocked_SameIADifferentHostDoesNotCollide (Phase 2c)
+// verifies the fix for the same-IA-different-hostAddr collision bug.
+//
+// Before the fix, scionPathFPKey was keyed on (peerIA, fingerprint) only.
+// Two Tailscale peers in the same SCION AS with different underlay addrs
+// share a topological path fingerprint — `daemon.Paths` returns paths
+// per-IA. The second upsert would find the first peer's entry in the
+// reverse index and "update it in place", returning the first peer's key.
+// Both peers then resolved to one scionPathInfo with one hostAddr,
+// routing the second peer's outbound traffic to the wrong underlay.
+//
+// The fix keys scionPathFPKey on (peerIA, hostAddr, fingerprint). This
+// test locks in that contract: same IA + fingerprint but different
+// hostAddrs yield two distinct registry entries with their own hostAddrs.
+func TestUpsertSCIONPathLocked_SameIADifferentHostDoesNotCollide(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+	hostA := netip.MustParseAddrPort("192.168.20.175:32766")
+	hostB := netip.MustParseAddrPort("192.168.20.185:32767")
+
+	iface1 := snet.PathInterface{IA: localIA, ID: 1}
+	iface2 := snet.PathInterface{IA: peerIA, ID: 2}
+	md := &snet.PathMetadata{
+		Interfaces: []snet.PathInterface{iface1, iface2},
+		Expiry:     time.Now().Add(1 * time.Hour),
+		MTU:        1472,
+	}
+	// Two mock paths with the same topology → same fingerprint. This
+	// mirrors what the daemon returns when two hosts share an AS: the
+	// inter-AS route is the same regardless of which host you're reaching.
+	pathForA := newMockPathWithMetadata(ctrl, md)
+	pathForB := newMockPathWithMetadata(ctrl, md)
+	fp := pathForA.Metadata().Fingerprint()
+	if fp == "" || fp != pathForB.Metadata().Fingerprint() {
+		t.Fatalf("test setup: paths must share a non-empty fingerprint")
+	}
+
+	c := &Conn{connCtx: context.Background()}
+	c.logf = t.Logf
+	c.pconnSCION.Store(&scionConn{localIA: localIA})
+
+	c.mu.Lock()
+	kA, registeredA, collisionA := c.upsertSCIONPathLocked(c.pconnSCION.Load(), peerIA, hostA, pathForA, fp)
+	c.mu.Unlock()
+	if !registeredA || collisionA {
+		t.Fatalf("first upsert: registered=%v, collision=%v (want true, false)", registeredA, collisionA)
+	}
+
+	c.mu.Lock()
+	kB, registeredB, collisionB := c.upsertSCIONPathLocked(c.pconnSCION.Load(), peerIA, hostB, pathForB, fp)
+	c.mu.Unlock()
+	if !registeredB {
+		t.Fatalf("second upsert (different hostAddr): registered=%v; want true (two peers in same IA must get distinct entries)", registeredB)
+	}
+	if collisionB {
+		t.Fatalf("second upsert: collision=true unexpected; same topology to different hosts is not a hash collision")
+	}
+	if kA == kB {
+		t.Fatalf("second upsert returned key %d == first (%d); must be distinct (same-IA different-host bug)", kB, kA)
+	}
+
+	// Each key's pathInfo must carry its own hostAddr.
+	piA := c.lookupSCIONPathLocking(kA)
+	piB := c.lookupSCIONPathLocking(kB)
+	if piA == nil || piB == nil {
+		t.Fatalf("one or both pathInfos missing: piA=%v piB=%v", piA, piB)
+	}
+	if piA.hostAddr != hostA {
+		t.Errorf("piA.hostAddr = %v, want %v", piA.hostAddr, hostA)
+	}
+	if piB.hostAddr != hostB {
+		t.Errorf("piB.hostAddr = %v, want %v", piB.hostAddr, hostB)
+	}
+}
+
 // TestUpsertSCIONPathLocked_HopCountCollision verifies the fingerprint-
 // collision guard: if a daemon response yields the same fingerprint but a
 // different interface count as an already-registered entry, we treat it as

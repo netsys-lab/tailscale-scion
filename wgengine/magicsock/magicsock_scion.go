@@ -145,14 +145,23 @@ type scionAddrKey struct {
 }
 
 // scionPathFPKey is a comparable key for the reverse index from
-// (peer IA, path fingerprint) to scionPathKey. The fingerprint is SCION's
-// stable topological identity — same interface sequence ⇒ same fingerprint —
-// so this index lets the reconciler find the existing scionPathInfo when
-// the daemon returns a re-signed (same-topology, later-expiry) path without
-// accidentally minting a fresh scionPathKey and churning endpoint state.
+// (peer IA, peer host addr, path fingerprint) to scionPathKey. The
+// fingerprint is SCION's stable topological identity — same interface
+// sequence ⇒ same fingerprint — so this index lets the reconciler find
+// the existing scionPathInfo when the daemon returns a re-signed
+// (same-topology, later-expiry) path without accidentally minting a fresh
+// scionPathKey and churning endpoint state.
+//
+// hostAddr MUST be part of the key. SCION path segments are per-IA (the
+// daemon returns paths to an IA, not to a specific underlay host), so two
+// Tailscale peers in the same AS share a fingerprint despite having
+// different underlay addresses. Keying on (ia, fp) alone would collapse
+// them into one scionPathInfo, and the second peer's outbound traffic
+// would go to the first peer's hostAddr — a silent misroute.
 type scionPathFPKey struct {
-	ia addr.IA
-	fp snet.PathFingerprint
+	ia       addr.IA
+	hostAddr netip.AddrPort
+	fp       snet.PathFingerprint
 }
 
 // scionPathInfo holds the full SCION path information for a peer, indexed by
@@ -1565,7 +1574,7 @@ func (c *Conn) registerSCIONPath(pi *scionPathInfo) scionPathKey {
 		if c.scionPathsByFP == nil {
 			c.scionPathsByFP = make(map[scionPathFPKey]scionPathKey)
 		}
-		c.scionPathsByFP[scionPathFPKey{ia: pi.peerIA, fp: pi.fingerprint}] = k
+		c.scionPathsByFP[scionPathFPKey{ia: pi.peerIA, hostAddr: pi.hostAddr, fp: pi.fingerprint}] = k
 	}
 	metricSCIONPathsRegistered.Add(1)
 	metricSCIONPathsLive.Set(int64(len(c.scionPaths)))
@@ -1637,7 +1646,7 @@ func (c *Conn) upsertSCIONPathLocked(
 	fp snet.PathFingerprint,
 ) (k scionPathKey, registered, collision bool) {
 	if fp != "" {
-		fpk := scionPathFPKey{ia: peerIA, fp: fp}
+		fpk := scionPathFPKey{ia: peerIA, hostAddr: hostAddr, fp: fp}
 		if existing, ok := c.scionPathsByFP[fpk]; ok {
 			pi := c.scionPaths[existing]
 			if pi == nil {
@@ -1730,7 +1739,7 @@ func (c *Conn) unregisterSCIONPath(k scionPathKey) {
 		delete(c.scionPathsByAddr, ak)
 	}
 	if pi.fingerprint != "" {
-		fpk := scionPathFPKey{ia: pi.peerIA, fp: pi.fingerprint}
+		fpk := scionPathFPKey{ia: pi.peerIA, hostAddr: pi.hostAddr, fp: pi.fingerprint}
 		if c.scionPathsByFP[fpk] == k {
 			delete(c.scionPathsByFP, fpk)
 		}
