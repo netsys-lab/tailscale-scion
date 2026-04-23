@@ -36,6 +36,7 @@ func (c *Conn) initSCIONLocked(ctx context.Context) {
 	c.recordSCIONConnectError(nil)
 	c.signalSCIONConnReady()
 	go c.refreshSCIONPaths()
+	go c.scionColdRetryLoop()
 }
 
 // scionStartupRetrySleep returns the backoff sleep before the Nth SCION

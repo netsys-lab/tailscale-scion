@@ -324,6 +324,156 @@ const scionRefreshMaxBackoff = 2 * time.Minute
 // PeerStatus.SCION.LastDiscoveryError (Phase 4a) with no rate limit.
 const scionDiscoveryLogInterval = 5 * time.Minute
 
+// --- Phase 2d: cold-retry after initial discovery failure ---
+//
+// When a peer's first path-discovery attempt fails because the local SCION
+// daemon is warming up (no segments received yet, CS returned a truncated
+// TRC, gRPC Unavailable), we want to retry quickly — on the order of tens
+// of seconds — rather than wait for the 5-minute soft-refresh recovery
+// path. Cold-retry state lives on Conn (not on endpoint.scionState, which
+// is nil when discovery has never succeeded) and is keyed by
+// (peerIA, hostAddr). A dedicated goroutine ticks every 5s and re-kicks
+// discovery for due peers. Entries are cleared on success or given up
+// after scionColdRetryMaxAttempts (at which point the standard soft-
+// refresh loop handles long-term recovery).
+
+const (
+	scionColdRetryTickInterval = 5 * time.Second
+	scionColdRetryMaxAttempts  = 6 // ~310 s total budget before giving up
+)
+
+// scionColdRetryKey identifies a peer's cold-retry state. hostAddr is part
+// of the key so two Tailscale peers in the same SCION AS get independent
+// retry schedules (mirrors the Phase 2c fix).
+type scionColdRetryKey struct {
+	ia       addr.IA
+	hostAddr netip.AddrPort
+}
+
+// scionColdRetryEntry tracks how many times we've retried discovery for
+// a given peer and when to try next. Pure state — no goroutines, no
+// timers; the ticker goroutine reads and acts on this.
+type scionColdRetryEntry struct {
+	attempts       int                     // 1-indexed; incremented on each schedule
+	nextAttemptAt  time.Time               // wall-clock when the ticker should re-kick
+	firstFailureAt time.Time               // original failure — for future "give up and log" reporting
+	lastErrorKind  scionDiscoveryErrorKind // classified error (Phase 5)
+}
+
+// scionColdRetrySleep returns the delay before the Nth retry attempt
+// (1-indexed): 10s, 20s, 40s, 80s, 160s, capped at 160s thereafter. Kept
+// separate for unit testability.
+func scionColdRetrySleep(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	shift := attempt - 1
+	if shift > 4 {
+		shift = 4
+	}
+	return 10 * time.Second * (1 << shift)
+}
+
+// scheduleColdRetry records (or bumps) a cold-retry entry for (peerIA,
+// hostAddr). After scionColdRetryMaxAttempts bumps without success the
+// entry is deleted and long-term recovery is left to soft-refresh.
+func (c *Conn) scheduleColdRetry(peerIA addr.IA, hostAddr netip.AddrPort, kind scionDiscoveryErrorKind) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.scionColdRetry == nil {
+		c.scionColdRetry = make(map[scionColdRetryKey]*scionColdRetryEntry)
+	}
+	key := scionColdRetryKey{ia: peerIA, hostAddr: hostAddr}
+	now := time.Now()
+	ent := c.scionColdRetry[key]
+	if ent == nil {
+		ent = &scionColdRetryEntry{firstFailureAt: now}
+		c.scionColdRetry[key] = ent
+	}
+	ent.attempts++
+	if ent.attempts > scionColdRetryMaxAttempts {
+		delete(c.scionColdRetry, key)
+		return
+	}
+	ent.nextAttemptAt = now.Add(scionColdRetrySleep(ent.attempts))
+	ent.lastErrorKind = kind
+}
+
+// clearColdRetry removes any cold-retry entry for (peerIA, hostAddr).
+// Called when discovery succeeds for that peer.
+func (c *Conn) clearColdRetry(peerIA addr.IA, hostAddr netip.AddrPort) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.scionColdRetry, scionColdRetryKey{ia: peerIA, hostAddr: hostAddr})
+}
+
+// scionColdRetryLoop is the dedicated goroutine. Ticks at
+// scionColdRetryTickInterval; for each due entry, re-kicks
+// discoverSCIONPathAsync on the corresponding endpoint. CAS + throttle
+// inside discoverSCIONPathAsync coalesce with any other trigger that
+// might race us.
+func (c *Conn) scionColdRetryLoop() {
+	ticker := time.NewTicker(scionColdRetryTickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.donec:
+			return
+		case <-ticker.C:
+			c.scionColdRetryTick()
+		}
+	}
+}
+
+// scionColdRetryTick iterates due cold-retry entries and kicks discovery
+// for the matching endpoints. Looks up endpoints via the netmap peer list
+// (same pattern as discoverNewSCIONPeers) because a peer whose first
+// discovery failed has no scionState and therefore no fast path from key
+// to endpoint.
+func (c *Conn) scionColdRetryTick() {
+	now := time.Now()
+
+	c.mu.Lock()
+	if len(c.scionColdRetry) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	peers := c.peers
+	due := make(map[scionColdRetryKey]bool, len(c.scionColdRetry))
+	for key, ent := range c.scionColdRetry {
+		if !ent.nextAttemptAt.After(now) {
+			due[key] = true
+		}
+	}
+	c.mu.Unlock()
+
+	if len(due) == 0 {
+		return
+	}
+
+	for i := range peers.Len() {
+		peer := peers.At(i)
+		peerIA, hostAddr, ok := scionServiceFromPeer(peer)
+		if !ok {
+			continue
+		}
+		key := scionColdRetryKey{ia: peerIA, hostAddr: hostAddr}
+		if !due[key] {
+			continue
+		}
+		c.mu.Lock()
+		ep, epOk := c.peerMap.endpointForNodeID(peer.ID())
+		c.mu.Unlock()
+		if !epOk || ep == nil {
+			continue
+		}
+		// The CAS + 5 s throttle inside discoverSCIONPathAsync coalesces
+		// with any other trigger (Hostinfo update, demote, send-time,
+		// post-connect) that might race this tick.
+		go ep.discoverSCIONPathAsync(peerIA, hostAddr)
+	}
+}
+
 // scionDiscoveryErrorKind classifies SCION path-discovery failures so
 // operators (and the per-peer backoff) can distinguish config problems
 // (TRC missing — won't self-heal) from transient infrastructure errors
@@ -3304,10 +3454,20 @@ func (de *endpoint) discoverSCIONPathAsync(peerIA addr.IA, hostAddr netip.AddrPo
 			de.scionState.lastDiscoveryErrorKind = errKind
 		}
 		de.mu.Unlock()
+		// Phase 2d: schedule a short-interval retry. The initial-discovery
+		// failure class is dominated by daemon warm-up (no segments yet,
+		// truncated TRC from CS, gRPC Unavailable). Soft-refresh's recovery
+		// path takes up to 5 min to kick in; cold-retry gets us back within
+		// tens of seconds. After scionColdRetryMaxAttempts without success
+		// the entry is removed and long-term recovery falls to soft-refresh.
+		de.c.scheduleColdRetry(peerIA, hostAddr, errKind)
 		return
 	}
 	// Successful discovery: clear any stale error so status reflects the
-	// current state, not a prior transient failure.
+	// current state, not a prior transient failure. Phase 2d: also clear
+	// the cold-retry schedule so a subsequent re-entry to the failure path
+	// starts from the 10 s base again.
+	de.c.clearColdRetry(peerIA, hostAddr)
 	de.mu.Lock()
 	if de.scionState != nil {
 		de.scionState.lastDiscoveryError = ""

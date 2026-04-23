@@ -459,6 +459,13 @@ type Conn struct {
 	// One log line per peer per scionDiscoveryLogInterval.
 	scionDiscoveryLogAt map[scionIAKey]time.Time
 
+	// scionColdRetry tracks short-interval retry state for peers whose
+	// initial path-discovery failed (e.g. SCION daemon warm-up returning
+	// "no segments" or an undecodable TRC). Guarded by c.mu. Consumed by
+	// the scionColdRetryLoop goroutine at 5 s ticks. See the Phase 2d
+	// commentary in magicsock_scion.go for the lifecycle.
+	scionColdRetry map[scionColdRetryKey]*scionColdRetryEntry
+
 	// lastSCIONRecv is the last time we received any SCION packet (monotonic).
 	// Used by receiveSCION to detect a dead socket and trigger reconnection.
 	lastSCIONRecv mono.Time

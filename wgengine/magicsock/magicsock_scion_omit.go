@@ -58,6 +58,8 @@ type scionPathFPKey struct{}
 type scionEndpointState struct{}
 type scionIAKey = uint64
 type scionRefreshBackoff struct{}
+type scionColdRetryKey struct{}
+type scionColdRetryEntry struct{}
 
 const scionWireMTU = tstun.WireMTU(1280)
 

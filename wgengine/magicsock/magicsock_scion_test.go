@@ -34,6 +34,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 )
 
 func TestScionPathKeyIsSet(t *testing.T) {
@@ -3083,6 +3084,244 @@ func TestPopulateSCIONPathsLocked_SurfacesDiscoveryError(t *testing.T) {
 	}
 	if len(ps.SCIONPaths) != 0 {
 		t.Errorf("SCIONPaths len = %d, want 0", len(ps.SCIONPaths))
+	}
+}
+
+// --- Phase 2d: cold-retry after initial discovery failure ---
+
+// TestScionColdRetrySleep verifies the backoff curve: 10s, 20s, 40s, 80s, 160s,
+// and then capped at 160s for any further attempt.
+func TestScionColdRetrySleep(t *testing.T) {
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{1, 10 * time.Second},
+		{2, 20 * time.Second},
+		{3, 40 * time.Second},
+		{4, 80 * time.Second},
+		{5, 160 * time.Second},
+		{6, 160 * time.Second}, // capped
+		{100, 160 * time.Second},
+		{0, 10 * time.Second}, // defensive: attempt<1 → treat as 1
+	}
+	for _, tt := range tests {
+		if got := scionColdRetrySleep(tt.attempt); got != tt.want {
+			t.Errorf("scionColdRetrySleep(%d) = %v, want %v", tt.attempt, got, tt.want)
+		}
+	}
+}
+
+// TestScheduleColdRetry_BookkeepingAndGiveUp covers all the state
+// transitions of the cold-retry map:
+//   - First schedule creates an entry with attempts=1 and
+//     nextAttemptAt = now + 10s.
+//   - Second schedule bumps to attempts=2, nextAttemptAt = now + 20s.
+//   - After scionColdRetryMaxAttempts (6) attempts, the entry is deleted
+//     (give up; let long-term soft-refresh take over).
+//   - clearColdRetry removes the entry.
+func TestScheduleColdRetry_BookkeepingAndGiveUp(t *testing.T) {
+	c := &Conn{}
+	c.logf = t.Logf
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+	hostA := netip.MustParseAddrPort("10.0.0.1:41641")
+	key := scionColdRetryKey{ia: peerIA, hostAddr: hostA}
+
+	// First failure — entry created.
+	c.scheduleColdRetry(peerIA, hostA, scionErrNoSegments)
+	c.mu.Lock()
+	ent := c.scionColdRetry[key]
+	c.mu.Unlock()
+	if ent == nil {
+		t.Fatalf("scheduleColdRetry: no entry created for %v", key)
+	}
+	if ent.attempts != 1 {
+		t.Errorf("after 1st call: attempts=%d, want 1", ent.attempts)
+	}
+	if ent.lastErrorKind != scionErrNoSegments {
+		t.Errorf("lastErrorKind = %v, want scionErrNoSegments", ent.lastErrorKind)
+	}
+	if ent.firstFailureAt.IsZero() {
+		t.Errorf("firstFailureAt not set")
+	}
+
+	// Second failure — attempts bumped.
+	c.scheduleColdRetry(peerIA, hostA, scionErrNoSegments)
+	c.mu.Lock()
+	ent = c.scionColdRetry[key]
+	c.mu.Unlock()
+	if ent.attempts != 2 {
+		t.Errorf("after 2nd call: attempts=%d, want 2", ent.attempts)
+	}
+
+	// Failures 3..6 — entry still present.
+	for i := 3; i <= scionColdRetryMaxAttempts; i++ {
+		c.scheduleColdRetry(peerIA, hostA, scionErrNoSegments)
+	}
+	c.mu.Lock()
+	_, present := c.scionColdRetry[key]
+	c.mu.Unlock()
+	if !present {
+		t.Errorf("entry deleted before give-up threshold")
+	}
+
+	// The (max+1)th call: give up, entry deleted.
+	c.scheduleColdRetry(peerIA, hostA, scionErrNoSegments)
+	c.mu.Lock()
+	_, present = c.scionColdRetry[key]
+	c.mu.Unlock()
+	if present {
+		t.Errorf("entry still present after give-up threshold; expected deletion")
+	}
+
+	// Re-add and test clearColdRetry removes it.
+	c.scheduleColdRetry(peerIA, hostA, scionErrNoSegments)
+	c.clearColdRetry(peerIA, hostA)
+	c.mu.Lock()
+	_, present = c.scionColdRetry[key]
+	c.mu.Unlock()
+	if present {
+		t.Errorf("clearColdRetry: entry still present after clear")
+	}
+}
+
+// TestScheduleColdRetry_DistinctKeysForSameIADifferentHosts — two peers
+// in the same IA at different underlay hosts get independent cold-retry
+// entries. Mirrors the Phase 2c guarantee in the retry state layer.
+func TestScheduleColdRetry_DistinctKeysForSameIADifferentHosts(t *testing.T) {
+	c := &Conn{}
+	c.logf = t.Logf
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+	hostA := netip.MustParseAddrPort("10.0.0.1:41641")
+	hostB := netip.MustParseAddrPort("10.0.0.2:41641")
+
+	c.scheduleColdRetry(peerIA, hostA, scionErrNoSegments)
+	c.scheduleColdRetry(peerIA, hostB, scionErrNoSegments)
+
+	c.mu.Lock()
+	entA := c.scionColdRetry[scionColdRetryKey{ia: peerIA, hostAddr: hostA}]
+	entB := c.scionColdRetry[scionColdRetryKey{ia: peerIA, hostAddr: hostB}]
+	c.mu.Unlock()
+
+	if entA == nil || entB == nil {
+		t.Fatalf("expected two distinct entries: entA=%v entB=%v", entA, entB)
+	}
+	if entA == entB {
+		t.Fatalf("same-IA different-host peers shared a cold-retry entry")
+	}
+	if entA.attempts != 1 || entB.attempts != 1 {
+		t.Errorf("each entry should be at attempts=1; got A=%d B=%d",
+			entA.attempts, entB.attempts)
+	}
+}
+
+// TestScionColdRetryTick_KicksDueEntriesOnly verifies that
+// scionColdRetryTick spawns discovery ONLY for entries whose
+// nextAttemptAt has elapsed, and leaves not-yet-due entries alone.
+// Observability: discoverSCIONPathAsync's CAS-guarded prelude stamps
+// scionState.lastDiscoveryAt. For not-yet-due entries we pre-seed a
+// "10 min ago" lastDiscoveryAt and assert it stays stale.
+func TestScionColdRetryTick_KicksDueEntriesOnly(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	localIA := addr.MustParseIA("1-ff00:0:110")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+	hostDue := netip.MustParseAddrPort("10.0.0.1:41641")
+	hostNotYet := netip.MustParseAddrPort("10.0.0.2:41641")
+
+	// Two peers to test: one whose retry is due, one whose isn't.
+	mockDaemon := mock_daemon.NewMockConnector(ctrl)
+	mockDaemon.EXPECT().
+		Paths(gomock.Any(), peerIA, localIA, daemontypes.PathReqFlags{Refresh: false}).
+		Return(nil, fmt.Errorf("still warming up")).MinTimes(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Conn{connCtx: ctx, peerMap: newPeerMap()}
+	c.logf = t.Logf
+	c.pconnSCION.Store(&scionConn{daemon: mockDaemon, localIA: localIA})
+
+	// Build two endpoints with stale lastDiscoveryAt.
+	staleDiscovery := time.Now().Add(-10 * time.Minute)
+	epDue := &endpoint{c: c}
+	epDue.scionState = &scionEndpointState{
+		peerIA: peerIA, hostAddr: hostDue,
+		lastDiscoveryAt: staleDiscovery,
+	}
+	epDue.publicKey = testNodeKey()
+	c.peerMap.byNodeKey[epDue.publicKey] = newPeerInfo(epDue)
+
+	epNotYet := &endpoint{c: c}
+	epNotYet.scionState = &scionEndpointState{
+		peerIA: peerIA, hostAddr: hostNotYet,
+		lastDiscoveryAt: staleDiscovery,
+	}
+	epNotYet.publicKey = testNodeKey()
+	c.peerMap.byNodeKey[epNotYet.publicKey] = newPeerInfo(epNotYet)
+
+	// Build a tailcfg NodeView with the peer's SCION advertisement so
+	// scionServiceFromPeer can resolve (peerIA, hostAddr) for each peer.
+	makePeerNode := func(id tailcfg.NodeID, hostAddr netip.AddrPort) tailcfg.NodeView {
+		n := &tailcfg.Node{
+			ID:       id,
+			Hostinfo: (&tailcfg.Hostinfo{
+				Services: []tailcfg.Service{
+					{Proto: tailcfg.SCION, Description: fmt.Sprintf("%s,[%s]", peerIA, hostAddr.Addr()), Port: hostAddr.Port()},
+				},
+			}).View(),
+		}
+		return n.View()
+	}
+	nodes := []tailcfg.NodeView{
+		makePeerNode(1, hostDue),
+		makePeerNode(2, hostNotYet),
+	}
+	// endpointForNodeID expects peerMap.byNodeID to be populated.
+	c.peerMap.byNodeID[1] = c.peerMap.byNodeKey[epDue.publicKey]
+	c.peerMap.byNodeID[2] = c.peerMap.byNodeKey[epNotYet.publicKey]
+	c.peers = views.SliceOf(nodes)
+
+	// Seed cold-retry entries: one due (nextAttemptAt in the past), one
+	// not yet (nextAttemptAt in the future).
+	now := time.Now()
+	c.mu.Lock()
+	c.scionColdRetry = map[scionColdRetryKey]*scionColdRetryEntry{
+		{ia: peerIA, hostAddr: hostDue}: {
+			attempts:      1,
+			nextAttemptAt: now.Add(-1 * time.Second), // due
+		},
+		{ia: peerIA, hostAddr: hostNotYet}: {
+			attempts:      1,
+			nextAttemptAt: now.Add(30 * time.Second), // not yet
+		},
+	}
+	c.mu.Unlock()
+
+	c.scionColdRetryTick()
+
+	// Poll for the due endpoint's lastDiscoveryAt to advance.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var gotDue time.Time
+	for time.Now().Before(deadline) {
+		epDue.mu.Lock()
+		gotDue = epDue.scionState.lastDiscoveryAt
+		epDue.mu.Unlock()
+		if gotDue.After(staleDiscovery) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !gotDue.After(staleDiscovery) {
+		t.Errorf("due peer's lastDiscoveryAt = %v (unchanged); cold-retry tick did not kick discovery", gotDue)
+	}
+
+	// Not-yet-due peer should not have been kicked. Give it the same
+	// window to be sure.
+	time.Sleep(50 * time.Millisecond)
+	epNotYet.mu.Lock()
+	gotNotYet := epNotYet.scionState.lastDiscoveryAt
+	epNotYet.mu.Unlock()
+	if gotNotYet.After(staleDiscovery) {
+		t.Errorf("not-yet-due peer's lastDiscoveryAt = %v (advanced); cold-retry tick kicked it prematurely", gotNotYet)
 	}
 }
 
