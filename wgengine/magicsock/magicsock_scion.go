@@ -3092,8 +3092,23 @@ func (c *Conn) cleanStaleSCIONPathFromEndpoints(staleKeys []scionPathKey, peerIA
 		staleSet[k] = true
 	}
 
+	// Phase 2b: endpoints whose probe set becomes empty after pruning need
+	// a rediscovery kick. Without this, a peer whose paths silently age out
+	// (refresh misses during a network blip, same-fingerprint never re-
+	// admitted) stays permanently on UDP because no other code path fires:
+	// Hostinfo didn't change, demote has no active path to time out, and
+	// the refresh loop only touches existing registry entries. Collect the
+	// (ep, peerIA, hostAddr) triples here; spawn goroutines after both
+	// locks are released so discoverSCIONPathAsync can freely re-acquire
+	// de.mu (which it does in its CAS-guarded prelude).
+	type rediscoverKick struct {
+		ep       *endpoint
+		peerIA   addr.IA
+		hostAddr netip.AddrPort
+	}
+	var kicks []rediscoverKick
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for _, pi := range c.peerMap.byNodeKey {
 		ep := pi.ep
 		ep.mu.Lock()
@@ -3113,7 +3128,22 @@ func (c *Conn) cleanStaleSCIONPathFromEndpoints(staleKeys []scionPathKey, peerIA
 				break
 			}
 		}
+		// If pruning just cleared the peer's last SCION path, schedule a
+		// rediscovery. Capture peerIA + hostAddr by value; the goroutine
+		// runs after we release the locks.
+		if len(ep.scionState.paths) == 0 {
+			kicks = append(kicks, rediscoverKick{
+				ep:       ep,
+				peerIA:   ep.scionState.peerIA,
+				hostAddr: ep.scionState.hostAddr,
+			})
+		}
 		ep.mu.Unlock()
+	}
+	c.mu.Unlock()
+
+	for _, k := range kicks {
+		go k.ep.discoverSCIONPathAsync(k.peerIA, k.hostAddr)
 	}
 }
 

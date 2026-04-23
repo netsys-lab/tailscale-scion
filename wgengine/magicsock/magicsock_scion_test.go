@@ -2012,6 +2012,89 @@ func TestScionDemoteSCIONPathLocked_AllUnhealthyKicksDiscovery(t *testing.T) {
 	}
 }
 
+// TestCleanStaleSCIONPaths_ZeroPathsKicksDiscovery (Phase 2b) verifies that
+// when cleanStaleSCIONPathFromEndpoints prunes the LAST path from an
+// endpoint's scionState.paths, an async rediscovery is kicked. Without this,
+// a peer whose SCION paths silently age out (e.g. after a network-blip-
+// induced refresh-miss window) would stay permanently on UDP even though
+// SCION is still advertised — because no other code path triggers
+// rediscovery for a peer whose Hostinfo hasn't changed.
+//
+// Observability: discoverSCIONPathAsync sets de.scionState.lastDiscoveryAt
+// in its CAS-guarded prelude. A successful kick will bump that timestamp
+// from its pre-seeded "10 min ago" value to the current time.
+func TestCleanStaleSCIONPaths_ZeroPathsKicksDiscovery(t *testing.T) {
+	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
+	peerIA := addr.MustParseIA("1-ff00:0:111")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := &Conn{
+		connCtx: ctx,
+		peerMap: newPeerMap(),
+	}
+	c.logf = t.Logf
+	// pconnSCION stays nil: we only care that lastDiscoveryAt moves,
+	// not that daemon.Paths gets called. Keeps the test hermetic.
+
+	// Set up an endpoint with a single registered path + matching probe state.
+	ep := &endpoint{c: c}
+	pi := &scionPathInfo{
+		peerIA:      peerIA,
+		hostAddr:    hostAddr,
+		fingerprint: "some-fp",
+	}
+	k := c.registerSCIONPathLocking(pi)
+	staleDiscovery := time.Now().Add(-10 * time.Minute)
+	ep.scionState = &scionEndpointState{
+		peerIA:          peerIA,
+		hostAddr:        hostAddr,
+		activePath:      k,
+		lastDiscoveryAt: staleDiscovery, // older than 5s throttle
+		paths: map[scionPathKey]*scionPathProbeState{
+			k: {fingerprint: "some-fp", healthy: true},
+		},
+	}
+	// Wire the endpoint into the peerMap so cleanStaleSCIONPathFromEndpoints
+	// (which iterates c.peerMap.byNodeKey) can find it. Direct insertion keeps
+	// the test minimal; upsertEndpoint's full state invariants aren't needed.
+	ep.publicKey = testNodeKey()
+	c.peerMap.byNodeKey[ep.publicKey] = newPeerInfo(ep)
+
+	// Prune the only path.
+	c.cleanStaleSCIONPathFromEndpoints([]scionPathKey{k}, peerIA)
+
+	// Path should be gone and activePath cleared.
+	ep.mu.Lock()
+	gotPaths := len(ep.scionState.paths)
+	gotActive := ep.scionState.activePath
+	ep.mu.Unlock()
+	if gotPaths != 0 {
+		t.Errorf("scionState.paths len = %d, want 0", gotPaths)
+	}
+	if gotActive.IsSet() {
+		t.Errorf("activePath = %d, want 0", gotActive)
+	}
+
+	// Poll for the async discovery kick to update lastDiscoveryAt.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var got time.Time
+	for time.Now().Before(deadline) {
+		ep.mu.Lock()
+		got = ep.scionState.lastDiscoveryAt
+		ep.mu.Unlock()
+		if got.After(staleDiscovery) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !got.After(staleDiscovery) {
+		t.Fatalf("lastDiscoveryAt = %v (unchanged from pre-seeded %v); rediscovery was not kicked after silent prune of last path",
+			got, staleDiscovery)
+	}
+}
+
 func TestScionReEvalSCIONPathsLocked(t *testing.T) {
 	hostAddr := netip.MustParseAddrPort("10.0.0.1:41641")
 	peerIA := addr.MustParseIA("1-ff00:0:111")
