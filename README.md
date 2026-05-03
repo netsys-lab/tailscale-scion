@@ -10,25 +10,59 @@ A fork of [tailscale/tailscale](https://github.com/tailscale/tailscale) that add
 
 ## Status
 
-Experimental. Platforms: Linux, macOS, Windows, FreeBSD, OpenBSD, NetBSD, Android (via [tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion)).
+Experimental. Platforms: Linux, macOS, FreeBSD, OpenBSD, NetBSD, Android (via [tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion)).
 
 ## Releases
 
-Pre-built binaries for Linux (amd64/arm64), macOS, and Windows are available on the [Releases](https://github.com/netsys-lab/tailscale-scion/releases) page. Android APK releases are available from [tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion/releases).
+Pre-built binaries for Linux (amd64/arm64) and macOS are available on the [Releases](https://github.com/netsys-lab/tailscale-scion/releases) page. Android APK releases are available from [tailscale-android-scion](https://github.com/netsys-lab/tailscale-android-scion/releases).
 
 For CLI usage, see the [Tailscale CLI reference](https://tailscale.com/docs/reference/tailscale-cli) — all standard `tailscale` and `tailscaled` commands work the same.
 
 ## Quick Start (Linux)
 
+### Install from a release package
+
+Download the `.deb` or `.rpm` for your architecture from the [Releases](https://github.com/netsys-lab/tailscale-scion/releases) page and install it:
+
 ```bash
-# Build
+# Debian / Ubuntu
+sudo dpkg -i tailscale-scion_<version>_amd64.deb
+
+# RHEL / Fedora / openSUSE
+sudo rpm -i tailscale-scion_<version>_amd64.rpm
+```
+
+The package installs a `tailscaled.service` systemd unit. Configure environment variables (including SCION bootstrap settings) by editing `/etc/default/tailscaled` — for example:
+
+```bash
+# /etc/default/tailscaled
+PORT="41641"
+FLAGS=""
+TS_SCION_BOOTSTRAP_URL="http://your-bootstrap-server:8041"
+TS_PREFER_SCION="true"
+```
+
+Then enable and start the daemon, and view logs via journald:
+
+```bash
+sudo systemctl enable --now tailscaled
+sudo journalctl -u tailscaled -f      # follow live logs
+sudo journalctl -u tailscaled --since "10 min ago"
+```
+
+### Build from source
+
+```bash
 go install tailscale.com/cmd/tailscale{,d}
 
 # Run with the embedded SCION daemon (bootstraps topology + TRCs)
 TS_SCION_BOOTSTRAP_URL=http://your-bootstrap-server:8041 \
   tailscaled
+```
 
-# Verify SCION is connected
+### Verify SCION is connected
+
+```bash
 curl -s --unix-socket /var/run/tailscale/tailscaled.sock \
   http://local-tailscaled.sock/localapi/v0/scion-status
 # {"Connected":true,"LocalIA":"19-ffaa:1:eba"}
